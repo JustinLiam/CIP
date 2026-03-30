@@ -1,0 +1,75 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "VCIP VAE Debug (gamma=4, rank=false)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/runnables/train_vae.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "+dataset=cancer_sim_cont",
+        "+model=vcip",
+        "+model/hparams/cancer=4*",
+        "exp.seed=10",
+        "dataset.coeff=4",
+        "exp.epochs=100",
+        "model.name=VCIP",
+        "exp.test=false",
+        "exp.rank=false"
+      ]
+    },
+    {
+      "name": "VCIP VAE Debug (gamma=4, rank=true)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/runnables/train_vae.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "+dataset=cancer_sim_cont",
+        "+model=vcip",
+        "+model/hparams/cancer=4*",
+        "exp.seed=10",
+        "dataset.coeff=4",
+        "exp.epochs=100",
+        "model.name=VCIP",
+        "exp.test=false",
+        "exp.rank=true"
+      ]
+    },
+    {
+      "name": "VCIP CT Debug (gamma=4, rank=false)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/runnables/train_multi.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0"
+      },
+      "args": [
+        "+dataset=cancer_sim_cont",
+        "+baselines=ct",
+        "+baselines/ct_hparams/cancer_sim_domain_conf=4*",
+        "exp.seed=10",
+        "exp.logging=False",
+        "exp.alpha=0.01",
+        "model.name=CT/0.01",
+        "exp.max_epochs=100",
+        "exp.test=false",
+        "exp.rank=false"
+      ]
+    }
+  ]
+}

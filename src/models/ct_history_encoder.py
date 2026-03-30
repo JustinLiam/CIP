@@ -1,31 +1,26 @@
 import torch
 import torch.nn as nn
-import math
-
-
-class PositionalEncoding(nn.Module):
-    """标准的位置编码，Transformer处理时序必须依赖此模块"""
-
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        # x shape: [batch_size, seq_len, d_model]
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
-
+from src.models.utils_transformer import (
+    AbsolutePositionalEncoding,
+    RelativePositionalEncoding,
+    TransformerMultiInputBlock,
+)
 
 class CTHistoryEncoder(nn.Module):
-    def __init__(self, x_dim, a_dim, y_dim, d_model=64, num_heads=4, num_layers=2, dropout=0.1):
+    def __init__(
+        self,
+        x_dim,
+        a_dim,
+        y_dim,
+        static_dim=0,
+        d_model=64,
+        num_heads=4,
+        num_layers=2,
+        dropout=0.1,
+        max_seq_len=512,
+        use_relative_positional_encoding=True,
+        max_relative_position=64,
+    ):
         """
         x_dim: 协变量(vitals + static_features)的维度
         a_dim: 治疗记录(treatments)的维度
@@ -34,62 +29,94 @@ class CTHistoryEncoder(nn.Module):
         """
         super().__init__()
         self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        self.head_size = d_model // num_heads
+        self.static_dim = static_dim
 
         # 1. 独立特征嵌入层 (Feature Embeddings)
         self.x_enc = nn.Linear(x_dim, d_model)
         self.a_enc = nn.Linear(a_dim, d_model)
         self.y_enc = nn.Linear(y_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        self.static_input_transformation = (
+            nn.Linear(static_dim, d_model) if static_dim and static_dim > 0 else None
+        )
+        # 为与 CT 主实现对齐：支持 absolute / relative positional encoding
+        self.self_positional_encoding = None
+        self.self_positional_encoding_k = None
+        self.self_positional_encoding_v = None
+        if use_relative_positional_encoding:
+            self.self_positional_encoding_k = RelativePositionalEncoding(
+                max_relative_position=max_relative_position,
+                d_model=self.head_size,
+                trainable=False,
+            )
+            self.self_positional_encoding_v = RelativePositionalEncoding(
+                max_relative_position=max_relative_position,
+                d_model=self.head_size,
+                trainable=False,
+            )
+        else:
+            self.self_positional_encoding = AbsolutePositionalEncoding(
+                max_len=max_seq_len, d_model=d_model, trainable=False
+            )
 
-        # 2. 自注意力编码器 (Self-Attention)
-        # batch_first=True 保证输入输出形状为 [batch_size, seq_len, d_model]
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=num_heads, dropout=dropout, batch_first=True)
-        self.self_attn_x = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.self_attn_a = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.self_attn_y = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # 2-3. 使用 CT 的 multi-input block（每层同时做 self/cross attention）
+        self.transformer_blocks = nn.ModuleList(
+            [
+                TransformerMultiInputBlock(
+                    hidden=d_model,
+                    attn_heads=num_heads,
+                    head_size=self.head_size,
+                    feed_forward_hidden=d_model * 4,
+                    dropout=dropout,
+                    attn_dropout=dropout,
+                    self_positional_encoding_k=self.self_positional_encoding_k,
+                    self_positional_encoding_v=self.self_positional_encoding_v,
+                    n_inputs=3,
+                    disable_cross_attention=False,
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
-        # 3. 交叉注意力机制 (Cross-Attention)
-        # 在 PyTorch 中，TransformerDecoderLayer 就是完美的 Cross-Attention 实现
-        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=num_heads, dropout=dropout, batch_first=True)
-        # X 关注 A (协变量如何受治疗影响)
-        self.cross_attn_xa = nn.TransformerDecoder(decoder_layer, num_layers=1)
-        # X 关注 Y (协变量如何受历史结果影响)
-        self.cross_attn_xy = nn.TransformerDecoder(decoder_layer, num_layers=1)
-
-    def generate_square_subsequent_mask(self, sz):
-        """生成因果掩码 (Causal Mask) —— 极其重要，防止信息泄露(偷看未来)"""
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
-
-    def forward(self, x, a, y):
+    def forward(self, x, a, y, active_entries=None, static_features=None):
         """
         x, a, y 形状均为: [batch_size, seq_len, dim]
         """
-        seq_len = x.size(1)
-        # 生成因果掩码 [seq_len, seq_len]
-        mask = self.generate_square_subsequent_mask(seq_len).to(x.device)
+        batch_size, seq_len, _ = x.size()
+        if active_entries is None:
+            active_entries = torch.ones(batch_size, seq_len, 1, device=x.device, dtype=x.dtype)
 
-        # Step 1: 投影并加上位置编码
-        x_emb = self.pos_encoder(self.x_enc(x))
-        a_emb = self.pos_encoder(self.a_enc(a))
-        y_emb = self.pos_encoder(self.y_enc(y))
+        # 与 CT 一致：三个子网络输入分别映射后在每层 block 中做 self/cross attention
+        x_t = self.a_enc(a)  # treatment stream
+        x_o = self.y_enc(y)  # outcome stream
+        x_v = self.x_enc(x)  # covariate stream
 
-        # Step 2: 独立的时序演化 (Self-Attention)
-        x_rep = self.self_attn_x(x_emb, mask=mask)
-        a_rep = self.self_attn_a(a_emb, mask=mask)
-        y_rep = self.self_attn_y(y_emb, mask=mask)
+        if self.self_positional_encoding is not None:
+            x_t = x_t + self.self_positional_encoding(x_t)
+            x_o = x_o + self.self_positional_encoding(x_o)
+            x_v = x_v + self.self_positional_encoding(x_v)
 
-        # Step 3: 交叉注意力融合 (Cross-Attention)
-        # tgt 是 Query，memory 是 Key/Value。两者都需要 mask，防止 t 时刻看到 t+1 的记忆。
-        xa_rep = self.cross_attn_xa(tgt=x_rep, memory=a_rep, tgt_mask=mask, memory_mask=mask)
-        xy_rep = self.cross_attn_xy(tgt=x_rep, memory=y_rep, tgt_mask=mask, memory_mask=mask)
+        # 与 CT 一致：静态通道作为逐层偏置项注入
+        if self.static_input_transformation is not None and static_features is not None:
+            if static_features.dim() == 3:
+                static_features = static_features[:, 0, :]
+            x_s = self.static_input_transformation(static_features).unsqueeze(1)
+        else:
+            x_s = torch.zeros(batch_size, 1, self.d_model, device=x.device, dtype=x.dtype)
 
-        # Step 4: 聚合表示 (平均池化或拼接)
-        # 参考 Causal Transformer 论文，我们将所有学到的表示取平均
-        final_rep = (x_rep + a_rep + y_rep + xa_rep + xy_rep) / 5.0
+        for block in self.transformer_blocks:
+            x_t, x_o, x_v = block(
+                (x_t, x_o, x_v),
+                x_s,
+                active_entries_treat_outcomes=active_entries,
+                active_entries_vitals=active_entries,
+            )
 
-        return final_rep  # 输出形状: [batch_size, seq_len, d_model]
+        # 与 CT 三分支聚合方式一致（等权平均）
+        final_rep = (x_t + x_o + x_v) / 3.0
+        return final_rep
 
 class ProjectionHead(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):

@@ -199,9 +199,17 @@ class VAEModel(pl.LightningModule):
             ture_output_actions = self.dataset_collection.val_f.simulate_output_after_actions(H_t, true_actions, self.dataset_collection.train_scaling_params)
 
             # print(f'shape of output_after_actions: {output_after_actions.shape}, shape of ture_output: {ture_output.shape}')
-            loss = np.sqrt(((output_after_actions-ture_output) ** 2).mean())
+            # 计算RMSE损失（均方根误差），衡量模型优化后的干预（optimized_a_seq）作用下，仿真出的病人末次输出(output_after_actions)
+            # 与真实观测到的末次输出(ture_output)之间的拟合误差。
+            # output_after_actions 是指：采用优化求解出的 a_seq（干预决策序列）作用于历史数据H_t后，模拟产生的预测结局（最后一个时间步的输出）。
+            # 换句话说，它代表执行intervention（a_seq）后模型预测的病人生理状态；用它与ture_output的RMSE衡量intervention的个性化潜力。
+            loss = np.sqrt(((output_after_actions - ture_output) ** 2).mean())
             losses.append(loss)
 
+            # loss_2 表示在已知真实临床决策（current_treatments）路径下，仿真生成模型（simulate_output_after_actions）
+            # 分别输出的 ture_output_actions（输入真实 actions）和 ture_output（实际观测结果的同一生成器还原值）之间的拟合误差（RMSE）。
+            # 注意：ture_output 其实也是通过仿真生成模型，根据真实 trajectory 得到的“还原”输出，而非直接观测值。
+            # 故 loss_2 可以理解为，仿真模型能否对真实历史路径准确还原的能力（baseline）。
             loss_2 = np.sqrt(((ture_output_actions-ture_output) ** 2).mean())
             losses_2.append(loss_2)
 

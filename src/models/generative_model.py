@@ -25,10 +25,16 @@ class GenerativeModel(nn.Module):
         self.predict_X = config['dataset']['predict_X']
         self.input_size = config['dataset']['input_size']
 
-        self.ct_history_encoder = CTHistoryEncoder(x_dim=self.input_size + self.static_size, a_dim=self.treatment_size,
-                                                   y_dim=self.output_dim,
-                                                   d_model=64, num_heads=4, num_layers=self.num_layers,
-                                                   dropout=self.dropout)
+        self.ct_history_encoder = CTHistoryEncoder(
+            x_dim=self.input_size + self.static_size,
+            a_dim=self.treatment_size,
+            y_dim=self.output_dim,
+            static_dim=self.static_size,
+            d_model=64,
+            num_heads=4,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+        )
         self.projection_head = ProjectionHead(input_dim=64, hidden_dim=64, output_dim=self.z_dim)
 
 
@@ -302,7 +308,13 @@ class GenerativeModel(nn.Module):
 
         # 2. 传入 Causal Transformer 提取时序表示
         # ct_rep 形状: (batch_size, history_length, d_model)
-        ct_rep = self.ct_history_encoder(x=covariates, a=treatments, y=outputs)
+        ct_rep = self.ct_history_encoder(
+            x=covariates,
+            a=treatments,
+            y=outputs,
+            active_entries=H_t.get('active_entries', None),
+            static_features=H_t.get('static_features', None),
+        )
 
         # 3. 通过投影头，映射到去交杂的 Latent 空间
         # Z_t 形状: (batch_size, history_length, z_dim)

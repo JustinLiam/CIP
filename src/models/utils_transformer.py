@@ -45,15 +45,34 @@ class AbsolutePositionalEncoding(nn.Module):
 
 
 class RelativePositionalEncoding(nn.Module):
+    """
+    相对位置编码（Relative Positional Encoding）模块，主要用于实现Transformer结构中的相对位置信息建模。
+
+    这个类的作用是生成一个长度为[query_len, key_len, d_model]的编码张量，使得模型可以利用序列中两两元素之间的相对距离信息，从而增强模型对时序或结构关系的理解能力。常用于自注意力（self-attention）或交叉注意力（cross-attention）中作为额外的“偏置”项。
+
+    参数说明：
+        max_relative_position: 能感知的最大正负相对距离。例如设为16，则能区分[-16, 16]范围的关系。
+        d_model: 每个相对距离编码的维度。
+        trainable: 如果为True，编码参数可学习；否则使用固定的sin-cos编码。
+        cross_attn: 是否用于cross-attention（解码器用，和self-attention的位置编码略有不同）。
+
+    工作原理简述：
+        - 初始化时构造一个编码lookup表（可以是可学习embedding，也可以是固定的sin-cos）。
+        - 前向传播时，根据query/key长度构造一个距离矩阵，把每个query和key之间的相对距离都编码出来。
+        - 然后查表得到每对query-key间的相对位置向量（形状为 [query_len, key_len, d_model]）。
+        - 该位置编码可用于后续的注意力得分偏置。
+    """
     def __init__(self, max_relative_position: int, d_model: int, trainable=False, cross_attn=False):
         super().__init__()
         self.max_relative_position = max_relative_position
         self.trainable = trainable
         self.cross_attn = cross_attn
+        # cross_attn为False时允许[-max, +max]，共2*max+1种相对位置；为True时只考虑[0, max]，常用于Decoder侧的跨注意力mask
         self.num_embeddings = (max_relative_position * 2 + 1) if not cross_attn else (max_relative_position + 1)
         if trainable:
             self.embeddings_table = nn.Embedding(self.num_embeddings, d_model)
         else:
+            # 默认固定编码长度，也用2*max+1，无论cross_attn与否（简化实现，实际用时只会索引到需要范围）
             self.register_buffer('embeddings_table', get_fixed_sin_cos_encodings(d_model, max_relative_position * 2 + 1))
 
     def forward(self, length_q, length_k):

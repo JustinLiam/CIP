@@ -24,8 +24,16 @@ class InferenceModel(nn.Module):
         self.treatment_hidden_dim = config['model']['generative']['treatment_hidden_dim']
         self.dropout = config['exp']['dropout']
 
-        self.ct_history_encoder = CTHistoryEncoder(x_dim=self.input_size + self.static_size, a_dim=self.treatment_dim, y_dim=self.output_dim,
-                                                   d_model=64, num_heads=4, num_layers=self.num_layers, dropout=self.dropout)
+        self.ct_history_encoder = CTHistoryEncoder(
+            x_dim=self.input_size + self.static_size,
+            a_dim=self.treatment_dim,
+            y_dim=self.output_dim,
+            static_dim=self.static_size,
+            d_model=64,
+            num_heads=4,
+            num_layers=self.num_layers,
+            dropout=self.dropout,
+        )
         self.projection_head = ProjectionHead(input_dim=64, hidden_dim=64, output_dim=self.z_dim)
         
 
@@ -84,6 +92,22 @@ class InferenceModel(nn.Module):
         self.transition_network = DynamicParamNetwork(input_dim, hidden_dim, output_dim, num_rbf_centers=5)
 
         self.predict_y_history = config['model']['inference']['predict_y_history']
+        # 如果 self.predict_y_history 的值是 16，那么 self.predict_y_history 实际上等价于 [16]，即只指定了一个隐藏层为 16 维。
+        #
+        # 下面的代码会自动构造如下网络结构：
+        #   - 输入层: 维度为 (self.z_dim + self.treatment_size)
+        #   - 隐藏层: 一个 Linear 层，输出 16 维，然后接一个 ELU 激活
+        #   - 输出层: 一个 Linear 层，把 16 维变换为 output_dim 维（同时加一个 ELU 激活）
+        #
+        # 总体等价于:
+        #   nn.Sequential(
+        #       nn.Linear(self.z_dim + self.treatment_size, 16),
+        #       nn.ELU(),
+        #       nn.Linear(16, self.output_dim)
+        #   )
+        #
+        # 这样设计的好处是灵活，可以配置多层或者单层隐藏层结构。这里指定 16 就是单隐藏层。
+
         self.predict_y_history_net = nn.Sequential()
         input_size = self.z_dim + self.treatment_size
         if -1 not in self.predict_y_history:
@@ -132,7 +156,8 @@ class InferenceModel(nn.Module):
 
     def ct_hidden_history(self, H_t):
 
-        treatments = H_t['prev_treatments']  # A, 形状: [batch_size, seq_len, a_dim]
+        treatments = H_t['prev_treatments']  # A_{t-1}: 历史动作，供 history encoder 编码
+        current_treatments = H_t['current_treatments']  # A_t: 与 outputs_t 对齐，供辅助监督
         outputs = H_t['prev_outputs']  # Y, 形状: [batch_size, seq_len, y_dim]
         seq_len = treatments.size(1)  # 获取当前历史序列的时间步长度
 
@@ -163,7 +188,13 @@ class InferenceModel(nn.Module):
 
         # 2. 传入 Causal Transformer 提取时序表示
         # ct_rep 形状: (batch_size, history_length, d_model)
-        ct_rep = self.ct_history_encoder(x=x_input, a=treatments, y=outputs)
+        ct_rep = self.ct_history_encoder(
+            x=x_input,
+            a=treatments,
+            y=outputs,
+            active_entries=H_t.get('active_entries', None),
+            static_features=H_t.get('static_features', None),
+        )
 
         # 3. 通过投影头，映射到去交杂的 Latent 空间
         # Z_t 形状: (batch_size, history_length, z_dim)
@@ -171,7 +202,7 @@ class InferenceModel(nn.Module):
 
         # 4. 辅助回归损失：保证提取出的表示依然具有预测病情的临床意义 (非常关键！)
         # 用当前的潜状态 Z_t 去预测真实的 outputs
-        y_hat = self.predict_y_history_net(torch.cat((Z_t, treatments), dim=-1))
+        y_hat = self.predict_y_history_net(torch.cat((Z_t, current_treatments), dim=-1))
         loss_hy = nn.MSELoss()(y_hat, H_t['outputs'])
 
         # 5. 只取历史序列的最后一步作为当前时刻推演的起点 s_t
