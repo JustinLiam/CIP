@@ -1,0 +1,36 @@
+# @package _global_
+dataset:
+  gamma: 1
+  norm_const: 1
+  data_size:
+    train: 1000
+    val: 100
+    test: 100
+  
+
+model:
+  decoder:
+    batch_size: 256
+    br_size: 6
+    dropout_rate: 0.3
+    fc_hidden_units: 12
+    optimizer:
+      learning_rate: 0.01
+  encoder:
+    batch_size: 64
+    br_size: 9
+    dropout_rate: 0.1
+    fc_hidden_units: 6
+    optimizer:
+      learning_rate: 0.01
+    seq_hidden_units: 24
+
+  train_decoder: True
+
+exp:
+  weights_ema: True
+  alpha: 0.01
+  beta: 0.99
+  balancing: regression
+  max_epochs: 150
+  bce_weight: False                 # Weight in BCE loss, proportional to treatment 

@@ -1,0 +1,23 @@
+# @package _global_
+dataset:
+  coeff: 3.0
+
+model:
+  multi:
+    batch_size: 64
+    br_size: 32
+    dropout_rate: 0.3
+    fc_hidden_units: 16
+    optimizer:
+      learning_rate: 0.01
+    seq_hidden_units: 32
+
+  self_positional_encoding:
+    max_relative_position: 15
+
+exp:
+  weights_ema: True
+  alpha: 0.01
+  beta: 0.99
+  balancing: regression
+  max_epochs: 100

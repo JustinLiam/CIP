@@ -1,0 +1,20 @@
+# @package _global_
+exp:
+  batch_size: 64
+  dropout: 0.2
+  load_best: true
+  lr: 0.01
+  load_data: true
+model:
+  br_size: 8
+  kernel_size: 3
+  kernel_size_x: 2
+  kernel_size_y: 2
+  num_channels_hidden:
+  - 8
+  num_channels_hidden_x:
+  - 8
+  - 8
+  num_channels_hidden_y:
+  - 8
+  - 8

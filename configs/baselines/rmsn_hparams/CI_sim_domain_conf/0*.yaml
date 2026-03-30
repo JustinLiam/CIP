@@ -1,0 +1,52 @@
+# @package _global_
+dataset:
+  gamma: 1
+  norm_const: 1
+  data_size:
+    train: 1000
+    val: 100
+    test: 100
+  
+model:
+  decoder:
+    batch_size: 128
+    dropout_rate: 0.2
+    max_grad_norm: 1.0
+    num_layer: 1
+    optimizer:
+      learning_rate: 0.01
+    seq_hidden_units: 4
+  encoder:
+    batch_size: 64
+    dropout_rate: 0.1
+    max_grad_norm: 2.0
+    num_layer: 1
+    optimizer:
+      learning_rate: 0.01
+    seq_hidden_units: 4
+  propensity_history:
+    batch_size: 256
+    dropout_rate: 0.3
+    max_grad_norm: 2.0
+    num_layer: 1
+    optimizer:
+      learning_rate: 0.0001
+    seq_hidden_units: 4
+  propensity_treatment:
+    batch_size: 256
+    dropout_rate: 0.4
+    max_grad_norm: 1.0
+    num_layer: 1
+    optimizer:
+      learning_rate: 0.01
+    seq_hidden_units: 4
+
+  train_decoder: True
+
+exp:
+  weights_ema: True
+  alpha: 0.01
+  beta: 0.99
+  balancing: regression
+  max_epochs: 150
+  bce_weight: False                 # Weight in BCE loss, proportional to treatment 

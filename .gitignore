@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+checkpoint/
+my_outputs/
+data/
+*.pth
+*.ckpt
+.DS_Store

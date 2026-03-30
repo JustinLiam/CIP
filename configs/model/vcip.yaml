@@ -1,0 +1,75 @@
+# @package _global_
+model:
+  _target_: src.models.vae_model.VAEModel
+  name: VCIP
+  z_dim: 16
+  auxiliary:
+    _target_: src.models.auxiliary_model.AuxiliaryModel
+    hidden_dim: 16
+    num_layers: 2
+    hiddens_G_y:
+    - 16
+    - 16
+    hiddens_G_x:
+    - 16
+    - 16
+    lr: 0.001
+  inference:
+    _target_: src.models.inference_model.InferenceModel
+    hidden_dim: 16
+    num_layers: 2
+    hiddens_F_mu:
+    - 16
+    # - 16
+    hiddens_F_logvar:
+    - 16
+    # - 16
+    predict_y_history:
+    - 16
+    # - 16
+    do: True
+  generative:
+    _target_: src.models.generative_model.GenerativeModel
+    entropy_lambda: 1
+    hidden_dim: 16
+    treatment_hidden_dim: 16
+    num_layers: 2
+    hiddens_F_mu:
+    - 16
+    # - 16
+    hiddens_F_logvar:
+    - 16
+    # - 16
+    hiddens_decoder:
+    - 16
+    # - 16
+    hidden_action_decoder:
+    - 16
+    # - 16
+    hidden_action_decoder_step:
+    - 16
+    # - 16
+  lr: 0.001
+exp:
+  seed: 10
+  batch_size: 512
+  batch_size_val: 128
+  num_samples: 10
+  dropout: 0.2
+  epochs: 100
+  patience: 20
+  lr: 0.01
+  weight_decay: 1.0e-05
+  lambda_X: 0.1
+  lambda_Y: 1
+  load_best: true
+  val: true
+  weights_ema: true
+  tau: 6
+  repeats: 5
+  lambda_step: 0.1
+  lambda_kl: 1
+  lambda_reg: 1
+  lambda_action: 1
+  lambda_hy: 1
+  beta_bound: -10
