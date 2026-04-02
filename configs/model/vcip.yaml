@@ -73,3 +73,37 @@ exp:
   lambda_action: 1
   lambda_hy: 1
   beta_bound: -10
+  # IQL planner (train_iql_planner.py) — declared so Hydra struct mode allows overrides without +exp.*
+  iql_updates: 5000
+  iql_batch_size: 256
+  iql_max_patients: null
+  # Path to train_ct ``ct_best_encoder.pt``, VAE ``model.ckpt`` (inference_model.*), or flat InferenceModel weights
+  iql_inference_ckpt: ""
+  iql_reward_type: negative_outcome_mse
+  iql_max_action: 1.0
+  iql_hidden_dim: 256
+  iql_n_hidden: 2
+  iql_tau: 0.7
+  iql_beta: 3.0
+  iql_discount: 0.99
+  iql_target_tau: 0.005
+  iql_actor_lr: 3.0e-4
+  iql_qf_lr: 3.0e-4
+  iql_vf_lr: 3.0e-4
+  iql_deterministic: false
+  iql_actor_dropout: null
+  # eval_iql_planner.py: empty -> iql_models/seed_{seed}/gamma_{coeff}/iql_planner.pt
+  iql_eval_ckpt: ""
+  # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
+  ct_align_loss: sinkhorn
+  ct_alpha: 0.1
+  ct_lr: 0.001
+  ct_epochs: 200
+  ct_patience: 20
+  ct_weight_decay: 1.0e-05
+  ct_sinkhorn_blur: 0.01
+  ct_batch_size: 256
+  ct_batch_size_val: 128
+  ct_num_workers: 0
+  ct_weight_hidden: 64
+  ct_predictor_hidden: 64

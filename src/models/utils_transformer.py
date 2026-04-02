@@ -75,17 +75,24 @@ class RelativePositionalEncoding(nn.Module):
             # 默认固定编码长度，也用2*max+1，无论cross_attn与否（简化实现，实际用时只会索引到需要范围）
             self.register_buffer('embeddings_table', get_fixed_sin_cos_encodings(d_model, max_relative_position * 2 + 1))
 
-    def forward(self, length_q, length_k):
+    def forward(self, length_q, length_k, device=None):
         embeddings_table = self.embeddings_table.weight if self.trainable else self.embeddings_table
+        dev = device if device is not None else embeddings_table.device
 
         if self.cross_attn:
-            distance_mat = torch.arange(length_k - 1, -1, -1)[None, :] + torch.arange(length_q)[:, None]
+            distance_mat = torch.arange(length_k - 1, -1, -1, device=dev, dtype=torch.long)[None, :] + torch.arange(
+                length_q, device=dev, dtype=torch.long
+            )[:, None]
         else:
-            distance_mat = torch.arange(length_k)[None, :] - torch.arange(length_q)[:, None]
-        distance_mat_clipped = torch.clamp(distance_mat, -self.max_relative_position, self.max_relative_position)
+            distance_mat = torch.arange(length_k, device=dev, dtype=torch.long)[None, :] - torch.arange(
+                length_q, device=dev, dtype=torch.long
+            )[:, None]
+        distance_mat_clipped = torch.clamp(
+            distance_mat, -self.max_relative_position, self.max_relative_position
+        )
         if not self.cross_attn:
             distance_mat_clipped = distance_mat_clipped + self.max_relative_position
-        final_mat = torch.LongTensor(distance_mat_clipped)
+        final_mat = distance_mat_clipped.long()
         embeddings = embeddings_table[final_mat]
 
         # Non-trainable far-away encodings
@@ -107,6 +114,17 @@ class LayerNorm(nn.Module):
 
 
 class Attention(nn.Module):
+    """
+    EDCT / Causal Transformer attention core.
+
+    - Optional relative position bias on scores (R_k) and on the weighted values (R_v), same as the reference CT code.
+    - ``one_direction=True`` applies a **causal** (lower-triangular) mask on the last two dims so position i cannot
+      attend to j > i. Per project CT constraints, self-attention and **aligned** cross-attention between X/A/Y streams
+      should use causal masking; keep ``one_direction=False`` only for non-causal cases (e.g. decoder attending a full
+      encoder memory).
+    - Padding ``mask`` (1 = keep, 0 = block) is combined with the causal mask before softmax.
+    """
+
     def __init__(self,
                  positional_encoding_k: RelativePositionalEncoding = None,
                  positional_encoding_v: RelativePositionalEncoding = None):
@@ -115,21 +133,29 @@ class Attention(nn.Module):
         self.positional_encoding_v = positional_encoding_v
 
     def forward(self, query, key, value, mask=None, dropout=None, one_direction=False):
+        d_k = query.size(-1)
+        device = query.device
+
         scores = torch.matmul(query, key.transpose(-2, -1))
 
         if self.positional_encoding_k is not None:
-            R_k = self.positional_encoding_k(query.size(2), key.size(2))
+            R_k = self.positional_encoding_k(query.size(2), key.size(2), device=device)
             scores = scores + torch.einsum('b h q d, q k d -> b h q k', query, R_k)
 
-        scores = scores / math.sqrt(query.size(-1))
+        scores = scores / math.sqrt(d_k)
+
+        neg_inf = torch.finfo(scores.dtype).min
 
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            if mask.dtype != torch.bool:
+                scores = scores.masked_fill(mask == 0, neg_inf)
+            else:
+                scores = scores.masked_fill(~mask, neg_inf)
 
-        if one_direction:  # Required for self-attention, but not for cross-attention
-            direction_mask = torch.ones_like(scores)
-            direction_mask = torch.tril(direction_mask)
-            scores = scores.masked_fill(direction_mask == 0, -1e9)
+        if one_direction:
+            lq, lk = query.size(2), key.size(2)
+            causal = torch.tril(torch.ones((lq, lk), device=device, dtype=torch.bool))
+            scores = scores.masked_fill(~causal.view(1, 1, lq, lk), neg_inf)
 
         p_attn = F.softmax(scores, dim=-1)
 
@@ -139,7 +165,7 @@ class Attention(nn.Module):
         output = torch.matmul(p_attn, value)
 
         if self.positional_encoding_v is not None:
-            R_v = self.positional_encoding_v(query.size(2), value.size(2))
+            R_v = self.positional_encoding_v(query.size(2), value.size(2), device=device)
             output = output + torch.einsum('b h q v, q v d -> b h q d', p_attn, R_v)
 
         return output, p_attn

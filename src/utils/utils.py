@@ -1,7 +1,9 @@
 import torch
+import torch.nn.functional as F
 import yaml
 import os
 import numpy as np
+from typing import Optional, Sequence, Union
 import random
 import glob
 from pytorch_lightning.callbacks import Callback
@@ -402,6 +404,148 @@ def compute_mmd(x, y, sigma=1.0):
     mmd = x_kernel.mean() + y_kernel.mean() - 2 * xy_kernel.mean()
     return mmd
 
+
+def compute_mmd_weighted(
+    joint_rep: torch.Tensor,
+    marginal_rep: torch.Tensor,
+    w_t: torch.Tensor,
+    sigma: float = 1.0,
+    sigmas: Optional[Sequence[float]] = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Weighted MMD between a **weighted** empirical law on ``joint_rep`` and a **uniform**
+    empirical law on ``marginal_rep``.
+
+    Matches the CTD-style deconfounding objective (see ``.cursor/skills/ctd.md``): align
+    the reweighted joint :math:`P_w(Z_t,A_t)` with the product-of-marginals surrogate built
+    by shuffling :math:`A_t`, i.e. samples ``marginal_rep = cat(Z_t, A_t[perm])``.
+
+    **Difference vs local CTD-NKO_IJCAI code:** that repository does **not** implement MMD for
+    this step. It uses ``geomloss.SamplesLoss`` **Sinkhorn** in
+    ``CTD-NKO_IJCAI-main/src/models/wass_calculator.py`` (:func:`compute_weighted_wasserstein_geomloss`).
+    For numerical parity with the paper code, use that Sinkhorn loss; use this function when you
+    want an MMD-based alignment (as allowed by ``ctd.md`` wording).
+
+    Uses the same RBF kernel as :func:`rbf_kernel` / ``generative_model.mmd_loss`` (multi-scale
+    optional, as in common MMD-GAN / representation balancing code).
+
+    Args:
+        joint_rep: ``[N, D]`` concatenated :math:`[Z_t, A_t]` (or any joint features).
+        marginal_rep: ``[N, D]`` shuffled-marginal features, same batch size ``N``.
+        w_t: ``[N]`` or ``[N, 1]`` non-negative weights (e.g. from WeightNet). Internally
+            normalized to sum to 1 so they act as a probability vector over batch points.
+        sigma: Base RBF bandwidth if ``sigmas`` is None.
+        sigmas: If set, average MMD over these bandwidths (same spirit as multi-σ in
+            ``mmd_loss`` in ``generative_model.py``).
+        eps: Small constant for weight normalization stability.
+
+    Returns:
+        Scalar tensor, mean MMD^2 over chosen bandwidths (biased estimator, diagonals included,
+        consistent with :func:`compute_mmd`).
+    """
+    if joint_rep.shape != marginal_rep.shape:
+        raise ValueError(
+            f"joint_rep and marginal_rep must have the same shape, got "
+            f"{tuple(joint_rep.shape)} vs {tuple(marginal_rep.shape)}"
+        )
+    n = joint_rep.size(0)
+    if n == 0:
+        return joint_rep.new_zeros(())
+
+    w = w_t.reshape(-1).to(dtype=joint_rep.dtype, device=joint_rep.device)
+    if w.numel() != n:
+        raise ValueError(f"w_t must have length N={n}, got {w.numel()}")
+    alpha = w / (w.sum() + eps)
+
+    bandwidths: Union[list, tuple]
+    if sigmas is not None:
+        bandwidths = tuple(float(s) for s in sigmas)
+    else:
+        bandwidths = (float(sigma),)
+
+    mmd_acc = joint_rep.new_zeros(())
+    for s in bandwidths:
+        k_xx = rbf_kernel(joint_rep, joint_rep, s)
+        k_yy = rbf_kernel(marginal_rep, marginal_rep, s)
+        k_xy = rbf_kernel(joint_rep, marginal_rep, s)
+        # Weighted joint–joint term: α^T K_xx α
+        term_xx = torch.einsum("i,ij,j->", alpha, k_xx, alpha)
+        # Uniform on marginal sample: E_{y,y'~Unif}[k(y,y')] = mean of K_yy
+        term_yy = k_yy.mean()
+        # Cross term: E_{x~α,y~Unif}[k(x,y)] = (1/N) Σ_j Σ_i α_i K_xy[i,j]
+        uniform = torch.full((n,), 1.0 / n, device=joint_rep.device, dtype=joint_rep.dtype)
+        term_xy = torch.einsum("i,ij,j->", alpha, k_xy, uniform)
+        mmd_acc = mmd_acc + (term_xx + term_yy - 2.0 * term_xy)
+
+    return mmd_acc / float(len(bandwidths))
+
+
+def compute_weighted_wasserstein_geomloss(A, B, wa, wb=None, blur: float = 0.01, p: int = 2):
+    """
+    Aligned with ``CTD-NKO_IJCAI-main/src/models/wass_calculator.compute_weighted_wasserstein_geomloss``.
+
+    Weighted Sinkhorn / Wasserstein-type loss between samples ``A`` and ``B`` using ``geomloss``.
+    ``wa`` are softmax-normalized on batch dimension (dim 0); if ``wb`` is omitted, ``B`` uses
+    uniform weights (softmax of ones on dim 0), matching the reference implementation.
+
+    Args:
+        A: ``(n, T, dim)`` joint (or other) features per sequence timestep.
+        B: ``(n, T, dim)`` marginal / shuffled counterpart, same shape as ``A``.
+        wa: ``(n, T, 1)`` raw weights (e.g. sigmoid from a weight net); internally ``F.softmax(..., dim=0)``.
+        wb: optional ``(n, T, 1)``; default uniform over ``n`` at each ``t``.
+        blur: Sinkhorn entropic temperature (CTD-NKO uses ``0.01``).
+        p: ground cost exponent (CTD-NKO uses ``2``).
+
+    Returns:
+        Scalar: mean over time of per-step Sinkhorn losses.
+    """
+    try:
+        from geomloss import SamplesLoss
+    except ImportError as err:
+        raise ImportError(
+            "compute_weighted_wasserstein_geomloss requires the `geomloss` package "
+            "(see CTD-NKO_IJCAI requirements.txt)."
+        ) from err
+
+    if wb is None:
+        wb = torch.ones_like(wa).to(wa.device)
+        wb = F.softmax(wb, dim=0)
+    wa = F.softmax(wa, dim=0)
+    n, T, dim = A.shape
+    distances = torch.zeros(T, 1, device=A.device, dtype=A.dtype)
+    loss = SamplesLoss(loss="sinkhorn", p=p, blur=blur)
+    for t in range(T):
+        distances[t] = loss(wa[:, t], A[:, t], wb[:, t], B[:, t])
+    return distances.mean()
+
+
+def compute_weighted_wasserstein_joint_marginal_flat(
+    joint_rep: torch.Tensor,
+    marginal_rep: torch.Tensor,
+    w_t: torch.Tensor,
+    blur: float = 0.01,
+) -> torch.Tensor:
+    """
+    Same distribution-alignment **objective** as CTD-NKO, for flat batch tensors ``[N, D]``
+    (e.g. one time index per row). Wraps :func:`compute_weighted_wasserstein_geomloss` with
+    ``T=1``.
+
+    CTD-NKO builds ``real_samples`` / ``fake_samples`` as ``[n, T, dim]``; this helper is for
+    ``train_ct``-style batches where each row is already ``concat([Z_t, A_t], dim=-1)``.
+    """
+    if joint_rep.shape != marginal_rep.shape:
+        raise ValueError(
+            f"joint_rep and marginal_rep must have the same shape, got "
+            f"{tuple(joint_rep.shape)} vs {tuple(marginal_rep.shape)}"
+        )
+    n = joint_rep.size(0)
+    w = w_t.reshape(n, 1, 1).to(device=joint_rep.device, dtype=joint_rep.dtype)
+    A = joint_rep.unsqueeze(1)
+    B = marginal_rep.unsqueeze(1)
+    return compute_weighted_wasserstein_geomloss(A, B, w, blur=blur)
+
+
 def pdist2sq(A, B):
     na = torch.sum(torch.square(A), 1)
     nb = torch.sum(torch.square(B), 1)  
@@ -429,7 +573,7 @@ def calculate_mmd(A, B, rbf_sigma=1):
 
     return mmd
 
-def eval(mode, dataset_collection):
+def eval(model, dataset_collection):
     val_rmse_orig, val_rmse_all = model.get_normalised_masked_rmse(dataset_collection.val_f)
     results = {}
     encoder_results = {}

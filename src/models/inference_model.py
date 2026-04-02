@@ -1,11 +1,27 @@
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
+
+from src.data.ct_transition_dataset import _covariate_stream_dim
+from src.models.ct_deconfound import build_covariate_x
 from src.models.dynamic_model import DynamicParamNetwork
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
+
+
+def _expand_static_time_dim(H_t: dict, seq_len: int) -> dict:
+    """[B,d] static -> [B,T,d] so it can concat with prev_outputs / prev_treatments."""
+    out = dict(H_t)
+    if "static_features" in out:
+        s = out["static_features"]
+        if s.dim() == 2:
+            out["static_features"] = s.unsqueeze(1).expand(-1, seq_len, -1)
+    return out
+
 
 class InferenceModel(nn.Module):
     def __init__(self, config):
         super(InferenceModel, self).__init__()
+        self.config = config
         self.z_dim = config['model']['z_dim']
         self.hidden_dim = config['model']['inference']['hidden_dim']
         self.num_layers = config['model']['inference']['num_layers']
@@ -24,8 +40,11 @@ class InferenceModel(nn.Module):
         self.treatment_hidden_dim = config['model']['generative']['treatment_hidden_dim']
         self.dropout = config['exp']['dropout']
 
+        ds_dict = OmegaConf.to_container(config["dataset"], resolve=True)
+        ct_x_dim = _covariate_stream_dim(ds_dict)
+
         self.ct_history_encoder = CTHistoryEncoder(
-            x_dim=self.input_size + self.static_size,
+            x_dim=ct_x_dim,
             a_dim=self.treatment_dim,
             y_dim=self.output_dim,
             static_dim=self.static_size,
@@ -161,30 +180,9 @@ class InferenceModel(nn.Module):
         outputs = H_t['prev_outputs']  # Y, 形状: [batch_size, seq_len, y_dim]
         seq_len = treatments.size(1)  # 获取当前历史序列的时间步长度
 
-        # 1. 拆解字典，安全且动态地构建协变量 X 分支
-        if self.input_size > 0:
-            # 如果数据集有动态生理特征 (如 MIMIC-III)
-            if 'vitals' in H_t:
-                covariates = H_t['vitals']
-            else:
-                covariates = H_t['current_covariates']
-
-            if self.static_size > 0:
-                statics = H_t['static_features']
-                # 确保静态特征拥有时间维度 [batch_size, 1, static_dim] -> [batch_size, seq_len, static_dim]
-                if statics.dim() == 2:
-                    statics = statics.unsqueeze(1).expand(-1, seq_len, -1)
-                x_input = torch.cat((covariates, statics), dim=-1)
-            else:
-                x_input = covariates
-        else:
-            # 如果 input_size == 0 (如肿瘤数据集)，X 分支只输入静态特征
-            statics = H_t['static_features']
-            if statics.dim() == 2:
-                # 把静态特征沿着时间维度复制 seq_len 遍，喂给 Transformer
-                x_input = statics.unsqueeze(1).expand(-1, seq_len, -1)
-            else:
-                x_input = statics
+        # 1. 协变量 X 分支：与 train_ct / CTHistoryEncoder.x_dim（_covariate_stream_dim）一致
+        H_aligned = _expand_static_time_dim(H_t, seq_len)
+        x_input = build_covariate_x(H_aligned, self.config)
 
         # 2. 传入 Causal Transformer 提取时序表示
         # ct_rep 形状: (batch_size, history_length, d_model)
