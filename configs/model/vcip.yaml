@@ -117,3 +117,11 @@ exp:
   ct_num_workers: 0
   ct_weight_hidden: 64
   ct_predictor_hidden: 64
+  # Multi-horizon teacher losses (k=1..K) + optional scheduled sampling on prev_outputs for k>=2; alignment stays k=1 only.
+  ct_multi_k_max: 3
+  ct_multi_eta: 0.5
+  ct_sched_p_start: 0.3
+  ct_sched_p_end: 0.8
+  ct_sched_ramp_epochs: 100
+  # train_ct early stopping + best ckpt: weighted = val_pred (L1–L3 mix); l1 = val mean L1 only (better for IQL-facing z_t)
+  ct_es_metric: l1

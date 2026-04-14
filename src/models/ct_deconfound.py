@@ -153,8 +153,28 @@ class CTDeconfoundModel(nn.Module):
         za_for_y = torch.cat([Z_t, A_t], dim=-1)
         y_hat = self.predictor(za_for_y)
         se = (y_hat - y_next).pow(2).mean(dim=-1)
-        
-        # 必须对 w 进行 .detach()，防止 loss_pred 流向 WeightNet
-        loss_pred = (w.detach() * se).mean()
-        
+        # 提取当前时间步的 active 掩码 [B]  # TODO 来自Gemini的修改，需要验证
+        active_t = H_t["active_entries"][:, -1, 0].squeeze() 
+        # 只对有效的序列计算加权 Loss
+        loss_pred = (w.detach() * se * active_t).sum() / (active_t.sum() + 1e-8)
+        # # 必须对 w 进行 .detach()，防止 loss_pred 流向 WeightNet
+        # loss_pred = (w.detach() * se).mean()
+
         return loss_pred, Z_t, A_t, w, logits_w, y_hat
+
+    def weighted_prediction_loss(
+        self, H_t: Dict[str, torch.Tensor], y_target: torch.Tensor, w_fixed: torch.Tensor
+    ) -> tuple:
+        """
+        Same M-step prediction loss as ``forward`` but uses a fixed batch weight ``w_fixed``
+        (typically ``w.detach()`` from the k=1 pass). For multi-horizon ablations only.
+        """
+        Z_t, A_t = self.encode(H_t)
+        za = torch.cat([Z_t, A_t], dim=-1)
+        y_hat = self.predictor(za)
+        se = (y_hat - y_target).pow(2).mean(dim=-1)
+        # 同样加入掩码
+        active_t = H_t["active_entries"][:, -1, 0].squeeze()
+        loss = (w_fixed * se * active_t).sum() / (active_t.sum() + 1e-8)
+        # loss = (w_fixed * se).mean()
+        return loss, y_hat
