@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
@@ -33,6 +34,7 @@ class IQLPlannerConfig:
     max_steps: int = 200000
     deterministic_actor: bool = False
     actor_dropout: Optional[float] = None
+    max_grad_norm: Optional[float] = None
     device: str = "cuda"
 
 
@@ -82,6 +84,11 @@ class MLP(nn.Module):
 
 
 class GaussianPolicy(nn.Module):
+    """
+    Tanh output in (-1, 1), then scaled to [-max_action, max_action].
+    For dataset actions in [0, max_action], use ``dataset_actions_to_tanh_policy_space`` in the transition builder.
+    """
+
     def __init__(
         self,
         state_dim: int,
@@ -115,6 +122,8 @@ class GaussianPolicy(nn.Module):
 
 
 class DeterministicPolicy(nn.Module):
+    """Same action range convention as :class:`GaussianPolicy`."""
+
     def __init__(
         self,
         state_dim: int,
@@ -241,6 +250,8 @@ class IQLPlanner:
         v_loss = asymmetric_l2_loss(adv, self.cfg.iql_tau)
         self.v_optimizer.zero_grad()
         v_loss.backward()
+        if self.cfg.max_grad_norm is not None:
+            clip_grad_norm_(self.vf.parameters(), self.cfg.max_grad_norm)
         self.v_optimizer.step()
         log_dict["value_loss"] = float(v_loss.item())
         return adv
@@ -275,6 +286,8 @@ class IQLPlanner:
         q_loss = 0.5 * (F.mse_loss(q1, targets) + F.mse_loss(q2, targets))
         self.q_optimizer.zero_grad()
         q_loss.backward()
+        if self.cfg.max_grad_norm is not None:
+            clip_grad_norm_(self.qf.parameters(), self.cfg.max_grad_norm)
         self.q_optimizer.step()
         soft_update(self.q_target, self.qf, self.cfg.tau)
         log_dict["q_loss"] = float(q_loss.item())
@@ -302,6 +315,8 @@ class IQLPlanner:
         policy_loss = torch.mean(exp_adv * bc_losses)
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
+        if self.cfg.max_grad_norm is not None:
+            clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.actor_optimizer.step()
         self.actor_lr_schedule.step()
         log_dict["actor_loss"] = float(policy_loss.item())
@@ -350,6 +365,7 @@ class IQLPlanner:
         state = torch.load(path, map_location=device)
         cfg_dict = dict(state["cfg"])
         cfg_dict["device"] = device
+        cfg_dict.setdefault("max_grad_norm", None)
         cfg = IQLPlannerConfig(**cfg_dict)
         planner = cls(cfg)
         planner.load_eval_weights(state)

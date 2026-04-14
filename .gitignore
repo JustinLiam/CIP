@@ -6,3 +6,10 @@ data/
 *.pth
 *.ckpt
 .DS_Store
+CORL-main/
+CausalTransformer/
+*.log
+*.pth
+*.pt
+*.gitignore
+CTD-NKO_IJCAI-main/

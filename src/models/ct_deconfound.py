@@ -137,10 +137,24 @@ class CTDeconfoundModel(nn.Module):
 
     def forward(self, H_t: Dict[str, torch.Tensor], y_next: torch.Tensor):
         Z_t, A_t = self.encode(H_t)
-        za = torch.cat([Z_t, A_t], dim=-1)
-        logits_w = self.weight_net(za)
+        
+        # ==============================================================
+        # 1. E-Step 分支：为 WeightNet 提供特征
+        # 必须对 Z_t 进行 .detach()，彻底切断 loss_align 流向 Encoder 的路径
+        # ==============================================================
+        za_for_w = torch.cat([Z_t.detach(), A_t], dim=-1)
+        logits_w = self.weight_net(za_for_w)
         w = F.softmax(logits_w, dim=0) * float(Z_t.size(0))
-        y_hat = self.predictor(za)
+        
+        # ==============================================================
+        # 2. M-Step 分支：为 Predictor 提供特征
+        # 这里的 Z_t 保持正常连接，负责接收 loss_pred 回传的梯度更新 Encoder
+        # ==============================================================
+        za_for_y = torch.cat([Z_t, A_t], dim=-1)
+        y_hat = self.predictor(za_for_y)
         se = (y_hat - y_next).pow(2).mean(dim=-1)
-        loss_pred = (w * se).mean()
+        
+        # 必须对 w 进行 .detach()，防止 loss_pred 流向 WeightNet
+        loss_pred = (w.detach() * se).mean()
+        
         return loss_pred, Z_t, A_t, w, logits_w, y_hat

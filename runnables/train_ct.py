@@ -55,7 +55,8 @@ def _alignment_loss(
     raise ValueError(f"Unknown ct_align_loss: {mode}")
 
 
-def _run_epoch(model, loader, optimizer, device, alpha: float, align_mode: str, blur: float, train: bool):
+# def _run_epoch(model, loader, optimizer, device, alpha: float, align_mode: str, blur: float, train: bool):
+def _run_epoch(model, loader, optimizer_w, optimizer_theta, device, align_mode: str, blur: float, train: bool):
     total = 0.0
     total_pred = 0.0
     total_align = 0.0
@@ -67,20 +68,38 @@ def _run_epoch(model, loader, optimizer, device, alpha: float, align_mode: str, 
     for batch in loader:
         H_t = {k: v.to(device) for k, v in batch["H_t"].items()}
         y_next = batch["y_next"].to(device)
-        if train:
-            optimizer.zero_grad(set_to_none=True)
+        
         with torch.set_grad_enabled(train):
+            # 只进行一次前向传播
             loss_pred, Z_t, A_t, w, _, _ = model(H_t, y_next)
-            loss_align = _alignment_loss(Z_t, A_t, w, align_mode, blur)
-            loss = loss_pred + alpha * loss_align
-        if train:
-            loss.backward()
-            optimizer.step()
-        total += float(loss.detach())
+            
+            if train:
+                # ==========================================
+                # E-Step: 更新权重网络 (WeightNet)
+                # 目标：最小化分布对齐损失 (传入 Z_t.detach() 防止表征坍塌)
+                # ==========================================
+                optimizer_w.zero_grad(set_to_none=True)
+                loss_align = _alignment_loss(Z_t.detach(), A_t, w, align_mode, blur)
+                loss_align.backward()
+                optimizer_w.step()
+
+                # ==========================================
+                # M-Step: 更新表征与预测网络 (CT Encoder & Predictor)
+                # 目标：最小化加权事实损失 (模型内部已执行 w.detach())
+                # ==========================================
+                optimizer_theta.zero_grad(set_to_none=True)
+                loss_pred.backward()
+                optimizer_theta.step()
+            else:
+                # 验证模式下仅计算 loss，不截断任何内容
+                loss_align = _alignment_loss(Z_t, A_t, w, align_mode, blur)
+
+        # total += float(loss_pred.detach() + alpha * loss_align.detach())
         total_pred += float(loss_pred.detach())
         total_align += float(loss_align.detach())
         n_batches += 1
-    return total / max(n_batches, 1), total_pred / max(n_batches, 1), total_align / max(n_batches, 1)
+    # return total / max(n_batches, 1), total_pred / max(n_batches, 1), total_align / max(n_batches, 1)
+    return total_pred / max(n_batches, 1), total_align / max(n_batches, 1)
 
 
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
@@ -92,14 +111,14 @@ def main(args: DictConfig):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     ct_align = str(OmegaConf.select(args, "exp.ct_align_loss", default="sinkhorn"))
-    ct_alpha = float(OmegaConf.select(args, "exp.ct_alpha", default=0.1))
-    ct_lr = float(OmegaConf.select(args, "exp.ct_lr", default=1e-3))
+    # ct_alpha = float(OmegaConf.select(args, "exp.ct_alpha", default=0.1))
+    ct_lr = float(OmegaConf.select(args, "exp.ct_lr", default=5e-4))
     ct_epochs = int(OmegaConf.select(args, "exp.ct_epochs", default=200))
     ct_patience = int(OmegaConf.select(args, "exp.ct_patience", default=20))
     ct_wd = float(OmegaConf.select(args, "exp.ct_weight_decay", default=1e-5))
     ct_blur = float(OmegaConf.select(args, "exp.ct_sinkhorn_blur", default=0.01))
-    batch_size = int(OmegaConf.select(args, "exp.ct_batch_size", default=256))
-    batch_size_val = int(OmegaConf.select(args, "exp.ct_batch_size_val", default=128))
+    batch_size = int(OmegaConf.select(args, "exp.ct_batch_size", default=512))
+    batch_size_val = int(OmegaConf.select(args, "exp.ct_batch_size_val", default=256))
     num_workers = int(OmegaConf.select(args, "exp.ct_num_workers", default=0))
 
     original_cwd = Path(get_original_cwd())
@@ -138,7 +157,17 @@ def main(args: DictConfig):
     logger.info(f"Covariate stream x_dim (CT encoder input): {x_dim}")
 
     model = CTDeconfoundModel(args, x_dim=x_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=ct_lr, weight_decay=ct_wd)
+
+    # optimizer = torch.optim.Adam(model.parameters(), lr=ct_lr, weight_decay=ct_wd)
+    # 分离网络参数
+    w_params = list(model.weight_net.parameters())
+    theta_params = list(model.ct_encoder.parameters()) + \
+                   list(model.projection.parameters()) + \
+                   list(model.predictor.parameters())
+
+    # 创建两个独立的优化器
+    optimizer_w = torch.optim.Adam(w_params, lr=ct_lr, weight_decay=ct_wd)
+    optimizer_theta = torch.optim.Adam(theta_params, lr=1e-4, weight_decay=ct_wd)  #TODO 调整 learning rate
 
     out_dir = original_cwd / "ct_checkpoints" / f"seed_{int(args.exp.seed)}_gamma_{int(args.dataset.coeff)}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -148,18 +177,18 @@ def main(args: DictConfig):
     patience_left = ct_patience
 
     for epoch in range(1, ct_epochs + 1):
-        tr_loss, tr_pred, tr_align = _run_epoch(
-            model, train_loader, optimizer, device, ct_alpha, ct_align, ct_blur, train=True
+        tr_pred, tr_align = _run_epoch(
+            model, train_loader, optimizer_w, optimizer_theta, device, ct_align, ct_blur, train=True
         )
         with torch.no_grad():
-            va_loss, va_pred, va_align = _run_epoch(
-                model, val_loader, None, device, ct_alpha, ct_align, ct_blur, train=False
+            va_pred, va_align = _run_epoch(
+                model, val_loader, None, None, device, ct_align, ct_blur, train=False
             )
 
         logger.info(
             f"Epoch {epoch}/{ct_epochs} "
-            f"train loss={tr_loss:.6f} (pred={tr_pred:.6f} align={tr_align:.6f}) | "
-            f"val loss={va_loss:.6f} (pred={va_pred:.6f} align={va_align:.6f})"
+            f"train_pred={tr_pred:.6f} train_align={tr_align:.6f} | "
+            f"val_pred={va_pred:.6f} val_align={va_align:.6f}"
         )
 
         if va_pred < best_val_pred:

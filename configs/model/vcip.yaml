@@ -81,19 +81,29 @@ exp:
   iql_inference_ckpt: ""
   iql_reward_type: negative_outcome_mse
   iql_max_action: 1.0
+  # Map dataset treatments in [0, iql_max_action] to [-iql_max_action, iql_max_action] for Tanh IQL actor
+  iql_dataset_actions_unit_interval: true
   iql_hidden_dim: 256
   iql_n_hidden: 2
+  # iql_tau: 策略价值函数加权的 expectile 参数，控制“policy value”与“critic value”之间的偏置。具体地，TD3+BC 和 IQL 论文中用于 expectile regression，建议在 0.5~0.9 之间，越大代表更乐观估计。
   iql_tau: 0.7
   iql_beta: 3.0
   iql_discount: 0.99
+  # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005
   iql_actor_lr: 3.0e-4
   iql_qf_lr: 3.0e-4
   iql_vf_lr: 3.0e-4
+  # Smoothed metrics in train_iql logs: trailing mean over this many steps (default 200)
+  iql_log_window: 200
+  # Optional L2 grad clip per network (V, Q twin, actor); null = disabled
+  iql_max_grad_norm: null
   iql_deterministic: false
   iql_actor_dropout: null
   # eval_iql_planner.py: empty -> iql_models/seed_{seed}/gamma_{coeff}/iql_planner.pt
   iql_eval_ckpt: ""
+  # Roll out τ steps: each step replans from CT state after appending (a_t, y_{t+1}); false = repeat first action (legacy)
+  iql_eval_autoregressive: true
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
   ct_align_loss: sinkhorn
   ct_alpha: 0.1
@@ -102,8 +112,8 @@ exp:
   ct_patience: 20
   ct_weight_decay: 1.0e-05
   ct_sinkhorn_blur: 0.01
-  ct_batch_size: 256
-  ct_batch_size_val: 128
+  ct_batch_size: 512
+  ct_batch_size_val: 256
   ct_num_workers: 0
   ct_weight_hidden: 64
   ct_predictor_hidden: 64
