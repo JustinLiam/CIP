@@ -74,7 +74,7 @@ exp:
   lambda_hy: 1
   beta_bound: -10
   # IQL planner (train_iql_planner.py) — declared so Hydra struct mode allows overrides without +exp.*
-  iql_updates: 5000
+  iql_updates: 2000
   iql_batch_size: 256
   iql_max_patients: null
   # Path to train_ct ``ct_best_encoder.pt``, VAE ``model.ckpt`` (inference_model.*), or flat InferenceModel weights
@@ -104,6 +104,8 @@ exp:
   iql_eval_ckpt: ""
   # Roll out τ steps: each step replans from CT state after appending (a_t, y_{t+1}); false = repeat first action (legacy)
   iql_eval_autoregressive: true
+  # Horizon-aware IQL: normalize time-to-go; must match iql_dataset_builder / eval_iql_planner
+  max_tau: 12.0
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
   ct_align_loss: sinkhorn
   ct_alpha: 0.1

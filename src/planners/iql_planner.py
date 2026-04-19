@@ -19,6 +19,7 @@ LOG_STD_MAX = 2.0
 
 @dataclass
 class IQLPlannerConfig:
+    # Horizon-aware + prev action: state_dim = z_dim + output_dim + 1 + action_dim (a_{t-1} in policy space)
     state_dim: int
     action_dim: int
     max_action: float = 1.0

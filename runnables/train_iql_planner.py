@@ -57,6 +57,7 @@ def main(args: DictConfig):
 
     iql_max_action = float(OmegaConf.select(args, "exp.iql_max_action", default=1.0))
     iql_unit_actions = bool(OmegaConf.select(args, "exp.iql_dataset_actions_unit_interval", default=True))
+    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
     transitions = build_iql_transitions_from_ct(
         data=dataset_collection.train_f.data,
         inference_model=inference_model,
@@ -65,6 +66,7 @@ def main(args: DictConfig):
         max_patients=iql_max_patients,
         max_action=iql_max_action,
         dataset_actions_unit_interval=iql_unit_actions,
+        max_tau=max_tau,
     )
     logger.info(f"Built transitions: {len(transitions['states'])}")
 

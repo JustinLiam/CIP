@@ -25,7 +25,7 @@ from omegaconf import DictConfig, OmegaConf
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cip_dataset import CIPDataset, get_dataloader
-from src.data.iql_dataset_builder import align_h_t_static_to_history
+from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_actions_to_tanh_policy_space
 from src.models.inference_model import InferenceModel
 from src.planners.iql_planner import IQLPlanner
 from src.utils.inference_ckpt import load_inference_checkpoint
@@ -50,6 +50,29 @@ def _policy_to_sim_interval_torch(raw: torch.Tensor, max_action: float) -> torch
     """Batched tensor version of ``_actions_to_sim_interval``."""
     denom = 2.0 * max_action if max_action > 0 else 1.0
     return torch.clamp((raw + max_action) / denom, 0.0, 1.0)
+
+
+def _sim_actions_to_tanh_batch(a_sim: torch.Tensor, max_action: float) -> torch.Tensor:
+    """Match ``dataset_actions_to_tanh_policy_space`` for batched simulator actions [B, A]."""
+    if max_action <= 0:
+        return a_sim
+    a = torch.clamp(a_sim, 0.0, max_action)
+    return 2.0 * a - max_action
+
+
+def _iql_augmented_state(
+    z: torch.Tensor,
+    eval_target: torch.Tensor,
+    step: int,
+    eval_tau: int,
+    max_tau: float,
+    a_prev_tanh: torch.Tensor,
+) -> torch.Tensor:
+    """concat(Z_t, Y_goal, delta_t_norm, a_{t-1}) in policy space; delta_t_norm = (eval_tau - step) / max_tau."""
+    bsz = z.size(0)
+    steps_left = float(eval_tau - step)
+    delta = torch.full((bsz, 1), steps_left / max_tau, device=z.device, dtype=z.dtype)
+    return torch.cat([z, eval_target, delta, a_prev_tanh], dim=-1)
 
 
 def _unscaled_cancer_volume(y_norm: torch.Tensor, mean_ser, std_ser) -> torch.Tensor:
@@ -188,9 +211,14 @@ def main(args: DictConfig):
     # tau 加载自 args.exp.tau，默认由 cancer_sim_cont.yaml（如 dataset/projection_horizon/tau）或 config.yaml（如 exp.tau）提供。
     # 你可以在命令行用 `python runnables/eval_iql_planner.py exp.tau=8` 这样的覆盖参数，Hydra 会自动覆盖 config.yaml 和任何 defaults 里的 tau 配置。
     tau = int(args.exp.tau)
+    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
+    if max_tau <= 0:
+        raise ValueError("exp.max_tau must be positive for horizon-aware IQL evaluation.")
     autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
     mean_ser, std_ser = dataset_collection.train_scaling_params
-    logger.info(f"IQL eval autoregressive action rollout: {autoregressive_eval} (tau={tau})")
+    logger.info(
+        f"IQL eval autoregressive action rollout: {autoregressive_eval} (tau={tau}, max_tau={max_tau})"
+    )
 
     losses = []
     losses_2 = []
@@ -208,12 +236,17 @@ def main(args: DictConfig):
                 targets[key] = targets[key].to(device)
 
             if autoregressive_eval:
+                eval_target = targets["outputs"][:, -1, :]
                 H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
+                # Previous action (simulator interval) before the first planned step: last factual treatment in prefix.
+                a_prev_sim = H_work["current_treatments"][:, -1, :].clone()
                 planned = []
-                for _ in range(tau):
+                for step in range(tau):
                     H_work = align_h_t_static_to_history(H_work)
                     z, _, _ = inference_model.ct_hidden_history(H_work)
-                    po = planner.actor(z)
+                    a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
+                    obs = _iql_augmented_state(z, eval_target, step, tau, max_tau, a_prev_tanh)
+                    po = planner.actor(obs)
                     ma = planner.actor.max_action
                     if isinstance(po, Distribution):
                         a_raw = torch.clamp(ma * po.mean, -ma, ma)
@@ -230,14 +263,21 @@ def main(args: DictConfig):
                     _extend_h_work_after_one_step(
                         H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
                     )
+                    a_prev_sim = a_sim
                 a_seq = torch.stack(planned, dim=1).contiguous()
             else:
                 z, _, _ = inference_model.ct_hidden_history(H_t)
                 z_np = z.detach().cpu().numpy()
+                eval_target_np = targets["outputs"][:, -1, :].detach().cpu().numpy()
+                a_prev_raw = H_t["current_treatments"][:, -1, :].detach().cpu().numpy()
+                a_prev_feat = dataset_actions_to_tanh_policy_space(a_prev_raw, max_action)
                 bsz = z_np.shape[0]
+                delta_scalar = float(tau - 0) / max_tau
+                delta_vec = np.array([delta_scalar], dtype=np.float32)
                 a_rows = []
                 for b in range(bsz):
-                    a_rows.append(planner.act(z_np[b]))
+                    obs_b = np.concatenate([z_np[b], eval_target_np[b], delta_vec, a_prev_feat[b]], axis=0)
+                    a_rows.append(planner.act(obs_b))
                 a_raw = np.stack(a_rows, axis=0)
                 a_sim = _actions_to_sim_interval(a_raw, max_action)
                 a_seq = torch.tensor(a_sim, device=device, dtype=torch.float32).unsqueeze(1).expand(-1, tau, -1).contiguous()
