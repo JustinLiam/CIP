@@ -74,7 +74,7 @@ exp:
   lambda_hy: 1
   beta_bound: -10
   # IQL planner (train_iql_planner.py) — declared so Hydra struct mode allows overrides without +exp.*
-  iql_updates: 2000
+  iql_updates: 5000
   iql_batch_size: 256
   iql_max_patients: null
   # Path to train_ct ``ct_best_encoder.pt``, VAE ``model.ckpt`` (inference_model.*), or flat InferenceModel weights
@@ -94,6 +94,15 @@ exp:
   iql_actor_lr: 3.0e-4
   iql_qf_lr: 3.0e-4
   iql_vf_lr: 3.0e-4
+  # Periodic val MAE on train_f-side val_f during IQL training; 0 disables (last-step ckpt only).
+  # Selection metric is computed on val_f only (no test_f exposure), with a fixed RNG snapshot
+  # so successive checkpoints share the same eval protocol.
+  iql_val_every: 200
+  iql_val_batch_size: null
+  # Metric to minimize for best checkpoint: mae_uns | mae_norm
+  iql_val_metric: mae_uns
+  # Also save final-step weights to iql_planner_last.pt when val is enabled
+  iql_val_save_last: true
   # Smoothed metrics in train_iql logs: trailing mean over this many steps (default 200)
   iql_log_window: 200
   # Optional L2 grad clip per network (V, Q twin, actor); null = disabled
