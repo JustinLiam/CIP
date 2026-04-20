@@ -1,0 +1,5 @@
+combo_id,seed,ct_lr,ct_multi_k_max,ct_multi_eta,ct_es_metric,ct_val_L1,iql_best_val_mae_uns,iql_best_step,mae_uns_eval_split,eval_split
+lr-5e-4_k-1_eta-0.3_esm-l1,10,5e-4,1,0.3,l1,0.000000,0.294100,3000,0.345616,false
+lr-5e-4_k-1_eta-0.3_esm-weighted,10,5e-4,1,0.3,weighted,0.000000,0.294100,3000,0.345616,false
+lr-5e-4_k-1_eta-0.5_esm-l1,10,5e-4,1,0.5,l1,0.000000,0.294100,3000,0.345616,false
+lr-5e-4_k-1_eta-0.5_esm-weighted,10,5e-4,1,0.5,weighted,0.000000,0.294100,3000,0.345616,false

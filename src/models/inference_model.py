@@ -3,7 +3,7 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 from src.data.ct_transition_dataset import _covariate_stream_dim
-from src.models.ct_deconfound import build_covariate_x
+from src.models.ct_deconfound import OutcomePredictor, build_covariate_x
 from src.models.dynamic_model import DynamicParamNetwork
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
 
@@ -54,7 +54,19 @@ class InferenceModel(nn.Module):
             dropout=self.dropout,
         )
         self.projection_head = ProjectionHead(input_dim=64, hidden_dim=64, output_dim=self.z_dim)
-        
+
+        # Outcome predictor trained jointly in ``train_ct.py``: p(y_{t+1} | Z_t, A_t).
+        # Used at IQL val / eval time as a learned "world model" for model-based OPE
+        # (alternative to the cancer simulator oracle). Weights are loaded from
+        # ct_best_encoder.pt via ``load_inference_checkpoint`` when present.
+        predictor_hidden = int(OmegaConf.select(config, "exp.ct_predictor_hidden", default=64))
+        self.outcome_predictor = OutcomePredictor(
+            z_dim=self.z_dim,
+            a_dim=self.treatment_size,
+            y_dim=self.output_dim,
+            hidden_dim=predictor_hidden,
+        )
+        self._outcome_predictor_loaded = False
 
         if self.static_size > 0:
             input_size = self.input_size + self.static_size + self.treatment_size

@@ -300,9 +300,19 @@ def main(args: DictConfig):
     optimizer_w = torch.optim.Adam(w_params, lr=ct_lr, weight_decay=ct_wd)
     optimizer_theta = torch.optim.Adam(theta_params, lr=1e-4, weight_decay=ct_wd)  #TODO 调整 learning rate
 
-    out_dir = original_cwd / "ct_checkpoints" / f"seed_{int(args.exp.seed)}_gamma_{int(args.dataset.coeff)}"
+    # Output directory: default to canonical ct_checkpoints/seed_${s}_gamma_${g}/,
+    # but allow override via exp.ct_ckpt_dir so grid search / parallel experiments
+    # don't clobber the canonical file used by the main pipeline (train_ct_iql.sh).
+    _ct_ckpt_dir_override = OmegaConf.select(args, "exp.ct_ckpt_dir", default=None)
+    if _ct_ckpt_dir_override:
+        out_dir = Path(str(_ct_ckpt_dir_override))
+        if not out_dir.is_absolute():
+            out_dir = original_cwd / out_dir
+    else:
+        out_dir = original_cwd / "ct_checkpoints" / f"seed_{int(args.exp.seed)}_gamma_{int(args.dataset.coeff)}"
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / "ct_best_encoder.pt"
+    logger.info(f"CT encoder checkpoint will be saved to: {ckpt_path}")
 
     def _es_score(va_extras: dict, va_pred_f: float) -> float:
         """Scalar for early stopping / best ckpt: weighted val_pred or val mean L1 (k=1 loss)."""
@@ -359,6 +369,10 @@ def main(args: DictConfig):
                 {
                     "ct_history_encoder": model.ct_encoder.state_dict(),
                     "projection_head": model.projection.state_dict(),
+                    # Save the OutcomePredictor so downstream IQL can do model-based OPE
+                    # (roll out with p(y_{t+1} | z_t, a_t) instead of the cancer simulator).
+                    "outcome_predictor": model.predictor.state_dict(),
+                    "predictor_hidden": int(OmegaConf.select(args, "exp.ct_predictor_hidden", default=64)),
                     "val_loss_pred": va_pred,
                     "val_loss_l1": float(va_ex["mean_l1"]),
                     "ct_es_metric": ct_es_metric,

@@ -65,8 +65,8 @@ exp:
   load_best: true
   val: true
   weights_ema: true
-  tau: 6
-  repeats: 5
+  tau: 12
+  repeats: 10
   lambda_step: 0.1
   lambda_kl: 1
   lambda_reg: 1
@@ -87,7 +87,7 @@ exp:
   iql_n_hidden: 2
   # iql_tau: 策略价值函数加权的 expectile 参数，控制“policy value”与“critic value”之间的偏置。具体地，TD3+BC 和 IQL 论文中用于 expectile regression，建议在 0.5~0.9 之间，越大代表更乐观估计。
   iql_tau: 0.7
-  iql_beta: 3.0
+  iql_beta: 1.0
   iql_discount: 0.99
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005
@@ -106,18 +106,27 @@ exp:
   # Smoothed metrics in train_iql logs: trailing mean over this many steps (default 200)
   iql_log_window: 200
   # Optional L2 grad clip per network (V, Q twin, actor); null = disabled
-  iql_max_grad_norm: null
+  iql_max_grad_norm: 5.0
   iql_deterministic: false
   iql_actor_dropout: null
   # eval_iql_planner.py: empty -> iql_models/seed_{seed}/gamma_{coeff}/iql_planner.pt
   iql_eval_ckpt: ""
   # Roll out τ steps: each step replans from CT state after appending (a_t, y_{t+1}); false = repeat first action (legacy)
   iql_eval_autoregressive: true
+  # Model-based OPE A/B during IQL val:
+  #   - sim:       ground-truth cancer simulator oracle (synthetic benchmark only).
+  #   - predictor: learned OutcomePredictor from ct_best_encoder.pt (works on real data).
+  # When >=2 worlds are listed, train_iql_planner.py tracks a separate best checkpoint
+  # per world and logs Spearman rank correlation / top-K overlap / regret across worlds.
+  iql_val_worlds: [sim, predictor]
+  # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
+  # Must appear in iql_val_worlds.
+  iql_val_selection_world: sim
   # Horizon-aware IQL: normalize time-to-go; must match iql_dataset_builder / eval_iql_planner
   max_tau: 12.0
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
   ct_align_loss: sinkhorn
-  ct_alpha: 0.1
+  # ct_alpha: 0.1 使用EM方法后， 该参数不生效
   ct_lr: 0.001
   ct_epochs: 200
   ct_patience: 20

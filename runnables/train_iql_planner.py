@@ -1,9 +1,11 @@
+import json
 import logging
 import os
 import sys
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
 import numpy as np
@@ -32,6 +34,34 @@ def _state_dict_to_cpu(obj):
     if isinstance(obj, dict):
         return {k: _state_dict_to_cpu(v) for k, v in obj.items()}
     return obj
+
+
+def _spearman_rho(a: List[float], b: List[float]) -> Optional[float]:
+    """Pearson correlation on ranks; None when undefined (< 2 samples or zero variance)."""
+    aa = np.asarray(a, dtype=np.float64)
+    bb = np.asarray(b, dtype=np.float64)
+    if aa.size < 2 or bb.size < 2 or aa.size != bb.size:
+        return None
+    ra = aa.argsort().argsort().astype(np.float64)
+    rb = bb.argsort().argsort().astype(np.float64)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    denom = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
+    if denom == 0.0:
+        return None
+    return float((ra * rb).sum() / denom)
+
+
+def _top_k_overlap(
+    metric_a: List[float], metric_b: List[float], k: int
+) -> Optional[float]:
+    """Fraction of top-K (lowest-metric) indices shared between two ranking metrics."""
+    if k <= 0 or len(metric_a) == 0 or len(metric_a) != len(metric_b):
+        return None
+    k = min(k, len(metric_a))
+    idx_a = set(np.argsort(np.asarray(metric_a))[:k].tolist())
+    idx_b = set(np.argsort(np.asarray(metric_b))[:k].tolist())
+    return float(len(idx_a & idx_b) / k)
 
 
 def _should_run_iql_val(step: int, total_updates: int, every: int) -> bool:
@@ -153,18 +183,44 @@ def main(args: DictConfig):
     save_last_ckpt = bool(OmegaConf.select(args, "exp.iql_val_save_last", default=True))
     val_seed = int(args.exp.seed) + 17  # fixed offset; do not collide with training seed
 
+    # A/B world selection.
+    val_worlds_raw = OmegaConf.select(args, "exp.iql_val_worlds", default=["sim"])
+    if isinstance(val_worlds_raw, str):
+        val_worlds: Tuple[str, ...] = tuple(val_worlds_raw.split(","))
+    else:
+        val_worlds = tuple(str(w).strip() for w in val_worlds_raw)
+    for w in val_worlds:
+        if w not in ("sim", "predictor"):
+            raise ValueError(f"exp.iql_val_worlds contains invalid world: {w!r}")
+
+    selection_world = str(OmegaConf.select(args, "exp.iql_val_selection_world", default=val_worlds[0])).strip()
+    if selection_world not in val_worlds:
+        raise ValueError(
+            f"exp.iql_val_selection_world={selection_world!r} must be one of exp.iql_val_worlds={val_worlds}"
+        )
+
+    # Warn early if predictor requested but its weights weren't loaded.
+    if "predictor" in val_worlds and not getattr(inference_model, "_outcome_predictor_loaded", False):
+        logger.warning(
+            "exp.iql_val_worlds includes 'predictor' but outcome_predictor weights were not "
+            "loaded from the CT checkpoint. Predictor-world metrics will reflect a randomly "
+            "initialized network (i.e. they are meaningless). Re-train CT so that "
+            "ct_best_encoder.pt contains 'outcome_predictor'."
+        )
+
     if iql_val_every > 0:
         logger.info(
             f"Periodic val enabled: every {iql_val_every} steps on val_f, "
             f"metric={val_metric_key}, val_batch_size={val_bs}, autoregressive={autoreg}, "
-            f"val_seed={val_seed}"
+            f"val_seed={val_seed}, worlds={val_worlds}, selection_world={selection_world!r}"
         )
     else:
         logger.info("Periodic val disabled (iql_val_every=0); will save last-step checkpoint only.")
 
-    best_metric = float("inf")
-    best_state_cpu = None
-    best_step = -1
+    best_per_world: Dict[str, Dict[str, Any]] = {
+        w: {"metric": float("inf"), "state": None, "step": -1} for w in val_worlds
+    }
+    val_trace: List[Dict[str, Any]] = []
 
     loss_keys = ("actor_loss", "q_loss", "value_loss")
     loss_buf = {k: deque(maxlen=max(1, log_window)) for k in loss_keys}
@@ -196,31 +252,128 @@ def main(args: DictConfig):
                     autoregressive_eval=autoreg,
                     val_batch_size=val_bs,
                     log_batches=False,
+                    worlds=val_worlds,
                 )
-            m = float(metrics[val_metric_key])
-            improved = m < best_metric
-            tag = " *best" if improved else ""
-            logger.info(
-                f"[val step {step}/{iql_updates}] {val_metric_key}={m:.6f} "
-                f"(mae_norm={metrics['mae_norm']:.6f}, mae_uns={metrics['mae_uns']:.6f}, "
-                f"rmse_norm={metrics['rmse_norm']:.6f}){tag}"
-            )
-            if improved:
-                best_metric = m
-                best_state_cpu = _state_dict_to_cpu(planner.state_dict())
-                best_step = step
 
-    model_dir = Path(get_original_cwd()) / "iql_models" / f"seed_{args.exp.seed}" / f"gamma_{int(args.dataset.coeff)}"
+            per_world = metrics.get("per_world", {val_worlds[0]: metrics})
+
+            trace_entry: Dict[str, Any] = {"step": step}
+            improved_worlds: List[str] = []
+            for w in val_worlds:
+                m_w = float(per_world[w][val_metric_key])
+                trace_entry[w] = {
+                    "mae_norm": float(per_world[w]["mae_norm"]),
+                    "mae_uns": float(per_world[w]["mae_uns"]),
+                    "rmse_norm": float(per_world[w]["rmse_norm"]),
+                }
+                if m_w < best_per_world[w]["metric"]:
+                    best_per_world[w]["metric"] = m_w
+                    best_per_world[w]["state"] = _state_dict_to_cpu(planner.state_dict())
+                    best_per_world[w]["step"] = step
+                    improved_worlds.append(w)
+            val_trace.append(trace_entry)
+
+            parts = [f"[val step {step}/{iql_updates}]"]
+            for w in val_worlds:
+                m_w = per_world[w][val_metric_key]
+                tag = "*" if w in improved_worlds else ""
+                parts.append(
+                    f"{w}:{val_metric_key}={m_w:.6f}"
+                    f"(mae_norm={per_world[w]['mae_norm']:.6f}){tag}"
+                )
+            logger.info(" ".join(parts))
+
+    # -------------------------------------------------------------------
+    # Cross-world diagnostics: how well does predictor-ranking track sim-ranking?
+    # -------------------------------------------------------------------
+    if len(val_worlds) >= 2 and len(val_trace) >= 2:
+        logger.info("=" * 80)
+        logger.info("Cross-world checkpoint-ranking diagnostics "
+                    f"(#val_points={len(val_trace)}, metric={val_metric_key})")
+        series: Dict[str, List[float]] = {
+            w: [float(entry[w][val_metric_key]) for entry in val_trace] for w in val_worlds
+        }
+        steps_list = [int(entry["step"]) for entry in val_trace]
+
+        for i in range(len(val_worlds)):
+            for j in range(i + 1, len(val_worlds)):
+                w_a, w_b = val_worlds[i], val_worlds[j]
+                rho = _spearman_rho(series[w_a], series[w_b])
+                rho_str = f"{rho:.4f}" if rho is not None else "NaN"
+                logger.info(f"  Spearman rho({w_a}, {w_b}) = {rho_str}")
+                for K in (1, 3, 5):
+                    ov = _top_k_overlap(series[w_a], series[w_b], K)
+                    ov_str = f"{ov:.3f}" if ov is not None else "NaN"
+                    logger.info(f"  Top-{K} overlap({w_a}, {w_b}) = {ov_str}")
+
+        # Regret: picking by world w_sel, measured against w_ref
+        for w_ref in val_worlds:
+            ref_series = series[w_ref]
+            best_ref_idx = int(np.argmin(ref_series))
+            best_ref_val = ref_series[best_ref_idx]
+            for w_sel in val_worlds:
+                if w_sel == w_ref:
+                    continue
+                picked_idx = int(np.argmin(series[w_sel]))
+                picked_step = steps_list[picked_idx]
+                picked_ref_val = ref_series[picked_idx]
+                regret = picked_ref_val - best_ref_val
+                logger.info(
+                    f"  Regret: pick-by-{w_sel} vs best-by-{w_ref} "
+                    f"(ref={w_ref}:{val_metric_key}) = {regret:+.6f} "
+                    f"(picked step {picked_step}: {picked_ref_val:.6f}; "
+                    f"best step {steps_list[best_ref_idx]}: {best_ref_val:.6f})"
+                )
+        logger.info("=" * 80)
+
+    # -------------------------------------------------------------------
+    # Save checkpoints + val trace.
+    # -------------------------------------------------------------------
+    # Default save dir: iql_models/seed_${s}/gamma_${g}/. Override via exp.iql_save_dir
+    # so grid search / parallel workers don't clobber the canonical file used by
+    # the main pipeline or by each other.
+    _iql_save_dir_override = OmegaConf.select(args, "exp.iql_save_dir", default=None)
+    if _iql_save_dir_override:
+        model_dir = Path(str(_iql_save_dir_override))
+        if not model_dir.is_absolute():
+            model_dir = Path(get_original_cwd()) / model_dir
+    else:
+        model_dir = Path(get_original_cwd()) / "iql_models" / f"seed_{args.exp.seed}" / f"gamma_{int(args.dataset.coeff)}"
     model_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = model_dir / "iql_planner.pt"
     last_path = model_dir / "iql_planner_last.pt"
+    trace_path = model_dir / "iql_val_trace.json"
+    logger.info(f"IQL planner checkpoints will be saved under: {model_dir}")
 
-    if iql_val_every > 0 and best_state_cpu is not None:
-        torch.save(best_state_cpu, ckpt_path)
-        logger.info(
-            f"Saved BEST IQL planner to {ckpt_path} "
-            f"({val_metric_key}={best_metric:.6f} at step {best_step})"
-        )
+    any_val_improved = any(bw["state"] is not None for bw in best_per_world.values())
+
+    if iql_val_every > 0 and any_val_improved:
+        # Primary checkpoint = checkpoint selected by the configured selection world.
+        sel = best_per_world[selection_world]
+        if sel["state"] is None:
+            logger.warning(
+                f"No val improvement recorded for selection_world={selection_world!r}; "
+                "falling back to last-step weights for the primary checkpoint."
+            )
+            torch.save(_state_dict_to_cpu(planner.state_dict()), ckpt_path)
+        else:
+            torch.save(sel["state"], ckpt_path)
+            logger.info(
+                f"Saved BEST IQL planner (selection_world={selection_world!r}) to {ckpt_path} "
+                f"({val_metric_key}={sel['metric']:.6f} at step {sel['step']})"
+            )
+
+        # Per-world best checkpoints (for offline A/B comparison; do not overwrite primary).
+        for w, bw in best_per_world.items():
+            if bw["state"] is None:
+                continue
+            per_path = model_dir / f"iql_planner_best_{w}.pt"
+            torch.save(bw["state"], per_path)
+            logger.info(
+                f"Saved per-world BEST IQL planner [{w}] to {per_path} "
+                f"({val_metric_key}={bw['metric']:.6f} at step {bw['step']})"
+            )
+
         if save_last_ckpt:
             torch.save(_state_dict_to_cpu(planner.state_dict()), last_path)
             logger.info(f"Saved LAST-step IQL planner to {last_path}")
@@ -230,6 +383,24 @@ def main(args: DictConfig):
             f"Saved IQL planner to {ckpt_path} "
             "(periodic val disabled or no val improvement; last-step weights)"
         )
+
+    if val_trace:
+        trace_payload = {
+            "val_metric": val_metric_key,
+            "worlds": list(val_worlds),
+            "selection_world": selection_world,
+            "tau": eval_tau,
+            "max_tau": max_tau,
+            "val_seed": val_seed,
+            "history": val_trace,
+            "best_per_world": {
+                w: {"metric": bw["metric"], "step": bw["step"]}
+                for w, bw in best_per_world.items()
+            },
+        }
+        with open(trace_path, "w") as f:
+            json.dump(trace_payload, f, indent=2)
+        logger.info(f"Saved val trace to {trace_path}")
 
 
 if __name__ == "__main__":

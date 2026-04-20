@@ -33,6 +33,32 @@ def load_inference_checkpoint(inference_model, ckpt_path: str, device: str) -> N
             logger.info("ct_history_encoder missing=%s unexpected=%s", m_ce, u_ce)
         if m_ph or u_ph:
             logger.info("projection_head missing=%s unexpected=%s", m_ph, u_ph)
+
+        # Optional: load OutcomePredictor for downstream model-based OPE in IQL val/eval.
+        if hasattr(inference_model, "outcome_predictor") and "outcome_predictor" in obj:
+            try:
+                m_op, u_op = inference_model.outcome_predictor.load_state_dict(
+                    obj["outcome_predictor"], strict=True
+                )
+                inference_model._outcome_predictor_loaded = True
+                logger.info("Loaded outcome_predictor weights from %s.", ckpt_path)
+                if m_op or u_op:
+                    logger.info("outcome_predictor missing=%s unexpected=%s", m_op, u_op)
+            except Exception as e:  # shape mismatch: fall back silently but flag it
+                inference_model._outcome_predictor_loaded = False
+                logger.warning(
+                    "outcome_predictor state_dict in %s could not be loaded (%s). "
+                    "Predictor-world rollouts will use randomly initialized weights.",
+                    ckpt_path, e,
+                )
+        elif hasattr(inference_model, "outcome_predictor"):
+            inference_model._outcome_predictor_loaded = False
+            logger.warning(
+                "Checkpoint %s does not contain 'outcome_predictor' weights. "
+                "Re-train CT to enable predictor-based model-based OPE (A/B val); "
+                "simulator-based val will still work.",
+                ckpt_path,
+            )
         return
 
     state_dict: Dict[str, torch.Tensor] = obj
