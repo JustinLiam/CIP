@@ -60,9 +60,15 @@ class CTTransitionDataset(Dataset):
     (requires length >= t + K + 1).
     """
 
-    def __init__(self, data: Dict[str, np.ndarray], multi_k_max: int = 1):
+    def __init__(
+        self,
+        data: Dict[str, np.ndarray],
+        multi_k_max: int = 1,
+        include_next_prefix: bool = False,
+    ):
         self.data = data
         self.multi_k_max = int(multi_k_max)
+        self.include_next_prefix = bool(include_next_prefix)
         self.index: List[Tuple[int, int]] = []
         n = data["current_treatments"].shape[0]
         min_len = self.multi_k_max + 2
@@ -84,6 +90,8 @@ class CTTransitionDataset(Dataset):
 
         y_next = torch.tensor(self.data["outputs"][i, t + 1, :], dtype=torch.float32)
         out: Dict = {"H_t": H, "y_next": y_next}
+        if self.include_next_prefix:
+            out["H_t_next"] = _build_H_slice(self.data, i, t + 2)
         if self.multi_k_max >= 2:
             out["H_t_k2"] = _build_H_slice(self.data, i, t + 2)
             out["y_next2"] = torch.tensor(self.data["outputs"][i, t + 2, :], dtype=torch.float32)
@@ -139,6 +147,8 @@ def collate_ct_batch(samples: List[Dict]) -> Dict[str, Any]:
     H_batch = _collate_pad_H(samples, "H_t", device_dtype)
     y_next = torch.stack([s["y_next"] for s in samples], dim=0)
     out: Dict[str, Any] = {"H_t": H_batch, "y_next": y_next}
+    if "H_t_next" in samples[0]:
+        out["H_t_next"] = _collate_pad_H(samples, "H_t_next", device_dtype)
     if "H_t_k2" in samples[0]:
         out["H_t_k2"] = _collate_pad_H(samples, "H_t_k2", device_dtype)
         out["y_next2"] = torch.stack([s["y_next2"] for s in samples], dim=0)

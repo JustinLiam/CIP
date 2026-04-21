@@ -39,7 +39,7 @@ cd "$ROOT"
 
 # seeds=(10 101 1010 10101 101010)
 seeds=(20 202 2020 20202 202020)
-seeds=(20)
+seeds=(10)
 
 for seed in "${seeds[@]}"; do
   CT_CKPT="${ROOT}/ct_checkpoints/seed_${seed}_gamma_${gamma}/ct_best_encoder.pt"

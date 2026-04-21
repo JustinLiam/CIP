@@ -198,6 +198,23 @@ def main(args: DictConfig):
         raise ValueError(
             f"exp.iql_val_selection_world={selection_world!r} must be one of exp.iql_val_worlds={val_worlds}"
         )
+    debug_panel_enabled = bool(OmegaConf.select(args, "exp.iql_debug_panel", default=False))
+
+    # Default save dir: iql_models/seed_${s}/gamma_${g}/. Override via exp.iql_save_dir
+    # so grid search / parallel workers don't clobber the canonical file used by
+    # the main pipeline or by each other.
+    _iql_save_dir_override = OmegaConf.select(args, "exp.iql_save_dir", default=None)
+    if _iql_save_dir_override:
+        model_dir = Path(str(_iql_save_dir_override))
+        if not model_dir.is_absolute():
+            model_dir = Path(get_original_cwd()) / model_dir
+    else:
+        model_dir = Path(get_original_cwd()) / "iql_models" / f"seed_{args.exp.seed}" / f"gamma_{int(args.dataset.coeff)}"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = model_dir / "iql_planner.pt"
+    last_path = model_dir / "iql_planner_last.pt"
+    trace_path = model_dir / "iql_val_trace.json"
+    debug_panel_path = model_dir / "iql_debug_panel.jsonl"
 
     # Warn early if predictor requested but its weights weren't loaded.
     if "predictor" in val_worlds and not getattr(inference_model, "_outcome_predictor_loaded", False):
@@ -216,11 +233,16 @@ def main(args: DictConfig):
         )
     else:
         logger.info("Periodic val disabled (iql_val_every=0); will save last-step checkpoint only.")
+    if debug_panel_enabled:
+        if debug_panel_path.exists():
+            debug_panel_path.unlink()
+        logger.info(f"IQL val debug panel enabled; writing JSONL records to {debug_panel_path}")
 
     best_per_world: Dict[str, Dict[str, Any]] = {
         w: {"metric": float("inf"), "state": None, "step": -1} for w in val_worlds
     }
     val_trace: List[Dict[str, Any]] = []
+    prev_action_fingerprints: Dict[str, Optional[str]] = {w: None for w in val_worlds}
 
     loss_keys = ("actor_loss", "q_loss", "value_loss")
     loss_buf = {k: deque(maxlen=max(1, log_window)) for k in loss_keys}
@@ -253,6 +275,7 @@ def main(args: DictConfig):
                     val_batch_size=val_bs,
                     log_batches=False,
                     worlds=val_worlds,
+                    debug_panel=debug_panel_enabled,
                 )
 
             per_world = metrics.get("per_world", {val_worlds[0]: metrics})
@@ -282,6 +305,26 @@ def main(args: DictConfig):
                     f"(mae_norm={per_world[w]['mae_norm']:.6f}){tag}"
                 )
             logger.info(" ".join(parts))
+            if debug_panel_enabled and "debug_panel" in metrics:
+                panel = metrics["debug_panel"]
+                panel["step"] = int(step)
+                panel["val_metric"] = val_metric_key
+                panel["worlds"] = list(val_worlds)
+                panel["selection_world"] = selection_world
+                action_flag = True
+                for w in val_worlds:
+                    world_panel = panel.get("per_world", {}).setdefault(w, {})
+                    action_info = world_panel.get("action_sequence", {})
+                    fingerprint = action_info.get("fingerprint")
+                    prev_fp = prev_action_fingerprints.get(w)
+                    changed_vs_prev = bool(fingerprint is not None and (prev_fp is None or fingerprint != prev_fp))
+                    world_panel["action_sequence_changed_vs_prev"] = changed_vs_prev
+                    if fingerprint is not None:
+                        prev_action_fingerprints[w] = str(fingerprint)
+                    action_flag = action_flag and changed_vs_prev
+                panel["summary_flags"]["action_sequence_changes"] = bool(action_flag)
+                with open(debug_panel_path, "a") as f:
+                    f.write(json.dumps(panel) + "\n")
 
     # -------------------------------------------------------------------
     # Cross-world diagnostics: how well does predictor-ranking track sim-ranking?
@@ -329,20 +372,6 @@ def main(args: DictConfig):
     # -------------------------------------------------------------------
     # Save checkpoints + val trace.
     # -------------------------------------------------------------------
-    # Default save dir: iql_models/seed_${s}/gamma_${g}/. Override via exp.iql_save_dir
-    # so grid search / parallel workers don't clobber the canonical file used by
-    # the main pipeline or by each other.
-    _iql_save_dir_override = OmegaConf.select(args, "exp.iql_save_dir", default=None)
-    if _iql_save_dir_override:
-        model_dir = Path(str(_iql_save_dir_override))
-        if not model_dir.is_absolute():
-            model_dir = Path(get_original_cwd()) / model_dir
-    else:
-        model_dir = Path(get_original_cwd()) / "iql_models" / f"seed_{args.exp.seed}" / f"gamma_{int(args.dataset.coeff)}"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = model_dir / "iql_planner.pt"
-    last_path = model_dir / "iql_planner_last.pt"
-    trace_path = model_dir / "iql_val_trace.json"
     logger.info(f"IQL planner checkpoints will be saved under: {model_dir}")
 
     any_val_improved = any(bw["state"] is not None for bw in best_per_world.values())

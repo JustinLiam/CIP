@@ -37,10 +37,21 @@ To train the CT model:
 python runnables/train_ct.py +dataset=cancer_sim_cont +model=vcip
 ```
 
+CUDA_VISIBLE_DEVICES=0 python runnables/train_ct.py +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=4*" exp.seed=10 dataset.coeff=4 exp.ct_epochs=2 exp.ct_weight_log_every=1
+  "+exp.ct_ckpt_dir=/tmp/ct_smoke_$$"
+
 2. Run the IQL model using the CT checkpoint:
 ```bash
 python runnables/train_iql_planner.py +dataset=cancer_sim_cont +model=vcip   exp.iql_inference_ckpt=/home/liam/pythonProject/VCIP-ICML-main/ct_checkpoints/seed_10_gamma_4/ct_best_encoder.pt
 ```
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python runnables/train_iql_planner.py +dataset=cancer_sim_cont +model=vcip \
+  exp.iql_inference_ckpt=/home/liam/pythonProject/VCIP-ICML-main/ct_checkpoints/seed_10_gamma_4/kmax1_dyn005/ct_best_encoder.pt \
+  +exp.iql_save_dir=/home/liam/pythonProject/VCIP-ICML-main/iql_runs/kmax3_seed10_g4
+```
+
+CUDA_VISIBLE_DEVICES=1 python runnables/eval_iql_planner.py +dataset=cancer_sim_cont +model=vcip   exp.seed=10 dataset.coeff=4 exp.tau=12 exp.max_tau=12.0   exp.test=True   exp.iql_inference_ckpt=/home/liam/pythonProject/VCIP-ICML-main/ct_checkpoints/seed_10_gamma_4/kmax1_dyn005/ct_best_encoder.pt exp.iql_eval_ckpt=/home/liam/pythonProject/VCIP-ICML-main/iql_runs/kmax3_seed10_g4/iql_planner_best_predictor.pt
 
 3. Run the IQL model validation:
 ```bash

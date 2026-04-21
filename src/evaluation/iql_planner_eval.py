@@ -3,6 +3,7 @@ Aggregate IQL planner metrics on a CIP split (val/test), matching ``eval_iql_pla
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Dict
 
@@ -60,6 +61,38 @@ def _unscaled_cancer_volume_np(y_norm: np.ndarray, mean_ser, std_ser) -> np.ndar
     m = float(mean_ser["cancer_volume"])
     s = float(std_ser["cancer_volume"])
     return y_norm.astype(np.float64) * s + m
+
+
+def _fingerprint_np(arr: np.ndarray, max_items: int = 64) -> str:
+    flat = np.asarray(arr, dtype=np.float64).reshape(-1)
+    if flat.size > max_items:
+        flat = flat[:max_items]
+    flat = np.round(flat, 6)
+    return hashlib.sha1(flat.tobytes()).hexdigest()[:16]
+
+
+def _predictor_debug_stats(inference_model: InferenceModel) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "loaded_flag": bool(getattr(inference_model, "_outcome_predictor_loaded", False))
+    }
+    if not hasattr(inference_model, "outcome_predictor"):
+        return out
+    params = [p.detach().float().cpu() for p in inference_model.outcome_predictor.parameters()]
+    if not params:
+        return out
+    total_sq = 0.0
+    total_count = 0
+    for p in params:
+        total_sq += float((p * p).sum().item())
+        total_count += int(p.numel())
+    first = params[0].reshape(-1)
+    out.update({
+        "param_count": total_count,
+        "param_l2_norm": float(np.sqrt(total_sq)),
+        "first_param_mean": float(first.mean().item()),
+        "first_param_std": float(first.std(unbiased=False).item()) if first.numel() > 1 else 0.0,
+    })
+    return out
 
 
 def _extend_h_work_after_one_step(
@@ -258,6 +291,7 @@ def aggregate_iql_planner_metrics(
     return_series: bool = False,
     include_factual_traj_rmse: bool = False,
     worlds: tuple = ("sim",),
+    debug_panel: bool = False,
 ) -> Dict[str, Any]:
     """
     Full pass over ``fold``'s dataloader; returns global MAE/RMSE (normalized and unscaled tumor volume).
@@ -292,11 +326,18 @@ def aggregate_iql_planner_metrics(
 
     dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=val_batch_size, shuffle=False)
 
+    collect_series = bool(return_series or debug_panel)
     ture_output_list: list = []
     per_world_pred: Dict[str, list] = {w: [] for w in worlds}
     per_world_fact: Dict[str, list] = {w: [] for w in worlds} if include_factual_traj_rmse else {w: [] for w in worlds}
     per_world_batch_rmse_plan: Dict[str, list] = {w: [] for w in worlds}
     per_world_batch_rmse_fact: Dict[str, list] = {w: [] for w in worlds}
+    debug_payload: Dict[str, Any] | None = None
+    if debug_panel:
+        debug_payload = {
+            "predictor_load": _predictor_debug_stats(inference_model),
+            "per_world": {},
+        }
 
     was_training = planner.actor.training
     planner.actor.eval()
@@ -320,15 +361,26 @@ def aggregate_iql_planner_metrics(
             for world in worlds:
                 np.random.set_state(np_state_pre)
                 torch.set_rng_state(torch_state_pre)
+                world_debug: Dict[str, Any] | None = None
+                if debug_payload is not None and i == 0:
+                    world_debug = debug_payload["per_world"].setdefault(world, {})
 
                 if autoregressive_eval:
                     eval_target = targets["outputs"][:, -1, :]
                     H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
                     a_prev_sim = H_work["current_treatments"][:, -1, :].clone()
                     planned = []
+                    history_checks = []
                     for step in range(tau):
                         H_work = align_h_t_static_to_history(H_work)
                         z, _, _ = inference_model.ct_hidden_history(H_work)
+                        pre_len = None
+                        prev_out = None
+                        z_before = None
+                        if world_debug is not None and len(history_checks) < 2:
+                            pre_len = int(H_work["outputs"].size(1))
+                            prev_out = H_work["outputs"][:, -1, :].detach().clone()
+                            z_before = z.detach().clone()
                         a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
                         obs = _iql_augmented_state(z, eval_target, step, tau, max_tau, a_prev_tanh)
                         po = planner.actor(obs)
@@ -347,8 +399,44 @@ def aggregate_iql_planner_metrics(
                         _extend_h_work_after_one_step(
                             H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
                         )
+                        if world_debug is not None and len(history_checks) < 2:
+                            post_len = int(H_work["outputs"].size(1))
+                            appended_action_ok = bool(torch.allclose(
+                                H_work["current_treatments"][:, -1, :], a_sim, atol=1e-6, rtol=1e-5
+                            ))
+                            appended_output_ok = bool(torch.allclose(
+                                H_work["outputs"][:, -1, :], y_norm.view(y_norm.size(0), -1), atol=1e-6, rtol=1e-5
+                            ))
+                            prev_output_ok = bool(torch.allclose(
+                                H_work["prev_outputs"][:, -1, :], prev_out, atol=1e-6, rtol=1e-5
+                            ))
+                            H_probe = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_work.items()}
+                            H_probe = align_h_t_static_to_history(H_probe)
+                            z_after, _, _ = inference_model.ct_hidden_history(H_probe)
+                            z_delta = float(torch.norm(z_after - z_before, dim=-1).mean().item())
+                            ok = bool(
+                                (post_len == pre_len + 1)
+                                and appended_action_ok
+                                and appended_output_ok
+                                and prev_output_ok
+                            )
+                            history_checks.append({
+                                "step": int(step),
+                                "len_before": pre_len,
+                                "len_after": post_len,
+                                "appended_action_ok": appended_action_ok,
+                                "appended_output_ok": appended_output_ok,
+                                "prev_output_ok": prev_output_ok,
+                                "z_delta_mean_l2": z_delta,
+                                "ok": ok,
+                            })
                         a_prev_sim = a_sim
                     a_seq = torch.stack(planned, dim=1).contiguous()
+                    if world_debug is not None:
+                        world_debug["history_checks"] = history_checks
+                        world_debug["history_updates_ok"] = bool(
+                            history_checks and all(bool(item["ok"]) for item in history_checks)
+                        )
                 else:
                     z, _, _ = inference_model.ct_hidden_history(H_t)
                     z_np = z.detach().cpu().numpy()
@@ -370,6 +458,19 @@ def aggregate_iql_planner_metrics(
                         .expand(-1, tau, -1)
                         .contiguous()
                     )
+                    if world_debug is not None:
+                        world_debug["history_checks"] = []
+                        world_debug["history_updates_ok"] = True
+
+                if world_debug is not None:
+                    a_seq_np = a_seq.detach().cpu().numpy()
+                    world_debug["action_sequence"] = {
+                        "fingerprint": _fingerprint_np(a_seq_np[:2, :min(tau, 4), :]),
+                        "mean": float(a_seq_np.mean()),
+                        "std": float(a_seq_np.std()),
+                        "min": float(a_seq_np.min()),
+                        "max": float(a_seq_np.max()),
+                    }
 
                 output_after_actions = _simulate_a_seq_final_y(
                     world, H_t, a_seq,
@@ -420,11 +521,48 @@ def aggregate_iql_planner_metrics(
             std=std,
             batch_rmse_plan=per_world_batch_rmse_plan[world],
             batch_rmse_fact=per_world_batch_rmse_fact[world] if include_factual_traj_rmse else None,
-            return_series=return_series,
+            return_series=collect_series,
         )
 
     primary = worlds[0]
     out: Dict[str, Any] = dict(per_world_metrics[primary])
+    if debug_payload is not None:
+        history_ok = True
+        metric_ok = True
+        for world in worlds:
+            world_debug = debug_payload["per_world"].setdefault(world, {})
+            pred_y_uns = np.asarray(per_world_metrics[world].get("iql_y_uns"))
+            true_y_uns = np.asarray(per_world_metrics[world].get("true_y_uns"))
+            mae_recomputed = float(np.mean(np.abs(pred_y_uns - true_y_uns)))
+            same_shape = tuple(pred_y_uns.shape) == tuple(true_y_uns.shape)
+            world_metric_ok = bool(
+                same_shape and abs(mae_recomputed - float(per_world_metrics[world]["mae_uns"])) <= 1e-10
+            )
+            world_debug["metric_alignment"] = {
+                "pred_shape": list(pred_y_uns.shape),
+                "true_shape": list(true_y_uns.shape),
+                "pred_hash": _fingerprint_np(pred_y_uns),
+                "true_hash": _fingerprint_np(true_y_uns),
+                "mae_uns_logged": float(per_world_metrics[world]["mae_uns"]),
+                "mae_uns_recomputed": mae_recomputed,
+                "mae_uns_abs_diff": float(abs(mae_recomputed - float(per_world_metrics[world]["mae_uns"]))),
+                "same_shape": same_shape,
+            }
+            history_ok = history_ok and bool(world_debug.get("history_updates_ok", True))
+            metric_ok = metric_ok and world_metric_ok
+            if not return_series:
+                per_world_metrics[world].pop("iql_y_norm", None)
+                per_world_metrics[world].pop("true_y_norm", None)
+                per_world_metrics[world].pop("iql_y_uns", None)
+                per_world_metrics[world].pop("true_y_uns", None)
+        debug_payload["summary_flags"] = {
+            "predictor_loaded": bool(debug_payload["predictor_load"].get("loaded_flag", False)),
+            "history_updates_ok": bool(history_ok),
+            "action_sequence_changes": True,
+            "metric_alignment_ok": bool(metric_ok),
+        }
     if len(worlds) > 1:
         out["per_world"] = per_world_metrics
+    if debug_payload is not None:
+        out["debug_panel"] = debug_payload
     return out

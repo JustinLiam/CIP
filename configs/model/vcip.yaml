@@ -127,11 +127,11 @@ exp:
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
   ct_align_loss: sinkhorn
   # ct_alpha: 0.1 使用EM方法后， 该参数不生效
-  ct_lr: 0.001
+  ct_lr: 1e-4
   ct_epochs: 200
   ct_patience: 20
   ct_weight_decay: 1.0e-05
-  ct_sinkhorn_blur: 0.01
+  ct_sinkhorn_blur: 0.05
   ct_batch_size: 512
   ct_batch_size_val: 256
   ct_num_workers: 0
@@ -143,5 +143,54 @@ exp:
   ct_sched_p_start: 0.3
   ct_sched_p_end: 0.8
   ct_sched_ramp_epochs: 100
-  # train_ct early stopping + best ckpt: weighted = val_pred (L1–L3 mix); l1 = val mean L1 only (better for IQL-facing z_t)
-  ct_es_metric: l1
+  # train_ct early stopping + best ckpt. Options:
+  #   weighted : multi-horizon WeightNet-reweighted val MSE (legacy).
+  #   l1       : k=1 WeightNet-reweighted val MSE. BIASED when WeightNet concentrates
+  #              mass onto easy samples — gives rosy numbers that mask the true
+  #              population-level predictor error (see ct_anchor_weight docs).
+  #   mae_uw   : k=1 UN-weighted val MAE on normalized y. This is the factual
+  #              prediction accuracy the downstream IQL outcome_predictor actually
+  #              uses during rollouts, and matches CFRNet / Causal Transformer /
+  #              CTD-NKO paper conventions. Recommended when ct_anchor_weight > 0.
+  ct_es_metric: mae_uw
+  # Log the full percentile distribution of WeightNet outputs every N epochs
+  # (the compact ESS/std/min/max line is logged every epoch regardless).
+  ct_weight_log_every: 10
+  # E-step inner loop: number of WeightNet updates per batch before the M-step.
+  # k_inner=1 preserves the legacy 1:1 E/M interleaving (identical behaviour to before).
+  # k_inner>1 gives the E-step more iterations per batch to converge against the frozen
+  # encoder output Z_t.detach(), analogous to CTD-NKO's per-epoch full refit but at the
+  # batch level. Typical values to try: 3, 5, 10. Higher = stronger deconfounding
+  # pressure but ~linearly more Sinkhorn evaluations per batch.
+  ct_k_inner: 1
+  # WeightNet learning rate (separate from encoder+predictor LR, which is hard-coded
+  # to 1e-4 inside train_ct.py). Set to null => fall back to ct_lr for backward compat.
+  # When raising ct_k_inner>1, the [E-inner] drop often comes back too small (<5%)
+  # because Sinkhorn gradients are tiny; try ct_w_lr in [5e-3, 1e-2] to make each
+  # inner update actually move the parameters. Reference CTD-NKO uses lr=0.1 for a
+  # similar WeightNet (extreme, only because they refit from scratch every update).
+  ct_w_lr: 1e-2
+  # Gradient-clip max_norm applied to WeightNet params after each inner-loop backward.
+  # Raise together with ct_w_lr (e.g. 5.0 for w_lr=1e-2); set to null to disable clip.
+  ct_w_clip: 5.0
+  # Anchor-loss blend for the M-step (Plan A for predictor-bias fix).
+  # Total M-step loss = (1 - ct_anchor_weight) * weighted_MSE + ct_anchor_weight * uniform_MSE.
+  # Motivation: WeightNet's softmax-renormalisation (w=softmax*B) concentrates mass on
+  # a sub-population whose y-mean typically differs from the full-population y-mean;
+  # the predictor then inherits this offset bias (~+0.03 normalized on cancer_sim γ=4,
+  # see debug_predictor_sensitivity.py). Mixing a small un-weighted anchor loss gives
+  # the predictor an un-biased calibration signal without killing the deconfounding
+  # gradient on the encoder. 0.0 = legacy behaviour; 0.5 = equal blend; 1.0 = no
+  # reweighting (WeightNet only pushes encoder via loss_align).
+  ct_anchor_weight: 0.5
+  # CTD-NKO-inspired latent dynamics consistency:
+  #   z_next_pred = g(z_t, a_t), with target z_{t+1} = encoder(H_{t+1}) treated as a
+  #   stop-gradient teacher signal. This regularizes rollout dynamics in latent space
+  #   without changing the downstream IQL interface (which still uses outcome_predictor).
+  # Set to 0.0 to disable. A good first sweep is {1e-2, 5e-2, 1e-1}.
+  ct_dyn_consistency_weight: 0.0
+  # Hidden width of g(z_t, a_t) -> z_{t+1}; defaults to ct_predictor_hidden when unset.
+  ct_dyn_hidden: 64
+  # Residual latent transition: z_next_pred = z_t + delta(z_t, a_t). Usually stabilizes
+  # one-step latent prediction and reduces rollout drift.
+  ct_dyn_residual: true
