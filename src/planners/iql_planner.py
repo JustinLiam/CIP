@@ -245,7 +245,8 @@ class IQLPlanner:
         5. 用 v_optimizer 对 value 网络参数做梯度下降
         """
         with torch.no_grad():
-            target_q = self.q_target(observations, actions)
+            q1, q2 = self.qf.both(observations, actions)
+            target_q = torch.min(q1, q2)
         v = self.vf(observations)
         adv = target_q - v
         v_loss = asymmetric_l2_loss(adv, self.cfg.iql_tau)
@@ -327,10 +328,10 @@ class IQLPlanner:
         observations, actions, rewards, next_observations, dones = batch
         rewards = rewards.squeeze(-1)
         dones = dones.squeeze(-1)
-        with torch.no_grad():
-            next_v = self.vf(next_observations)
         log_dict: Dict[str, float] = {}
         adv = self._update_v(observations, actions, log_dict)
+        with torch.no_grad():
+            next_v = self.vf(next_observations)
         self._update_q(next_v, observations, actions, rewards, dones, log_dict)
         self._update_policy(adv, observations, actions, log_dict)
         return log_dict

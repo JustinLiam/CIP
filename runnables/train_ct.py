@@ -290,12 +290,39 @@ def _run_epoch(
                         )
                     optimizer_w.step()
 
+                # --- M-Step: 与 E-step 后的 WeightNet 对齐 ---
+                # Inner loop 已更新 weight_net；若仍用 forward 时的 w_fix，则 encoder 的加权梯度
+                # 与当前 WeightNet 不一致。这里用同一 Z_t、A_t 重算 w_sync（Z_t.detach() 与 forward
+                # 中一致），仅替换加权 MSE 里的权重；anchor / dynamics / 多步 H2m、H3m 不变。
+                za_sync = torch.cat([Z_t.detach(), A_t], dim=-1)
+                logits_sync = model.weight_net(za_sync)
+                w_sync = F.softmax(logits_sync, dim=0) * float(Z_t.size(0))
+                active_t_m = H_t["active_entries"][:, -1, 0]
+                se1 = (y_hat1 - y_next).pow(2).mean(dim=-1)
+                loss_pred1_w_m = (w_sync.detach() * se1 * active_t_m).sum() / (active_t_m.sum() + 1e-8)
+                loss_pred1_m = (1.0 - a_blend) * loss_pred1_w_m + a_blend * loss_pred1_anchor
+                l1f_old = l1f
+                l1f = float(loss_pred1_w_m.detach())
+                sum_l1 += l1f - l1f_old
+                if multi_k_max <= 1:
+                    loss_theta = loss_pred1_m + float(dyn_consistency_weight) * loss_dyn
+                else:
+                    loss_pred2_w, _, loss_pred2_anchor = model.weighted_prediction_loss(
+                        H2m, y2, w_sync.detach()
+                    )
+                    loss_pred2 = (1.0 - a_blend) * loss_pred2_w + a_blend * loss_pred2_anchor
+                    l2f = float(loss_pred2_w.detach())
+                    loss_theta = horiz_w[0] * loss_pred1_m + horiz_w[1] * loss_pred2
+                    if multi_k_max >= 3:
+                        loss_pred3_w, _, loss_pred3_anchor = model.weighted_prediction_loss(
+                            H3m, y3, w_sync.detach()
+                        )
+                        loss_pred3 = (1.0 - a_blend) * loss_pred3_w + a_blend * loss_pred3_anchor
+                        l3f = float(loss_pred3_w.detach())
+                        loss_theta = loss_theta + horiz_w[2] * loss_pred3
+                    loss_theta = loss_theta + float(dyn_consistency_weight) * loss_dyn
+
                 # --- M-Step: 更新ct_encoder和predictor parameters，仅loss_theta作用 ---
-                # Note: loss_theta was built using w_fix (pre-inner-loop w). This matches
-                # the legacy M-step semantics exactly when k_inner=1, and for k_inner>1 it
-                # keeps the multi-horizon losses consistent with the same w_fix used for
-                # k=1. If you want M-step to use the POST-loop w instead, that is a
-                # separate design choice (requires a second forward after E-step).
                 optimizer_theta.zero_grad(set_to_none=True)
                 loss_theta.backward()
                 torch.nn.utils.clip_grad_norm_(model.ct_encoder.parameters(), max_norm=1.0)
