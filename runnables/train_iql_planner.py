@@ -135,11 +135,13 @@ def main(args: DictConfig):
         data=dataset_collection.train_f.data,
         inference_model=inference_model,
         device=device,
-        reward_type=str(OmegaConf.select(args, "exp.iql_reward_type", default="negative_outcome_mse")),
+        reward_type=str(OmegaConf.select(args, "exp.iql_reward_type", default="progress")),
         max_patients=iql_max_patients,
         max_action=iql_max_action,
         dataset_actions_unit_interval=iql_unit_actions,
         max_tau=max_tau,
+        reward_clip=float(OmegaConf.select(args, "exp.iql_reward_clip", default=1.0)),
+        reward_scale=str(OmegaConf.select(args, "exp.iql_reward_scale", default="none")),
     )
     logger.info(f"Built transitions: {len(transitions['states'])}")
 

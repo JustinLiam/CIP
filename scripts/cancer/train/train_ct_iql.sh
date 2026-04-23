@@ -37,9 +37,31 @@ eval_tau=${4:-}
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
 
-# seeds=(10 101 1010 10101 101010)
-seeds=(20 202 2020 20202 202020)
-seeds=(10)
+# Shared CSV (append-only) for all runs; safe under concurrent bash processes.
+CSV_DIR="${ROOT}/results"
+CSV_PATH="${CSV_DIR}/ct_iql_eval_metrics.csv"
+CSV_LOCK="${CSV_PATH}.lock"
+mkdir -p "${CSV_DIR}"
+touch "${CSV_LOCK}"
+
+ensure_csv_header() {
+  if [[ ! -f "${CSV_PATH}" ]]; then
+    printf "timestamp,gamma,seed,tau,test,mae_norm,mae_uns,rmse_uns,rmse_norm,rmse_x_std,rmse_factual_x_std\n" > "${CSV_PATH}"
+  fi
+}
+
+append_csv_row() {
+  local row="$1"
+  (
+    flock -x 200
+    ensure_csv_header
+    printf "%s\n" "${row}" >> "${CSV_PATH}"
+  ) 200>"${CSV_LOCK}"
+}
+
+seeds=(10 101 1010 10101 101010)
+# seeds=(20 202 2020 20202 202020)
+# seeds=(10)
 
 for seed in "${seeds[@]}"; do
   CT_CKPT="${ROOT}/ct_checkpoints/seed_${seed}_gamma_${gamma}/ct_best_encoder.pt"
@@ -84,5 +106,50 @@ for seed in "${seeds[@]}"; do
   )
   [[ -n "${eval_tau}" ]] && eval_args+=( "exp.tau=${eval_tau}" )
 
-  CUDA_VISIBLE_DEVICES=${gpu} python runnables/eval_iql_planner.py "${eval_args[@]}"
+  eval_log="$(mktemp)"
+  CUDA_VISIBLE_DEVICES=${gpu} python runnables/eval_iql_planner.py "${eval_args[@]}" 2>&1 | tee "${eval_log}"
+
+  # Parse aggregate metrics from eval log (use Python: default awk is often mawk and does not
+  # support gawk-only match(..., ..., array) capture groups).
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+  read -r tau_used mae_norm mae_uns rmse_uns rmse_norm rmse_x_std rmse_factual_x_std < <(
+    python -c '
+import re
+import sys
+
+def last_num(pat, text):
+    ms = list(re.finditer(pat, text))
+    return ms[-1].group(1) if ms else "NA"
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="replace").read()
+tau_m = re.search(r"\(tau=(\d+),", text)
+tau = tau_m.group(1) if tau_m else "NA"
+m3 = None
+for m in re.finditer(
+    r"MAE normalized:\s*([0-9.]+)\s*\|\s*MAE unscaled:\s*([0-9.]+)\s*\|\s*RMSE unscaled:\s*([0-9.]+)",
+    text,
+):
+    m3 = m
+if m3:
+    mae_norm, mae_uns, rmse_uns = m3.groups()
+else:
+    mae_norm = mae_uns = rmse_uns = "NA"
+rmse_norm = last_num(r"Global RMSE on stacked batches \(normalized space\):\s*([0-9.]+)", text)
+rmse_x_std = last_num(r"VCIP-style\):\s*([0-9.]+)", text)
+rmse_factual_x_std = last_num(r"Factual global RMSE[^\n:]*:\s*([0-9.]+)", text)
+print(tau, mae_norm, mae_uns, rmse_uns, rmse_norm, rmse_x_std, rmse_factual_x_std)
+' "${eval_log}"
+  )
+
+  # Fallbacks if parsing misses a field for any reason.
+  [[ -z "${mae_norm}" ]] && mae_norm="NA"
+  [[ -z "${mae_uns}" ]] && mae_uns="NA"
+  [[ -z "${rmse_uns}" ]] && rmse_uns="NA"
+  [[ -z "${rmse_norm}" ]] && rmse_norm="NA"
+  [[ -z "${rmse_x_std}" ]] && rmse_x_std="NA"
+  [[ -z "${rmse_factual_x_std}" ]] && rmse_factual_x_std="NA"
+
+  append_csv_row "${timestamp},${gamma},${seed},${tau_used},${test},${mae_norm},${mae_uns},${rmse_uns},${rmse_norm},${rmse_x_std},${rmse_factual_x_std}"
+  rm -f "${eval_log}"
 done

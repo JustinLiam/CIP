@@ -79,7 +79,30 @@ exp:
   iql_max_patients: null
   # Path to train_ct ``ct_best_encoder.pt``, VAE ``model.ckpt`` (inference_model.*), or flat InferenceModel weights
   iql_inference_ckpt: ""
-  iql_reward_type: negative_outcome_mse
+  # Reward design for offline RL transitions (see iql_dataset_builder.py docstring).
+  #   negative_outcome      : r = -|y_{t+1} - y_target|                (L1, RECOMMENDED)
+  #   negative_outcome_mse  : r = -(y_{t+1} - y_target)^2              (L2, heavy-tailed!)
+  #   progress              : r = |y_t - y_target| - |y_{t+1} - y_target|
+  #     NOTE: "progress" was tried as a long-horizon signal but empirically
+  #     collapses V/Q to ≈0 under HER-sampled y_target — mean(r)≈0 and
+  #     |r|~0.01 for slow-changing tumor data, so the AWR advantage vanishes
+  #     and the IQL policy degenerates to pure behavior cloning (actor_loss
+  #     plateaus at the BC baseline, mae_uns stuck at the factual baseline).
+  #     Also has a sign conflict: treatment that shrinks tumor pushes y_next
+  #     away from the factual-future y_target → good actions get negative
+  #     reward. L1 below does not have this issue.
+  iql_reward_type: negative_outcome
+  # Hard-clip |r| to suppress simulator-overflow outliers (raw MSE on cancer_sim
+  # γ=4 has min≈-117 even though q99=0). With L1 reward the typical |r| ~ 0.3,
+  # outliers |r| ~ 10; clip=3.0 kills the worst 1% without distorting 99% of the
+  # learning signal. Directly eliminates the Twin-Q spike pattern (r in batch
+  # → TD target jumps → q_loss ~ 0.5·r²). 0 disables.
+  iql_reward_clip: 3.0
+  # none | auto. "auto" divides the whole reward buffer by its empirical std
+  # so TD targets stay O(1) regardless of outcome scale (standard IQL trick).
+  # Recommended together with reward_clip: after clipping we re-normalize so
+  # V fixed point ≈ E[r]/(1-γ) is O(10) rather than O(100).
+  iql_reward_scale: auto
   iql_max_action: 1.0
   # Map dataset treatments in [0, iql_max_action] to [-iql_max_action, iql_max_action] for Tanh IQL actor
   iql_dataset_actions_unit_interval: true
@@ -131,7 +154,7 @@ exp:
   ct_epochs: 200
   ct_patience: 20
   ct_weight_decay: 1.0e-05
-  ct_sinkhorn_blur: 0.05
+  ct_sinkhorn_blur: 0.01
   ct_batch_size: 512
   ct_batch_size_val: 256
   ct_num_workers: 0
@@ -155,21 +178,21 @@ exp:
   ct_es_metric: mae_uw
   # Log the full percentile distribution of WeightNet outputs every N epochs
   # (the compact ESS/std/min/max line is logged every epoch regardless).
-  ct_weight_log_every: 10
+  ct_weight_log_every: 5
   # E-step inner loop: number of WeightNet updates per batch before the M-step.
   # k_inner=1 preserves the legacy 1:1 E/M interleaving (identical behaviour to before).
   # k_inner>1 gives the E-step more iterations per batch to converge against the frozen
   # encoder output Z_t.detach(), analogous to CTD-NKO's per-epoch full refit but at the
   # batch level. Typical values to try: 3, 5, 10. Higher = stronger deconfounding
   # pressure but ~linearly more Sinkhorn evaluations per batch.
-  ct_k_inner: 1
+  ct_k_inner: 5
   # WeightNet learning rate (separate from encoder+predictor LR, which is hard-coded
   # to 1e-4 inside train_ct.py). Set to null => fall back to ct_lr for backward compat.
   # When raising ct_k_inner>1, the [E-inner] drop often comes back too small (<5%)
   # because Sinkhorn gradients are tiny; try ct_w_lr in [5e-3, 1e-2] to make each
   # inner update actually move the parameters. Reference CTD-NKO uses lr=0.1 for a
   # similar WeightNet (extreme, only because they refit from scratch every update).
-  ct_w_lr: 1e-2
+  ct_w_lr: 5e-3
   # Gradient-clip max_norm applied to WeightNet params after each inner-loop backward.
   # Raise together with ct_w_lr (e.g. 5.0 for w_lr=1e-2); set to null to disable clip.
   ct_w_clip: 5.0
@@ -188,9 +211,9 @@ exp:
   #   stop-gradient teacher signal. This regularizes rollout dynamics in latent space
   #   without changing the downstream IQL interface (which still uses outcome_predictor).
   # Set to 0.0 to disable. A good first sweep is {1e-2, 5e-2, 1e-1}.
-  ct_dyn_consistency_weight: 0.0
+  ct_dyn_consistency_weight: 0.1
   # Hidden width of g(z_t, a_t) -> z_{t+1}; defaults to ct_predictor_hidden when unset.
-  ct_dyn_hidden: 64
+  ct_dyn_hidden: 128
   # Residual latent transition: z_next_pred = z_t + delta(z_t, a_t). Usually stabilizes
   # one-step latent prediction and reduces rollout drift.
   ct_dyn_residual: true

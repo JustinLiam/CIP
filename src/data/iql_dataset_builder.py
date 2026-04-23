@@ -60,11 +60,13 @@ def build_iql_transitions_from_ct(
     data: Dict[str, np.ndarray],
     inference_model,
     device: str = "cuda",
-    reward_type: str = "negative_outcome_mse",
+    reward_type: str = "progress",
     max_patients: Optional[int] = None,
     max_action: float = 1.0,
     dataset_actions_unit_interval: bool = True,
     max_tau: float = 12.0,
+    reward_clip: float = 1.0,
+    reward_scale: str = "none",
 ) -> Dict[str, np.ndarray]:
     """
     Build offline RL transitions (s, a, r, s', done) from longitudinal dataset.
@@ -77,6 +79,28 @@ def build_iql_transitions_from_ct(
     [-max_action, max_action] to match Tanh-bounded IQL policies.
 
     ``max_tau`` scales time-to-go; must match evaluation (``exp.max_tau``).
+
+    Reward design (the 2026-04 fix for q_loss spikes + long-τ regressions):
+
+    ``reward_type`` selects the per-step scalar:
+      * ``"negative_outcome_mse"``  (legacy)      r = -mean((y_{t+1} - y_target)^2)
+      * ``"negative_outcome"``      (L1)          r = -mean(|y_{t+1} - y_target|)
+      * ``"progress"`` (RECOMMENDED, new default) r = |y_t - y_target| - |y_{t+1} - y_target|
+        Progress reward. Σ_t r_t telescopes to ``|y_t - y_target| - |y_T - y_target|``, so
+        V*(s_t) is the expected *remaining* distance improvement under the policy —
+        the exact quantity a long-horizon planner wants. Action-sensitive, zero-mean
+        on noise, naturally bounded by |Δy|.
+
+    ``reward_clip`` (float, >=0; 0 disables): hard-clip r to ``[-c, +c]``. On
+    cancer_sim γ=4 the raw MSE distribution has q99=0 but min≈-117 (rare simulator
+    overflow patients). Without clipping a single outlier in a batch creates TD
+    targets of O(100), driving q_loss spikes. Default ``1.0`` preserves > 99% of
+    the ``progress`` / L1 signal while killing the heavy tail completely.
+
+    ``reward_scale`` ("none" / "auto"): when "auto", divide all rewards by their
+    empirical std after clipping. Standard IQL practice; keeps ``Q`` in ``O(1)``
+    so that default ``iql_discount=0.99`` and ``iql_beta=1.0`` work out-of-the-box
+    across datasets with different outcome scales.
     """
     inference_model = inference_model.to(device)
     inference_model.eval()
@@ -172,14 +196,27 @@ def build_iql_transitions_from_ct(
 
                 done = 1.0 if (t + 1) >= last_idx else 0.0
                 y_next = data["outputs"][i, t + 1, :].astype(np.float32)
-                # Dense shaping: every step penalizes deviation from the sampled HER target.
-                # Sparse r=0 on most steps makes r + γV(s') ≈ 0 and collapses Q/V (q_loss/value_loss → 0).
+                y_cur = data["outputs"][i, t, :].astype(np.float32)
+                # See docstring for the reward design rationale. The default
+                # "progress" signal telescopes so V(s) encodes remaining distance
+                # improvement — directly aligned with long-horizon planning.
                 if reward_type == "negative_outcome_mse":
                     r = -float(np.mean((y_next - y_target) ** 2))
                 elif reward_type == "negative_outcome":
                     r = -float(np.mean(np.abs(y_next - y_target)))
+                elif reward_type == "progress":
+                    d_cur = float(np.mean(np.abs(y_cur - y_target)))
+                    d_nxt = float(np.mean(np.abs(y_next - y_target)))
+                    r = d_cur - d_nxt
                 else:
                     r = -float(np.mean(np.abs(y_next - y_target)))
+
+                if reward_clip is not None and float(reward_clip) > 0.0:
+                    c = float(reward_clip)
+                    if r > c:
+                        r = c
+                    elif r < -c:
+                        r = -c
                 
 
                 # # 4. 恢复最朴素的密集误差奖励 (逼迫模型给药，消除 33.6 飙升)
@@ -211,10 +248,30 @@ def build_iql_transitions_from_ct(
                 next_states.append(s_next)
                 dones.append([done])
 
+    rewards_arr = np.asarray(rewards, dtype=np.float32)
+    if str(reward_scale).lower() == "auto":
+        r_std = float(rewards_arr.std()) + 1e-8
+        rewards_arr = rewards_arr / r_std
+
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
+    r_flat = rewards_arr.reshape(-1)
+    _logger.info(
+        "IQL reward stats | type=%s clip=%s scale=%s | "
+        "mean=%.6f std=%.6f min=%.4f max=%.4f "
+        "q01=%.4f q50=%.4f q99=%.4f",
+        reward_type, reward_clip, reward_scale,
+        float(r_flat.mean()), float(r_flat.std()),
+        float(r_flat.min()), float(r_flat.max()),
+        float(np.quantile(r_flat, 0.01)),
+        float(np.quantile(r_flat, 0.50)),
+        float(np.quantile(r_flat, 0.99)),
+    )
+
     return {
         "states": np.asarray(states, dtype=np.float32),
         "actions": np.asarray(actions, dtype=np.float32),
-        "rewards": np.asarray(rewards, dtype=np.float32),
+        "rewards": rewards_arr,
         "next_states": np.asarray(next_states, dtype=np.float32),
         "dones": np.asarray(dones, dtype=np.float32),
     }
