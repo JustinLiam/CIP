@@ -144,7 +144,7 @@ exp:
   iql_val_worlds: [sim, predictor]
   # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
   # Must appear in iql_val_worlds.
-  iql_val_selection_world: sim
+  iql_val_selection_world: predictor
   # Horizon-aware IQL: normalize time-to-go; must match iql_dataset_builder / eval_iql_planner
   max_tau: 12.0
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
@@ -153,7 +153,7 @@ exp:
   ct_lr: 1e-4
   ct_epochs: 200
   ct_patience: 20
-  ct_weight_decay: 1.0e-05
+  ct_weight_decay: 1e-05
   ct_sinkhorn_blur: 0.01
   ct_batch_size: 512
   ct_batch_size_val: 256
