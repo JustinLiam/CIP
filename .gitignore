@@ -13,3 +13,4 @@ CausalTransformer/
 *.pt
 *.gitignore
 CTD-NKO_IJCAI-main/
+*trace.json

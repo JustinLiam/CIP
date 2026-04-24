@@ -157,7 +157,7 @@ exp:
   ct_sinkhorn_blur: 0.01
   ct_batch_size: 512
   ct_batch_size_val: 256
-  ct_num_workers: 0
+  ct_num_workers: 4
   ct_weight_hidden: 64
   ct_predictor_hidden: 64
   # Multi-horizon teacher losses (k=1..K) + optional scheduled sampling on prev_outputs for k>=2; alignment stays k=1 only.
