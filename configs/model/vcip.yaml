@@ -109,8 +109,8 @@ exp:
   iql_hidden_dim: 256
   iql_n_hidden: 2
   # iql_tau: 策略价值函数加权的 expectile 参数，控制“policy value”与“critic value”之间的偏置。具体地，TD3+BC 和 IQL 论文中用于 expectile regression，建议在 0.5~0.9 之间，越大代表更乐观估计。
-  iql_tau: 0.7
-  iql_beta: 1.0
+  iql_tau: 0.5  # revised in April 26, Sunday, by gridsearch in Thinkstation
+  iql_beta: 3.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_discount: 0.99
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005

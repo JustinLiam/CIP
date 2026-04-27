@@ -14,22 +14,28 @@ GRID_WORKER_ID=${GRID_WORKER_ID:-0}
 GRID_NUM_WORKERS=${GRID_NUM_WORKERS:-1}
 
 # ---------- IQL 搜索空间定义 ----------
-IQL_TAU_LIST=("0.5" "0.7" "0.8" "0.9")
-IQL_BETA_LIST=("1.0" "3.0" "5.0" "10.0")
-IQL_TARGET_TAU_LIST=("0.001" "0.005" "0.01")
-IQL_LR_LIST=("1e-4" "3e-4" "5e-4")
-IQL_DISCOUNT_LIST=("0.9" "0.95" "0.99")
+# IQL_TAU_LIST=("0.5" "0.7" "0.8" "0.9")
+IQL_TAU_LIST=("0.5")
+# IQL_BETA_LIST=("1.0" "3.0" "5.0" "10.0")
+IQL_BETA_LIST=("3.0" "5.0" "10.0")
+# IQL_TARGET_TAU_LIST=("0.001" "0.005" "0.01")
+IQL_TARGET_TAU_LIST=("0.001")
+# IQL_LR_LIST=("1e-4" "3e-4" "5e-4")
+IQL_LR_LIST=("3e-4" "5e-4")
+# IQL_DISCOUNT_LIST=("0.9" "0.95" "0.99")
+IQL_DISCOUNT_LIST=("0.95" "0.9")
 
 # 指定的 10 个 Seed
-SEEDS=(20 202 2020 20202 202020 10 101 1010 10101 101010)
+# SEEDS=(20 202 2020 20202 202020 10 101 1010 10101 101010)
+SEEDS=(10 101 2020)
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "${ROOT}"
 
 grid_root="${ROOT}/grid_results/iql_search/gamma_${gamma}"
 mkdir -p "${grid_root}/logs" "${grid_root}/iql_ckpts" "${grid_root}/iql_ckpts_work"
-summary_csv="${grid_root}/summary.csv"
-summary_lock="${grid_root}/.summary.lock"
+summary_csv="${grid_root}/summary_0426.csv"
+summary_lock="${grid_root}/.summary_0426.lock"
 
 # 定义 CSV 表头
 EXPECTED_HEADER="combo_id,seed,iql_tau,iql_beta,iql_target_tau,iql_lr,iql_discount,iql_best_val_mae_uns,iql_best_step,mae_uns_eval_split,eval_split"
@@ -130,11 +136,11 @@ run_iql_combo() {
 
 # 嵌套循环执行网格搜索
 for tau in "${IQL_TAU_LIST[@]}"; do
-  for beta in "${IQL_BETA_LIST[@]}"; do
-    for t_tau in "${IQL_TARGET_TAU_LIST[@]}"; do
-      for lr in "${IQL_LR_LIST[@]}"; do
-        for disc in "${IQL_DISCOUNT_LIST[@]}"; do
-          for seed in "${SEEDS[@]}"; do
+  for t_tau in "${IQL_TARGET_TAU_LIST[@]}"; do 
+    for beta in "${IQL_BETA_LIST[@]}"; do
+      for disc in "${IQL_DISCOUNT_LIST[@]}"; do
+        for lr in "${IQL_LR_LIST[@]}"; do       
+          for seed in "${SEEDS[@]}"; do         
             run_iql_combo "${tau}" "${beta}" "${t_tau}" "${lr}" "${disc}" "${seed}"
           done
         done
