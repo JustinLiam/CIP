@@ -57,9 +57,27 @@ def _iql_augmented_state(
     return torch.cat([z, eval_target, delta, a_prev_tanh], dim=-1)
 
 
-def _unscaled_cancer_volume_np(y_norm: np.ndarray, mean_ser, std_ser) -> np.ndarray:
-    m = float(mean_ser["cancer_volume"])
-    s = float(std_ser["cancer_volume"])
+def _resolve_outcome_scaling(mean_ser, std_ser, preferred_key: str = "outputs") -> tuple[float, float, str]:
+    """Return (mean, std, key_used) for unscaled outcome metrics."""
+    for key in (preferred_key, "cancer_volume"):
+        try:
+            return float(mean_ser[key]), float(std_ser[key]), key
+        except Exception:
+            pass
+    try:
+        if hasattr(mean_ser, "items") and hasattr(std_ser, "items"):
+            for key, mean_value in mean_ser.items():
+                try:
+                    return float(mean_value), float(std_ser[key]), str(key)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return 0.0, 1.0, "none"
+
+
+def _unscaled_outcome_np(y_norm: np.ndarray, mean_ser, std_ser, *, preferred_key: str = "outputs") -> np.ndarray:
+    m, s, _ = _resolve_outcome_scaling(mean_ser, std_ser, preferred_key=preferred_key)
     return y_norm.astype(np.float64) * s + m
 
 
@@ -106,7 +124,8 @@ def _extend_h_work_after_one_step(
     B = a_sim.size(0)
     y_col = y_norm.view(B, 1)
     y_ch = y_col.unsqueeze(-1)
-    y_uns = y_col * float(std_ser["cancer_volume"]) + float(mean_ser["cancer_volume"])
+    mean_outcome, std_outcome, _ = _resolve_outcome_scaling(mean_ser, std_ser, preferred_key="outputs")
+    y_uns = y_col * std_outcome + mean_outcome
 
     last_curr = H["current_treatments"][:, -1:, :].clone()
     last_out = H["outputs"][:, -1:, :].clone()
@@ -224,7 +243,7 @@ def _compute_world_metrics(
     factual_output_list: list | None,
     mean_ser,
     std_ser,
-    std: float,
+    outcome_std: float,
     batch_rmse_plan: list,
     batch_rmse_fact: list | None,
     return_series: bool,
@@ -240,32 +259,36 @@ def _compute_world_metrics(
     if factual_output_list is not None and len(factual_output_list) > 0:
         fact_arr = np.concatenate(factual_output_list, axis=0)
         rmse_factual_norm = float(np.sqrt(((fact_arr - true_arr) ** 2).mean()))
-        fact_y_uns = _unscaled_cancer_volume_np(fact_arr, mean_ser, std_ser).reshape(-1)
-        true_y_uns_full = _unscaled_cancer_volume_np(true_arr, mean_ser, std_ser).reshape(-1)
+        fact_y_uns = _unscaled_outcome_np(fact_arr, mean_ser, std_ser).reshape(-1)
+        true_y_uns_full = _unscaled_outcome_np(true_arr, mean_ser, std_ser).reshape(-1)
         mae_factual_norm = float(np.mean(np.abs(fact_arr.reshape(-1) - true_arr.reshape(-1))))
         mae_factual_uns = float(np.mean(np.abs(fact_y_uns - true_y_uns_full)))
 
     iql_y_norm = pred_arr.reshape(-1)
     true_y_norm = true_arr.reshape(-1)
-    iql_y_uns = _unscaled_cancer_volume_np(pred_arr, mean_ser, std_ser).reshape(-1)
-    true_y_uns = _unscaled_cancer_volume_np(true_arr, mean_ser, std_ser).reshape(-1)
+    iql_y_uns = _unscaled_outcome_np(pred_arr, mean_ser, std_ser).reshape(-1)
+    true_y_uns = _unscaled_outcome_np(true_arr, mean_ser, std_ser).reshape(-1)
 
     mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
-    mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
-    rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
+    mae_unscaled = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
+    rmse_unscaled = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
 
     out: Dict[str, Any] = {
         "mae_norm": mae_norm,
-        "mae_uns": mae_uns,
+        "mae_unscaled": mae_unscaled,
         "rmse_norm": rmse_norm,
-        "rmse_uns": rmse_uns,
-        "rmse_norm_x_std": rmse_norm * std,
+        "rmse_unscaled": rmse_unscaled,
+        "rmse_norm_x_std": rmse_norm * outcome_std,
         "mean_batch_rmse_plan": float(np.mean(batch_rmse_plan)) if batch_rmse_plan else None,
         "mean_batch_rmse_factual": float(np.mean(batch_rmse_fact)) if batch_rmse_fact else None,
         "rmse_factual_norm": rmse_factual_norm,
         "mae_factual_norm": mae_factual_norm,
-        "mae_factual_uns": mae_factual_uns,
+        "mae_factual_unscaled": mae_factual_uns,
     }
+    # Backward-compatible aliases.
+    out["mae_uns"] = out["mae_unscaled"]
+    out["rmse_uns"] = out["rmse_unscaled"]
+    out["mae_factual_uns"] = out["mae_factual_unscaled"]
     if return_series:
         out["iql_y_norm"] = iql_y_norm
         out["true_y_norm"] = true_y_norm
@@ -294,7 +317,7 @@ def aggregate_iql_planner_metrics(
     debug_panel: bool = False,
 ) -> Dict[str, Any]:
     """
-    Full pass over ``fold``'s dataloader; returns global MAE/RMSE (normalized and unscaled tumor volume).
+    Full pass over ``fold``'s dataloader; returns global MAE/RMSE (normalized and unscaled outcome).
 
     ``worlds`` controls which dynamics are used for the closed-loop rollout:
 
@@ -505,10 +528,7 @@ def aggregate_iql_planner_metrics(
     finally:
         planner.actor.train(was_training)
 
-    try:
-        std = float(dataset_collection.train_scaling_params[1]["cancer_volume"])
-    except Exception:
-        std = 1.0
+    _, std, outcome_scale_key = _resolve_outcome_scaling(mean_ser, std_ser, preferred_key="outputs")
 
     per_world_metrics: Dict[str, Dict[str, Any]] = {}
     for world in worlds:
@@ -518,7 +538,7 @@ def aggregate_iql_planner_metrics(
             factual_output_list=(per_world_fact[world] if include_factual_traj_rmse else None),
             mean_ser=mean_ser,
             std_ser=std_ser,
-            std=std,
+            outcome_std=std,
             batch_rmse_plan=per_world_batch_rmse_plan[world],
             batch_rmse_fact=per_world_batch_rmse_fact[world] if include_factual_traj_rmse else None,
             return_series=collect_series,
@@ -543,9 +563,9 @@ def aggregate_iql_planner_metrics(
                 "true_shape": list(true_y_uns.shape),
                 "pred_hash": _fingerprint_np(pred_y_uns),
                 "true_hash": _fingerprint_np(true_y_uns),
-                "mae_uns_logged": float(per_world_metrics[world]["mae_uns"]),
+                "mae_unscaled_logged": float(per_world_metrics[world]["mae_unscaled"]),
                 "mae_uns_recomputed": mae_recomputed,
-                "mae_uns_abs_diff": float(abs(mae_recomputed - float(per_world_metrics[world]["mae_uns"]))),
+                "mae_uns_abs_diff": float(abs(mae_recomputed - float(per_world_metrics[world]["mae_unscaled"]))),
                 "same_shape": same_shape,
             }
             history_ok = history_ok and bool(world_debug.get("history_updates_ok", True))
@@ -563,6 +583,7 @@ def aggregate_iql_planner_metrics(
         }
     if len(worlds) > 1:
         out["per_world"] = per_world_metrics
+    out["outcome_scale_key"] = outcome_scale_key
     if debug_payload is not None:
         out["debug_panel"] = debug_payload
     return out

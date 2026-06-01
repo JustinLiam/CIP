@@ -12,6 +12,21 @@ from omegaconf import DictConfig, OmegaConf
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
 
 
+def active_weight_from_logits(logits_w: torch.Tensor, active_t: torch.Tensor) -> torch.Tensor:
+    """
+    Mask inactive batch rows before softmax so padding does not share mass;
+    scale by ``sum(active_t)`` (not ``B``).
+
+    Aligns with ``forward`` supervised mask ``H_t['active_entries'][:, -1, 0]``.
+    Degenerate batches with no active row return zeros.
+    """
+    n_act = active_t.detach().float().sum()
+    if float(n_act) <= 0.0:
+        return torch.zeros_like(logits_w)
+    logits_m = logits_w.masked_fill(active_t.detach() < 0.5, torch.tensor(-1e4, device=logits_w.device, dtype=logits_w.dtype))
+    return F.softmax(logits_m, dim=0) * n_act
+
+
 def _cfg_sel(cfg, key: str, default):
     if isinstance(cfg, DictConfig):
         return OmegaConf.select(cfg, key, default=default)
@@ -110,7 +125,7 @@ class CTDeconfoundModel(nn.Module):
         self.static_size = int(ds["static_size"])
         self.z_dim = int(md["z_dim"])
         dropout = float(_cfg_sel(cfg, "exp.dropout", 0.1))
-        num_layers = int(md["inference"]["num_layers"])
+        num_layers = int(md["ct_model"]["num_layers"])
 
         self.ct_encoder = CTHistoryEncoder(
             x_dim=x_dim,
@@ -158,7 +173,12 @@ class CTDeconfoundModel(nn.Module):
         A_t = H_t["current_treatments"][:, -1, :]
         return Z_t, A_t
 
-    def forward(self, H_t: Dict[str, torch.Tensor], y_next: torch.Tensor):
+    def forward(
+        self,
+        H_t: Dict[str, torch.Tensor],
+        y_next: torch.Tensor,
+        w_fixed: torch.Tensor = None,
+    ):
         """
         Returns
         -------
@@ -169,17 +189,25 @@ class CTDeconfoundModel(nn.Module):
             offset bias that arises when WeightNet concentrates mass on a sub-population
             whose y-mean differs from the true population y-mean. Combine in train_ct.py
             as ``(1 - a) * loss_pred_w + a * loss_pred_anchor`` with ``a = ct_anchor_weight``.
+
+        If ``w_fixed`` is provided (offline_periodic / none modes), skip online WeightNet
+        and use the precomputed per-sample weights. Inactive rows should have w=0.
         """
         Z_t, A_t = self.encode(H_t)
-        
-        # ==============================================================
-        # 1. E-Step 分支：为 WeightNet 提供特征
-        # 必须对 Z_t 进行 .detach()，彻底切断 loss_align 流向 Encoder 的路径
-        # ==============================================================
-        za_for_w = torch.cat([Z_t.detach(), A_t], dim=-1)
-        logits_w = self.weight_net(za_for_w)
-        w = F.softmax(logits_w, dim=0) * float(Z_t.size(0))
-        
+
+        active_t = H_t["active_entries"][:, -1, 0].float()
+        n_act = active_t.sum() + 1e-8
+
+        if w_fixed is not None:
+            w = w_fixed.reshape(-1).to(device=Z_t.device, dtype=Z_t.dtype) * active_t
+            logits_w = w
+        else:
+            # Online E-step path: WeightNet on [Z_t.detach(), A_t].
+            za_for_w = torch.cat([Z_t.detach(), A_t], dim=-1)
+            logits_raw = self.weight_net(za_for_w)
+            w = active_weight_from_logits(logits_raw, active_t)
+            logits_w = logits_raw.masked_fill(active_t.detach() < 0.5, logits_raw.new_tensor(-1e4))
+
         # ==============================================================
         # 2. M-Step 分支：为 Predictor 提供特征
         # 这里的 Z_t 保持正常连接，负责接收 loss_pred 回传的梯度更新 Encoder
@@ -187,9 +215,8 @@ class CTDeconfoundModel(nn.Module):
         za_for_y = torch.cat([Z_t, A_t], dim=-1)
         y_hat = self.predictor(za_for_y)
         se = (y_hat - y_next).pow(2).mean(dim=-1)
-        # 提取当前时间步的 active 掩码 [B]
-        active_t = H_t["active_entries"][:, -1, 0]
-        # Weighted (WeightNet-reweighted) M-step loss — original behaviour.
+        # Weighted (WeightNet-reweighted) M-step loss — softmax 仅在 active 上归一，
+        # 分母 n_act 与活跃样本均值一致。
         #
         # 为什么需要 weighted 和 unweighted 两个 loss（loss_pred_w, loss_pred_anchor）？
         #
@@ -206,9 +233,10 @@ class CTDeconfoundModel(nn.Module):
         # unweighted loss（anchor loss）则直接反映在实际观测分布下的均值误差，体现了全体样本下的校准能力。
         # 若只依赖 weighted loss 优化，最终模型甚至可能产生很大 population-level 偏差；引入 anchor loss，可同时兼顾均值准确性和变量去偏。
         #
-        loss_pred_w = (w.detach() * se * active_t).sum() / (active_t.sum() + 1e-8)
+        w_denom = (w.detach() * active_t).sum() + 1e-8
+        loss_pred_w = (w.detach() * se * active_t).sum() / w_denom
         # anchor loss: 只用均匀权重，辅助校正 offset bias，增强泛化
-        loss_pred_anchor = (se * active_t).sum() / (active_t.sum() + 1e-8)
+        loss_pred_anchor = (se * active_t).sum() / n_act
 
         return loss_pred_w, Z_t, A_t, w, logits_w, y_hat, loss_pred_anchor
 
@@ -234,7 +262,11 @@ class CTDeconfoundModel(nn.Module):
             z_next_tgt, _ = self.encode(H_t_next)
         if detach_target:
             z_next_tgt = z_next_tgt.detach()
-        loss_dyn = F.mse_loss(z_next_pred, z_next_tgt)
+        # 提取当前时间步是否有效的掩码（active_t）
+        active_t = H_t["active_entries"][:, -1, 0] 
+        # 只针对 active_t == 1 的样本计算误差，并求平均
+        loss_dyn = ((z_next_pred - z_next_tgt).pow(2).mean(dim=-1) * active_t).sum() / (active_t.sum() + 1e-8)
+        # loss_dyn = F.mse_loss(z_next_pred, z_next_tgt)
         return loss_dyn, z_next_pred, z_next_tgt
 
     def weighted_prediction_loss(
@@ -249,7 +281,8 @@ class CTDeconfoundModel(nn.Module):
         za = torch.cat([Z_t, A_t], dim=-1)
         y_hat = self.predictor(za)
         se = (y_hat - y_target).pow(2).mean(dim=-1)
-        active_t = H_t["active_entries"][:, -1, 0]
-        loss_w = (w_fixed * se * active_t).sum() / (active_t.sum() + 1e-8)
+        active_t = H_t["active_entries"][:, -1, 0].float()
+        w_denom = (w_fixed * active_t).sum() + 1e-8
+        loss_w = (w_fixed * se * active_t).sum() / w_denom
         loss_anchor = (se * active_t).sum() / (active_t.sum() + 1e-8)
         return loss_w, y_hat, loss_anchor

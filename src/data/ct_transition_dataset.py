@@ -1,7 +1,7 @@
 """
 Transitions (patient, t) for standalone Causal Transformer training (ctd.md).
 """
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -69,6 +69,8 @@ class CTTransitionDataset(Dataset):
         self.data = data
         self.multi_k_max = int(multi_k_max)
         self.include_next_prefix = bool(include_next_prefix)
+        # Optional [num_patients, max_seq_len, 1] dataset/time-level weights (offline refresh).
+        self.weight_table: Optional[torch.Tensor] = None
         self.index: List[Tuple[int, int]] = []
         n = data["current_treatments"].shape[0]
         min_len = self.multi_k_max + 2
@@ -83,13 +85,29 @@ class CTTransitionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
+    def set_weight_table(self, weight_table: Optional[torch.Tensor]) -> None:
+        """Attach dataset/time-level weights; None resets to uniform w=1."""
+        self.weight_table = weight_table
+
+    def get_weight(self, patient_id: int, time_id: int) -> float:
+        if self.weight_table is None:
+            return 1.0
+        return float(self.weight_table[int(patient_id), int(time_id), 0].item())
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         i, t = self.index[idx]
         tp1 = t + 1
         H = _build_H_slice(self.data, i, tp1)
 
         y_next = torch.tensor(self.data["outputs"][i, t + 1, :], dtype=torch.float32)
-        out: Dict = {"H_t": H, "y_next": y_next}
+        w_val = self.get_weight(i, t)
+        out: Dict = {
+            "H_t": H,
+            "y_next": y_next,
+            "patient_id": torch.tensor(i, dtype=torch.long),
+            "time_id": torch.tensor(t, dtype=torch.long),
+            "w": torch.tensor(w_val, dtype=torch.float32),
+        }
         if self.include_next_prefix:
             out["H_t_next"] = _build_H_slice(self.data, i, t + 2)
         if self.multi_k_max >= 2:
@@ -146,7 +164,16 @@ def collate_ct_batch(samples: List[Dict]) -> Dict[str, Any]:
     device_dtype = samples[0]["H_t"]["prev_treatments"].dtype
     H_batch = _collate_pad_H(samples, "H_t", device_dtype)
     y_next = torch.stack([s["y_next"] for s in samples], dim=0)
-    out: Dict[str, Any] = {"H_t": H_batch, "y_next": y_next}
+    patient_id = torch.stack([s["patient_id"] for s in samples], dim=0)
+    time_id = torch.stack([s["time_id"] for s in samples], dim=0)
+    w = torch.stack([s["w"] for s in samples], dim=0)
+    out: Dict[str, Any] = {
+        "H_t": H_batch,
+        "y_next": y_next,
+        "patient_id": patient_id,
+        "time_id": time_id,
+        "w": w,
+    }
     if "H_t_next" in samples[0]:
         out["H_t_next"] = _collate_pad_H(samples, "H_t_next", device_dtype)
     if "H_t_k2" in samples[0]:

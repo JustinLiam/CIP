@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
 
+def _default_iql_model_dir(original_cwd: Path, args: DictConfig) -> Path:
+    """
+    Dataset-aware IQL output directory without hard dependency on dataset.coeff.
+    If coeff exists, append a suffix subdir to avoid collisions across coeff runs.
+    """
+    dataset_name = str(OmegaConf.select(args, "dataset.name", default="dataset"))
+    seed = int(OmegaConf.select(args, "exp.seed", default=0))
+    model_dir = original_cwd / "iql_models" / dataset_name / f"seed_{seed}"
+    coeff = OmegaConf.select(args, "dataset.coeff", default=None)
+    if coeff is not None:
+        model_dir = model_dir / f"coeff_{coeff}"
+    return model_dir
+
+
 def _state_dict_to_cpu(obj):
     if torch.is_tensor(obj):
         return obj.detach().cpu().clone()
@@ -211,7 +225,7 @@ def main(args: DictConfig):
         if not model_dir.is_absolute():
             model_dir = Path(get_original_cwd()) / model_dir
     else:
-        model_dir = Path(get_original_cwd()) / "iql_models" / f"seed_{args.exp.seed}" / f"gamma_{int(args.dataset.coeff)}"
+        model_dir = _default_iql_model_dir(Path(get_original_cwd()), args)
     model_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = model_dir / "iql_planner.pt"
     last_path = model_dir / "iql_planner_last.pt"

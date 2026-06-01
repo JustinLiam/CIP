@@ -99,10 +99,6 @@ class MIMIC3RealDataset(Dataset):
     def __len__(self):
         return len(self.data['active_entries'])
 
-    def simulate_output_after_actions(self, Ht, actions, scaling_params=None):
-        out = Ht['outputs']
-        return np.zeros((out.shape[0], out.shape[2]))
-
     def explode_trajectories(self, projection_horizon):
         """
         Convert test dataset to a dataset with rolling origin
@@ -545,6 +541,11 @@ class MIMIC3RealDatasetCollection(RealDatasetCollection):
                 treatments, outcomes, vitals, outcomes_unscaled
 
         
+        # Same dict as ``load_mimic3_data_processed``: outcome columns' mean/std after joint
+        # normalization with vitals (all_vitals → global mean/std → Z-score).
+        # Used by CT/train_ct and downstream code for unscaled-metric scaling; must match ``MIMIC3RealDataset.scaling_params``.
+        self.train_scaling_params = scaling_params
+
         self.train_f = MIMIC3RealDataset(treatments_train, outcomes_train, vitals_train, static_features_train,
                                          outcomes_unscaled_train, scaling_params, 'train')
         if split['val'] > 0.0:

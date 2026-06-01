@@ -10,6 +10,7 @@ exp:
   update_alpha: True                # Exponential growth of alpha from 0.0 to 1.0
   alpha_rate: exp                   # exp / lin
   bce_weight: False                 # Weight in BCE loss, proportional to treatment 
+  ct_ckpt_dir: null
 
 # Hydra defaults
 defaults:

@@ -10,6 +10,8 @@ The final RMSE still uses the original prefix ``H_t`` and the full ``a_seq`` (sa
 Logs aggregate **t+tau** tumor volume under the IQL plan vs ``targets['outputs'][:, -1]``, in normalized
 (train scaling) and unscaled (raw simulator scale) space.
 """
+from __future__ import annotations
+
 import logging
 import os
 import sys
@@ -35,6 +37,35 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
+
+
+def _default_iql_ckpt_candidates(args: DictConfig, original_cwd: Path) -> list[Path]:
+    """
+    Resolve IQL eval checkpoint candidates:
+    1) New dataset-aware layout (primary).
+    2) Legacy gamma layout (fallback for old experiments).
+    """
+    seed = int(OmegaConf.select(args, "exp.seed", default=0))
+    dataset_name = str(OmegaConf.select(args, "dataset.name", default="dataset"))
+    candidates = [
+        original_cwd / "iql_models" / dataset_name / f"seed_{seed}" / "iql_planner.pt",
+    ]
+    coeff = OmegaConf.select(args, "dataset.coeff", default=None)
+    if coeff is not None:
+        coeff_str = str(coeff)
+        candidates.insert(
+            0,
+            original_cwd / "iql_models" / dataset_name / f"seed_{seed}" / f"coeff_{coeff_str}" / "iql_planner.pt",
+        )
+        # Legacy location used by existing cancer experiments.
+        try:
+            coeff_int = int(coeff)
+            candidates.append(
+                original_cwd / "iql_models" / f"seed_{seed}" / f"gamma_{coeff_int}" / "iql_planner.pt"
+            )
+        except (TypeError, ValueError):
+            pass
+    return candidates
 
 
 def _actions_to_sim_interval(raw: np.ndarray, max_action: float) -> np.ndarray:
@@ -75,17 +106,24 @@ def _iql_augmented_state(
     return torch.cat([z, eval_target, delta, a_prev_tanh], dim=-1)
 
 
-def _unscaled_cancer_volume(y_norm: torch.Tensor, mean_ser, std_ser) -> torch.Tensor:
-    """y_norm: [B, 1] normalized tumor volume -> unscaled [B, 1]."""
-    m = float(mean_ser["cancer_volume"])
-    s = float(std_ser["cancer_volume"])
+def _resolve_outcome_scaling(mean_ser, std_ser, preferred_key: str = "outputs") -> tuple[float, float, str]:
+    for key in (preferred_key, "cancer_volume"):
+        try:
+            return float(mean_ser[key]), float(std_ser[key]), key
+        except Exception:
+            pass
+    return 0.0, 1.0, "none"
+
+
+def _unscaled_outcome(y_norm: torch.Tensor, mean_ser, std_ser) -> torch.Tensor:
+    """y_norm: [B, 1] normalized outcome -> unscaled [B, 1]."""
+    m, s, _ = _resolve_outcome_scaling(mean_ser, std_ser, preferred_key="outputs")
     return y_norm * s + m
 
 
-def _unscaled_cancer_volume_np(y_norm: np.ndarray, mean_ser, std_ser) -> np.ndarray:
-    """Same as ``_unscaled_cancer_volume`` for numpy (e.g. simulator outputs)."""
-    m = float(mean_ser["cancer_volume"])
-    s = float(std_ser["cancer_volume"])
+def _unscaled_outcome_np(y_norm: np.ndarray, mean_ser, std_ser) -> np.ndarray:
+    """Same as ``_unscaled_outcome`` for numpy (e.g. simulator outputs)."""
+    m, s, _ = _resolve_outcome_scaling(mean_ser, std_ser, preferred_key="outputs")
     return y_norm.astype(np.float64) * s + m
 
 
@@ -108,7 +146,7 @@ def _extend_h_work_after_one_step(
     B = a_sim.size(0)
     y_col = y_norm.view(B, 1)
     y_ch = y_col.unsqueeze(-1)  # [B, 1, 1] for outputs
-    y_uns = _unscaled_cancer_volume(y_col, mean_ser, std_ser)
+    y_uns = _unscaled_outcome(y_col, mean_ser, std_ser)
 
     last_curr = H["current_treatments"][:, -1:, :].clone()
     last_out = H["outputs"][:, -1:, :].clone()
@@ -151,9 +189,10 @@ def _resolve_iql_ckpt(args: DictConfig, original_cwd: Path) -> Path:
         if not p.is_absolute():
             p = original_cwd / p
         return p
-    seed = int(args.exp.seed)
-    gamma = int(args.dataset.coeff)
-    return original_cwd / "iql_models" / f"seed_{seed}" / f"gamma_{gamma}" / "iql_planner.pt"
+    for candidate in _default_iql_ckpt_candidates(args, original_cwd):
+        if candidate.exists():
+            return candidate
+    return _default_iql_ckpt_candidates(args, original_cwd)[0]
 
 
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
@@ -177,10 +216,11 @@ def main(args: DictConfig):
         if dims == 2:
             dataset_collection = repeat_static(dataset_collection)
 
-    try:
-        std = float(dataset_collection.train_scaling_params[1]["cancer_volume"])
-    except Exception:
-        std = 1.0
+    _, std, outcome_scale_key = _resolve_outcome_scaling(
+        dataset_collection.train_scaling_params[0],
+        dataset_collection.train_scaling_params[1],
+        preferred_key="outputs",
+    )
 
     # args.exp.test 参数用于指定当前代码是在“测试集” (test set) 上运行，还是在“验证集” (validation set) 上运行。
     # 如果 args.exp.test 为 True，则采用测试集数据 dataset_collection.test_f 进行评估，split_name 为 "test"。
@@ -312,19 +352,19 @@ def main(args: DictConfig):
     # t+tau tumor volume under IQL plan vs ground truth (normalized = train scaling space)
     iql_y_norm = output_after_actions_list.reshape(-1)
     true_y_norm = ture_output_list.reshape(-1)
-    iql_y_uns = _unscaled_cancer_volume_np(output_after_actions_list, mean_ser, std_ser).reshape(-1)
-    true_y_uns = _unscaled_cancer_volume_np(ture_output_list, mean_ser, std_ser).reshape(-1)
+    iql_y_uns = _unscaled_outcome_np(output_after_actions_list, mean_ser, std_ser).reshape(-1)
+    true_y_uns = _unscaled_outcome_np(ture_output_list, mean_ser, std_ser).reshape(-1)
 
     mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
-    mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
-    rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
+    mae_unscaled = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
+    rmse_unscaled = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
 
     logger.info("--- Aggregate (same protocol as optimize_interventions_onetime) ---")
     logger.info(f"Split: {split_name}")
     logger.info(f"Mean per-batch RMSE (IQL): {float(np.mean(losses)):.6f}")
     logger.info(f"Mean per-batch RMSE (factual traj): {float(np.mean(losses_2)):.6f}")
     logger.info(f"Global RMSE on stacked batches (normalized space): {rmse_norm:.6f}")
-    logger.info(f"Global RMSE × std (cancer volume scale, VCIP-style): {rmse_norm * std:.6f}")
+    logger.info(f"Global RMSE × std (outcome scale, VCIP-style): {rmse_norm * std:.6f}")
     logger.info(f"Factual global RMSE × std: {rmse_factual_norm * std:.6f}")
 
     logger.info("--- t+tau tumor volume (IQL planned actions vs target outputs[:, -1]) ---")
@@ -345,9 +385,11 @@ def main(args: DictConfig):
         f"min={float(np.min(true_y_uns)):.6f} max={float(np.max(true_y_uns)):.6f}"
     )
     logger.info(
-        f"Train scaling cancer_volume: mean={float(mean_ser['cancer_volume']):.6f} std={float(std_ser['cancer_volume']):.6f}"
+        f"Train scaling outcome key={outcome_scale_key}: mean={_resolve_outcome_scaling(mean_ser, std_ser)[0]:.6f} std={_resolve_outcome_scaling(mean_ser, std_ser)[1]:.6f}"
     )
-    logger.info(f"MAE normalized: {mae_norm:.6f} | MAE unscaled: {mae_uns:.6f} | RMSE unscaled: {rmse_uns:.6f}")
+    logger.info(
+        f"MAE normalized: {mae_norm:.6f} | MAE unscaled: {mae_unscaled:.6f} | RMSE unscaled: {rmse_unscaled:.6f}"
+    )
 
 
 if __name__ == "__main__":

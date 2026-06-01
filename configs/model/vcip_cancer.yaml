@@ -1,8 +1,8 @@
 # @package _global_
-# model:
-#   _target_: src.models.vae_model.VAEModel
-#   name: VCIP
-#   z_dim: 16
+model:
+  _target_: src.models.vae_model.VAEModel
+  name: VCIP
+  z_dim: 8
 #   auxiliary:
 #     _target_: src.models.auxiliary_model.AuxiliaryModel
 #     hidden_dim: 16
@@ -14,20 +14,21 @@
 #     - 16
 #     - 16
 #     lr: 0.001
-#   inference:
+  ct_model:
 #     _target_: src.models.inference_model.InferenceModel
-#     hidden_dim: 16
-#     num_layers: 2
-#     hiddens_F_mu:
-#     - 16
-#     # - 16
-#     hiddens_F_logvar:
-#     - 16
-#     # - 16
-#     predict_y_history:
-#     - 16
-#     # - 16
-#     do: True
+    hidden_dim: 16
+    num_layers: 2
+    hiddens_F_mu:
+    - 16
+    # - 16
+    hiddens_F_logvar:
+    - 16
+    # - 16
+    predict_y_history:
+    - 16
+    # - 16
+    do: True
+    treatment_hidden_dim: 16
 #   generative:
 #     _target_: src.models.generative_model.GenerativeModel
 #     entropy_lambda: 1
@@ -148,18 +149,33 @@ exp:
   # Horizon-aware IQL: normalize time-to-go; must match iql_dataset_builder / eval_iql_planner
   max_tau: 12.0
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
+  # Weighting mode: online (per-batch E-step), offline_periodic (CTD-NKO-style refresh), none (uniform w=1).
+  ct_weight_mode: offline_periodic
+  ct_weight_refresh_freq: 10
+  ct_weight_epochs: 5
+  ct_weight_batch_size: 1024
+  ct_weight_lr: 0.1
+  ct_weight_hidden_dim: 16
+  ct_weight_align_metric: sinkhorn
+  ct_weight_sinkhorn_blur: 0.01
+  ct_weight_use_time_shuffle: true
+  ct_weight_normalize: softmax_time
+  ct_weight_cache_dir: ""
+  ct_weight_log_diagnostics: true
+  # If true, after each refresh compute val alignment / balance diagnostics only (val loss still w=1).
+  ct_weight_val_diagnostics: false
   ct_align_loss: sinkhorn
   # ct_alpha: 0.1 使用EM方法后， 该参数不生效
-  ct_lr: 1e-4
+  ct_lr: 5e-5
   ct_epochs: 200
   ct_patience: 20
   ct_weight_decay: 1e-05
   ct_sinkhorn_blur: 0.01
-  ct_batch_size: 512
-  ct_batch_size_val: 256
+  ct_batch_size: 128
+  ct_batch_size_val: 64
   ct_num_workers: 4
-  ct_weight_hidden: 64
-  ct_predictor_hidden: 64
+  ct_weight_hidden: 32
+  ct_predictor_hidden: 32
   # Multi-horizon teacher losses (k=1..K) + optional scheduled sampling on prev_outputs for k>=2; alignment stays k=1 only.
   ct_multi_k_max: 3
   ct_multi_eta: 0.5
@@ -192,7 +208,7 @@ exp:
   # because Sinkhorn gradients are tiny; try ct_w_lr in [5e-3, 1e-2] to make each
   # inner update actually move the parameters. Reference CTD-NKO uses lr=0.1 for a
   # similar WeightNet (extreme, only because they refit from scratch every update).
-  ct_w_lr: 5e-3
+  ct_w_lr: 2.5e-3
   # Gradient-clip max_norm applied to WeightNet params after each inner-loop backward.
   # Raise together with ct_w_lr (e.g. 5.0 for w_lr=1e-2); set to null to disable clip.
   ct_w_clip: 5.0
