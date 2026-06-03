@@ -23,6 +23,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.ct_transition_dataset import CTTransitionDataset, collate_ct_batch, _covariate_stream_dim
 from src.models.ct_deconfound import CTDeconfoundModel, active_weight_from_logits
 from src.models.offline_weighting import (
+    apply_batch_softmax_weights,
     compute_val_balance_diagnostics,
     log_w_balance,
     log_w_used,
@@ -198,15 +199,33 @@ def _scheduled_prev_outputs(
     return Hm, n_used
 
 
-def _batch_fixed_weights(batch, device, active_t_mask: torch.Tensor) -> torch.Tensor:
-    """Dataset/time-level weights from collate; zero on inactive query steps."""
+def _batch_fixed_weights(
+    batch,
+    device,
+    active_t_mask: torch.Tensor,
+    *,
+    ctd_nko_mstep_softmax: bool = False,
+) -> torch.Tensor:
+    """
+    Dataset/time-level weights from collate; zero on inactive query steps.
+
+    offline_periodic: table holds sigmoid scores; apply CTD-NKO batch softmax on
+    active rows before the M-step (``F.softmax(w, dim=0) * batch_size``).
+    """
     if "w" in batch:
         w = batch["w"].to(device=device, dtype=torch.float32)
     elif "weights" in batch:
         w = batch["weights"].to(device=device, dtype=torch.float32)
     else:
         w = torch.ones(active_t_mask.size(0), device=device, dtype=torch.float32)
-    return w.reshape(-1) * active_t_mask.float()
+    w = w.reshape(-1)
+    if ctd_nko_mstep_softmax:
+        mask = active_t_mask.reshape(-1).bool()
+        if mask.any():
+            idx = torch.where(mask)[0]
+            w = w.clone()
+            w[idx] = apply_batch_softmax_weights(w[idx])
+    return w * active_t_mask.float()
 
 
 def _run_epoch(
@@ -297,7 +316,12 @@ def _run_epoch(
         with torch.set_grad_enabled(train):
             w_fixed_batch = None
             if use_fixed_w:
-                w_fixed_batch = _batch_fixed_weights(batch, device, active_t_mask)
+                w_fixed_batch = _batch_fixed_weights(
+                    batch,
+                    device,
+                    active_t_mask,
+                    ctd_nko_mstep_softmax=(weight_mode == "offline_periodic"),
+                )
             loss_pred1_w, Z_t, A_t, w, _, y_hat1, loss_pred1_anchor = model(
                 H_t, y_next, w_fixed=w_fixed_batch
             )
@@ -336,7 +360,12 @@ def _run_epoch(
                     sum_w_min += float(w_act.min())
                     w_samples.append(w_act.cpu())
             if train and weight_mode == "offline_periodic" and use_fixed_w:
-                w_batch = _batch_fixed_weights(batch, device, active_t_mask)
+                w_batch = _batch_fixed_weights(
+                    batch,
+                    device,
+                    active_t_mask,
+                    ctd_nko_mstep_softmax=True,
+                )
                 w_b_act = w_batch.detach()[active_t_mask]
                 if w_b_act.numel() > 0:
                     w_used_samples.append(w_b_act.cpu())
@@ -594,7 +623,7 @@ def main(args: DictConfig):
         OmegaConf.select(args, "exp.ct_weight_use_time_shuffle", default=True)
     )
     ct_weight_normalize = str(
-        OmegaConf.select(args, "exp.ct_weight_normalize", default="softmax_time")
+        OmegaConf.select(args, "exp.ct_weight_normalize", default="global")
     ).strip().lower()
     ct_weight_cache_dir = str(OmegaConf.select(args, "exp.ct_weight_cache_dir", default="") or "")
     ct_weight_log_diagnostics = bool(
@@ -665,8 +694,9 @@ def main(args: DictConfig):
     )
     if ct_weight_mode == "offline_periodic":
         logger.info(
-            "Offline periodic weights: refresh every %s epochs, weight_epochs=%s, "
-            "w_lr=%s, metric=%s, normalize=%s, time_shuffle=%s",
+            "Offline periodic weights (CTD-NKO): refresh every %s epochs, weight_epochs=%s, "
+            "w_lr=%s, metric=%s, normalize=%s, time_shuffle=%s, "
+            "output=sigmoid, mstep=batch_softmax",
             ct_weight_refresh_freq,
             ct_weight_epochs,
             ct_weight_lr,

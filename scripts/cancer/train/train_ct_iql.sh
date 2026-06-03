@@ -1,155 +1,334 @@
 #!/usr/bin/env bash
-# CT standalone (train_ct) -> IQL (train_iql_planner) -> eval (eval_iql_planner).
-# Usage (from repo root recommended):
-#   bash scripts/cancer/train/train_ct_iql.sh [test] [gamma] [gpu] [eval_tau]
-#     test     - passed as exp.test to eval only (false=val, true=test), default false
-#     gamma    - dataset.coeff / confounding level, default 4
-#     gpu      - CUDA_VISIBLE_DEVICES, default 0
-#     eval_tau - optional; if set, passed as exp.tau to eval_iql_planner only (rollout horizon + CIPDataset target window).
-#                CT/IQL training do not use this; same checkpoints work for any eval_tau (e.g. 6 then 4 without retraining).
+# CT (train_ct) -> IQL (train_iql_planner) -> eval (eval_iql_planner) for cancer_sim_cont.
 #
-# Eval-only (reuse existing checkpoints — each seed must have been fully trained once WITHOUT this flag):
-#   CT_IQL_SKIP_TRAIN=1 bash scripts/cancer/train/train_ct_iql.sh false 4 0 4
-# New seeds: run WITHOUT CT_IQL_SKIP_TRAIN first so train_ct creates ct_best_encoder.pt and train_iql_planner creates iql_planner.pt.
+# Usage (from repo root):
+#   bash scripts/cancer/train/train_ct_iql.sh [test] [gamma] [gpu]
+#     test  - exp.test for eval only (false=val, true=test), default false
+#     gamma - dataset.coeff, default 4
+#     gpu   - CUDA_VISIBLE_DEVICES, default 0
 #
-# Checkpoints (tau is NOT part of these paths):
-#   ct_checkpoints/seed_${seed}_gamma_${gamma}/ct_best_encoder.pt
-#   iql_models/seed_${seed}/gamma_${gamma}/iql_planner.pt
+# Eval runs at exp.tau = 1,2,3,4,5,6,8,10,12 (one row per seed x tau in ct_iql_eval_by_tau.csv).
+# IQL training metrics (independent of eval tau) go to ct_iql_training_summary.csv once per seed.
+# Override taus: CT_IQL_EVAL_TAUS="4 6 12"
+#
+# Outputs:
+#   results/ct_iql_eval_by_tau.csv      - eval metrics that MUST vary with exp.tau
+#   results/ct_iql_training_summary.csv - IQL val / cross-world metrics (one row per seed)
+# Eval-only (checkpoints must exist):
+#   CT_IQL_SKIP_TRAIN=1 bash scripts/cancer/train/train_ct_iql.sh false 4 0
+#
+# Optional env:
+#   CT_IQL_SEEDS="10 101"       - override default seed list
+#   CT_IQL_EVAL_TAUS="4 6 12"   - override default eval horizon list
+#   CT_IQL_SKIP_TRAIN=1         - skip train_ct + train_iql, eval only
+#
+# Checkpoints (canonical paths, match gridsearch layout under tumor_generator):
+#   ct_checkpoints/tumor_generator/seed_${seed}/coeff_${gamma}/ct_best_encoder.pt
+#   iql_models/tumor_generator/seed_${seed}/coeff_${gamma}/iql_planner.pt
 
-# set -euo pipefail 的作用是：
-# -e: 遇到命令执行出错时立即退出脚本
-# -u: 访问未定义变量时立即退出
-# -o pipefail: 只要管道（|）中的任何一个命令出错，则整个管道被视为失败（返回非零值）
-# 这样可以让 bash 脚本在遇到错误时及时终止，避免隐式 bug 并提高脚本的健壮性
 set -euo pipefail
 
-# 该语句的作用是：让当前 Bash 脚本能够使用 conda activate 命令切换环境。
-# 具体地，eval "$(conda shell.bash hook)" 会在当前 shell 会话中注册 conda 的 shell 插件，
-# 这样就能直接用 conda activate xxx 激活指定的 conda 虚拟环境。
 eval "$(conda shell.bash hook)"
 conda activate vcip
 
 test=${1:-false}
 gamma=${2:-4}
 gpu=${3:-0}
-eval_tau=${4:-}
+
+# Default IQL hyperparams (vcip_cancer.yaml); recorded in summary CSV combo_id row fields.
+COMBO_ID="vcip_cancer_default"
+IQL_TAU="0.5"
+IQL_BETA="5.0"
+IQL_TARGET_TAU="0.005"
+IQL_LR="3e-4"
+IQL_DISCOUNT="0.95"
+
+if [[ -n "${CT_IQL_EVAL_TAUS:-}" ]]; then
+  read -r -a EVAL_TAUS <<< "${CT_IQL_EVAL_TAUS}"
+else
+  EVAL_TAUS=(1 2 3 4 5 6 8 10 12)
+fi
+
+if [[ -n "${CT_IQL_SEEDS:-}" ]]; then
+  read -r -a SEEDS <<< "${CT_IQL_SEEDS}"
+else
+  SEEDS=(10 101 1010 10101 101010 20 202 2020 20202 202020)
+fi
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
-cd "$ROOT"
+cd "${ROOT}"
 
-# Shared CSV (append-only) for all runs; safe under concurrent bash processes.
+DATASET_NAME="tumor_generator"
+
 CSV_DIR="${ROOT}/results"
-CSV_PATH="${CSV_DIR}/ct_iql_eval_metrics.csv"
-CSV_LOCK="${CSV_PATH}.lock"
+EVAL_CSV="${CSV_DIR}/ct_iql_eval_by_tau.csv"
+TRAIN_CSV="${CSV_DIR}/ct_iql_training_summary.csv"
+CSV_LOCK="${CSV_DIR}/.ct_iql_csv.lock"
 mkdir -p "${CSV_DIR}"
 touch "${CSV_LOCK}"
 
+# eval_tau = rollout horizon (exp.tau). iql_expectile is NOT eval horizon.
+EVAL_HEADER="seed,gamma,eval_tau,tau_verified_from_log,mae_norm_eval,mae_uns_eval,rmse_uns_eval,eval_split,ct_ckpt_path,iql_ckpt_path,combo_id"
+TRAIN_HEADER="combo_id,seed,gamma,iql_expectile,iql_beta,iql_target_tau,iql_lr,iql_discount,ct_ckpt_path,iql_ckpt_path,iql_picked_step,iql_best_step_sim,rho_sim_predictor,top1_overlap_sim_predictor,top3_overlap_sim_predictor,top5_overlap_sim_predictor,iql_best_val_mae_uns,iql_best_val_mae_predictor"
+
 ensure_csv_header() {
-  if [[ ! -f "${CSV_PATH}" ]]; then
-    printf "timestamp,gamma,seed,tau,test,mae_norm,mae_uns,rmse_uns,rmse_norm,rmse_x_std,rmse_factual_x_std\n" > "${CSV_PATH}"
+  local path="$1" expected="$2"
+  if [[ -f "${path}" ]]; then
+    local existing_header
+    existing_header=$(head -n1 "${path}" || true)
+    if [[ "${existing_header}" != "${expected}" ]]; then
+      local bak="${path}.$(date +%s).bak"
+      mv "${path}" "${bak}"
+      echo "[schema] archived old CSV to ${bak}"
+    fi
+  fi
+  if [[ ! -f "${path}" ]]; then
+    echo "${expected}" > "${path}"
   fi
 }
 
 append_csv_row() {
-  local row="$1"
+  local path="$1" expected_header="$2" row="$3"
   (
     flock -x 200
-    ensure_csv_header
-    printf "%s\n" "${row}" >> "${CSV_PATH}"
+    ensure_csv_header "${path}" "${expected_header}"
+    printf "%s\n" "${row}" >> "${path}"
   ) 200>"${CSV_LOCK}"
 }
 
-seeds=(10 101 1010 10101 101010)
-# seeds=(20 202 2020 20202 202020)
-# seeds=(10)
+parse_eval_log() {
+  local log_file="$1" expected_tau="$2"
+  python - "${log_file}" "${expected_tau}" <<'PY'
+import re
+import sys
 
-for seed in "${seeds[@]}"; do
-  CT_CKPT="${ROOT}/ct_checkpoints/seed_${seed}_gamma_${gamma}/ct_best_encoder.pt"
-  IQL_CKPT="${ROOT}/iql_models/seed_${seed}/gamma_${gamma}/iql_planner.pt"
+path, expected = sys.argv[1], str(sys.argv[2])
+text = open(path, encoding="utf-8", errors="replace").read()
 
-  tau_msg=""
-  [[ -n "${eval_tau}" ]] && tau_msg=" exp.tau=${eval_tau}"
-  echo "=== seed=${seed} gamma=${gamma} | CT -> IQL -> eval (exp.test=${test})${tau_msg} ==="
+tau_m = re.search(r"\(tau=(\d+),\s*max_tau=", text)
+tau_verified = tau_m.group(1) if tau_m else "NA"
+
+agg = re.search(
+    r"MAE normalized:\s*([0-9.eE+-]+)\s*\|\s*MAE unscaled:\s*([0-9.eE+-]+)\s*\|\s*RMSE unscaled:\s*([0-9.eE+-]+)",
+    text,
+)
+if agg:
+    mae_norm, mae_uns, rmse_uns = agg.groups()
+else:
+    mae_norm = mae_uns = rmse_uns = "NA"
+
+tau_ok = "1" if tau_verified == expected else "0"
+print(tau_verified, mae_norm, mae_uns, rmse_uns, tau_ok)
+PY
+}
+
+read_iql_crossworld_metrics() {
+  local trace_json="$1"
+  python - "${trace_json}" <<'PY'
+import json
+import sys
+from typing import List, Optional
+
+import numpy as np
+
+path = sys.argv[1]
+
+
+def spearman_rho(a: List[float], b: List[float]) -> Optional[float]:
+    aa = np.asarray(a, dtype=np.float64)
+    bb = np.asarray(b, dtype=np.float64)
+    if aa.size < 2 or bb.size < 2 or aa.size != bb.size:
+        return None
+    ra = aa.argsort().argsort().astype(np.float64)
+    rb = bb.argsort().argsort().astype(np.float64)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    denom = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
+    if denom == 0.0:
+        return None
+    return float((ra * rb).sum() / denom)
+
+
+def top_k_overlap(metric_a: List[float], metric_b: List[float], k: int) -> Optional[float]:
+    if k <= 0 or len(metric_a) == 0 or len(metric_a) != len(metric_b):
+        return None
+    k = min(k, len(metric_a))
+    idx_a = set(np.argsort(np.asarray(metric_a))[:k].tolist())
+    idx_b = set(np.argsort(np.asarray(metric_b))[:k].tolist())
+    return float(len(idx_a & idx_b) / k)
+
+
+def na():
+    print("NA NA NA NA NA NA NA NA")
+    return
+
+
+try:
+    with open(path, "r") as f:
+        trace = json.load(f)
+except FileNotFoundError:
+    na()
+    raise SystemExit(0)
+
+metric_key = str(trace.get("val_metric", "mae_uns"))
+worlds = list(trace.get("worlds", ["sim", "predictor"]))
+history = trace.get("history", [])
+best_pw = trace.get("best_per_world", {})
+selection_world = str(trace.get("selection_world", worlds[0] if worlds else "sim"))
+
+if "sim" not in worlds or "predictor" not in worlds or len(history) < 2:
+    na()
+    raise SystemExit(0)
+
+series_sim = [float(entry["sim"][metric_key]) for entry in history]
+series_pred = [float(entry["predictor"][metric_key]) for entry in history]
+
+rho = spearman_rho(series_sim, series_pred)
+t1 = top_k_overlap(series_sim, series_pred, 1)
+t3 = top_k_overlap(series_sim, series_pred, 3)
+t5 = top_k_overlap(series_sim, series_pred, 5)
+
+picked_step = best_pw.get(selection_world, {}).get("step")
+best_step_sim = best_pw.get("sim", {}).get("step")
+picked_mae = best_pw.get(selection_world, {}).get("metric")
+pred_mae = best_pw.get("predictor", {}).get("metric")
+
+
+def fmt(x):
+    if x is None:
+        return "NA"
+    if isinstance(x, float):
+        return f"{x:.6g}"
+    return str(x)
+
+
+print(
+    " ".join(
+        [
+            fmt(picked_step),
+            fmt(best_step_sim),
+            fmt(rho),
+            fmt(t1),
+            fmt(t3),
+            fmt(t5),
+            fmt(picked_mae),
+            fmt(pred_mae),
+        ]
+    )
+)
+PY
+}
+
+ct_dir_for_seed() {
+  local seed="$1"
+  echo "${ROOT}/ct_checkpoints/${DATASET_NAME}/seed_${seed}/coeff_${gamma}"
+}
+
+ct_ckpt_for_seed() {
+  echo "$(ct_dir_for_seed "$1")/ct_best_encoder.pt"
+}
+
+iql_dir_for_seed() {
+  local seed="$1"
+  echo "${ROOT}/iql_models/${DATASET_NAME}/seed_${seed}/coeff_${gamma}"
+}
+
+iql_ckpt_for_seed() {
+  echo "$(iql_dir_for_seed "$1")/iql_planner.pt"
+}
+
+for seed in "${SEEDS[@]}"; do
+  CT_DIR="$(ct_dir_for_seed "${seed}")"
+  CT_CKPT="$(ct_ckpt_for_seed "${seed}")"
+  IQL_DIR="$(iql_dir_for_seed "${seed}")"
+  IQL_CKPT="$(iql_ckpt_for_seed "${seed}")"
+  TRACE_JSON="${IQL_DIR}/iql_val_trace.json"
+
+  echo "================================================================"
+  echo "=== seed=${seed} coeff=${gamma} | CT -> IQL -> eval taus=(${EVAL_TAUS[*]}) exp.test=${test} ==="
+  echo "================================================================"
 
   if [[ "${CT_IQL_SKIP_TRAIN:-0}" != "1" ]]; then
+    mkdir -p "${CT_DIR}"
+
     CUDA_VISIBLE_DEVICES=${gpu} python runnables/train_ct.py \
-      +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${gamma}*" \
-      exp.seed="${seed}" dataset.coeff="${gamma}"
+      +dataset=cancer_sim_cont +model=vcip_cancer "+model/hparams/cancer=${gamma}*" \
+      exp.seed="${seed}" dataset.coeff="${gamma}" \
+      "+exp.ct_ckpt_dir=${CT_DIR}"
 
     if [[ ! -f "${CT_CKPT}" ]]; then
       echo "ERROR: CT checkpoint missing after train_ct: ${CT_CKPT}" >&2
       exit 1
     fi
 
+    mkdir -p "${IQL_DIR}"
+
     CUDA_VISIBLE_DEVICES=${gpu} python runnables/train_iql_planner.py \
-      +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${gamma}*" \
+      +dataset=cancer_sim_cont +model=vcip_cancer "+model/hparams/cancer=${gamma}*" \
       exp.seed="${seed}" dataset.coeff="${gamma}" \
-      exp.iql_inference_ckpt="${CT_CKPT}"
+      exp.iql_inference_ckpt="${CT_CKPT}" \
+      "+exp.iql_save_dir=${IQL_DIR}"
+
+    if [[ ! -f "${IQL_CKPT}" ]]; then
+      echo "ERROR: IQL checkpoint missing after train_iql_planner: ${IQL_CKPT}" >&2
+      exit 1
+    fi
   else
     if [[ ! -f "${CT_CKPT}" ]]; then
       echo "ERROR: CT checkpoint missing (CT_IQL_SKIP_TRAIN=1): ${CT_CKPT}" >&2
-      echo "       New seed? Unset CT_IQL_SKIP_TRAIN and run the full script once (train_ct -> train_iql -> eval)." >&2
       exit 1
     fi
     if [[ ! -f "${IQL_CKPT}" ]]; then
       echo "ERROR: IQL checkpoint missing (CT_IQL_SKIP_TRAIN=1): ${IQL_CKPT}" >&2
-      echo "       New seed? Unset CT_IQL_SKIP_TRAIN and run the full script once." >&2
       exit 1
     fi
   fi
 
-  eval_args=(
-    +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${gamma}*"
-    exp.seed="${seed}" dataset.coeff="${gamma}"
-    exp.test="${test}"
-    exp.iql_inference_ckpt="${CT_CKPT}"
-  )
-  [[ -n "${eval_tau}" ]] && eval_args+=( "exp.tau=${eval_tau}" )
+  picked_step="NA" best_step_sim="NA" rho="NA" t1="NA" t3="NA" t5="NA"
+  picked_mae="NA" pred_mae="NA"
 
-  eval_log="$(mktemp)"
-  CUDA_VISIBLE_DEVICES=${gpu} python runnables/eval_iql_planner.py "${eval_args[@]}" 2>&1 | tee "${eval_log}"
+  if [[ -f "${TRACE_JSON}" ]]; then
+    read -r picked_step best_step_sim rho t1 t3 t5 picked_mae pred_mae \
+      <<< "$(read_iql_crossworld_metrics "${TRACE_JSON}")" || true
+  else
+    echo "warning: ${TRACE_JSON} missing; cross-world metrics = NA"
+  fi
 
-  # Parse aggregate metrics from eval log (use Python: default awk is often mawk and does not
-  # support gawk-only match(..., ..., array) capture groups).
-  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-  read -r tau_used mae_norm mae_uns rmse_uns rmse_norm rmse_x_std rmse_factual_x_std < <(
-    python -c '
-import re
-import sys
+  append_csv_row "${TRAIN_CSV}" "${TRAIN_HEADER}" \
+    "${COMBO_ID},${seed},${gamma},${IQL_TAU},${IQL_BETA},${IQL_TARGET_TAU},${IQL_LR},${IQL_DISCOUNT},${CT_CKPT},${IQL_CKPT},${picked_step},${best_step_sim},${rho},${t1},${t3},${t5},${picked_mae},${pred_mae}"
 
-def last_num(pat, text):
-    ms = list(re.finditer(pat, text))
-    return ms[-1].group(1) if ms else "NA"
+  for eval_tau in "${EVAL_TAUS[@]}"; do
+    echo "--- seed=${seed} eval ++exp.tau=${eval_tau} exp.test=${test} ---"
 
-path = sys.argv[1]
-text = open(path, encoding="utf-8", errors="replace").read()
-tau_m = re.search(r"\(tau=(\d+),", text)
-tau = tau_m.group(1) if tau_m else "NA"
-m3 = None
-for m in re.finditer(
-    r"MAE normalized:\s*([0-9.]+)\s*\|\s*MAE unscaled:\s*([0-9.]+)\s*\|\s*RMSE unscaled:\s*([0-9.]+)",
-    text,
-):
-    m3 = m
-if m3:
-    mae_norm, mae_uns, rmse_uns = m3.groups()
-else:
-    mae_norm = mae_uns = rmse_uns = "NA"
-rmse_norm = last_num(r"Global RMSE on stacked batches \(normalized space\):\s*([0-9.]+)", text)
-rmse_x_std = last_num(r"VCIP-style\):\s*([0-9.]+)", text)
-rmse_factual_x_std = last_num(r"Factual global RMSE[^\n:]*:\s*([0-9.]+)", text)
-print(tau, mae_norm, mae_uns, rmse_uns, rmse_norm, rmse_x_std, rmse_factual_x_std)
-' "${eval_log}"
-  )
+    eval_log="$(mktemp)"
+    # ++exp.tau forces override over vcip_cancer / hparams defaults (rollout horizon).
+    CUDA_VISIBLE_DEVICES=${gpu} python runnables/eval_iql_planner.py \
+      +dataset=cancer_sim_cont +model=vcip_cancer "+model/hparams/cancer=${gamma}*" \
+      exp.seed="${seed}" dataset.coeff="${gamma}" \
+      exp.test="${test}" \
+      "++exp.tau=${eval_tau}" \
+      exp.iql_inference_ckpt="${CT_CKPT}" \
+      exp.iql_eval_ckpt="${IQL_CKPT}" \
+      2>&1 | tee "${eval_log}"
 
-  # Fallbacks if parsing misses a field for any reason.
-  [[ -z "${mae_norm}" ]] && mae_norm="NA"
-  [[ -z "${mae_uns}" ]] && mae_uns="NA"
-  [[ -z "${rmse_uns}" ]] && rmse_uns="NA"
-  [[ -z "${rmse_norm}" ]] && rmse_norm="NA"
-  [[ -z "${rmse_x_std}" ]] && rmse_x_std="NA"
-  [[ -z "${rmse_factual_x_std}" ]] && rmse_factual_x_std="NA"
+    read -r tau_verified mae_norm mae_uns rmse_uns tau_ok \
+      <<< "$(parse_eval_log "${eval_log}" "${eval_tau}")" || true
+    [[ -z "${tau_verified}" ]] && tau_verified="NA"
+    [[ -z "${mae_norm}" ]] && mae_norm="NA"
+    [[ -z "${mae_uns}" ]] && mae_uns="NA"
+    [[ -z "${rmse_uns}" ]] && rmse_uns="NA"
 
-  append_csv_row "${timestamp},${gamma},${seed},${tau_used},${test},${mae_norm},${mae_uns},${rmse_uns},${rmse_norm},${rmse_x_std},${rmse_factual_x_std}"
-  rm -f "${eval_log}"
+    if [[ "${tau_ok}" != "1" ]]; then
+      echo "WARNING: seed=${seed} requested eval_tau=${eval_tau} but log reports tau=${tau_verified}" >&2
+    fi
+
+    append_csv_row "${EVAL_CSV}" "${EVAL_HEADER}" \
+      "${seed},${gamma},${eval_tau},${tau_verified},${mae_norm},${mae_uns},${rmse_uns},${test},${CT_CKPT},${IQL_CKPT},${COMBO_ID}"
+
+    rm -f "${eval_log}"
+  done
 done
+
+echo "Done."
+echo "  Eval by tau:  ${EVAL_CSV}"
+echo "  IQL training: ${TRAIN_CSV}"

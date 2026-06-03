@@ -1,5 +1,5 @@
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from src.planners.dw_weighting import DensityRatioWeightNet, weight_statistics
 
 
 TensorBatch = List[torch.Tensor]
@@ -37,6 +39,26 @@ class IQLPlannerConfig:
     actor_dropout: Optional[float] = None
     max_grad_norm: Optional[float] = None
     device: str = "cuda"
+    iql_use_dw: bool = False
+    dw_hidden_dim: int = 256
+    dw_n_hidden: int = 2
+    dw_lr: float = 3e-4
+    dw_lambda_flow: float = 1.0
+    dw_lambda_kl: float = 0.01
+    dw_flow_discount: float = 1.0
+    dw_weight_temp: float = 1.0
+    dw_clip_ratio: float = 0.2
+    dw_mode: str = "reference"
+    dw_use_done_mask: bool = False
+    dw_weight_min: float = 0.05
+    dw_weight_max: float = 10.0
+    dw_update_ratio: int = 1
+    dw_warmup_steps: int = 0
+    dw_center_reward: bool = False
+    dw_reward_norm: str = "std"
+    dw_reward_std: float = 1.0
+    dw_reward_min: float = 0.0
+    dw_reward_max: float = 1.0
 
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
@@ -45,7 +67,11 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float):
 
 
 def asymmetric_l2_loss(u: torch.Tensor, tau: float) -> torch.Tensor:
-    return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
+    return asymmetric_l2_loss_per_sample(u, tau).mean()
+
+
+def asymmetric_l2_loss_per_sample(u: torch.Tensor, tau: float) -> torch.Tensor:
+    return torch.abs(tau - (u < 0).float()) * u**2
 
 
 class Squeeze(nn.Module):
@@ -224,7 +250,90 @@ class IQLPlanner:
         self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, cfg.max_steps)
         self.total_it = 0
 
-    def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
+        self.weight_net: Optional[DensityRatioWeightNet] = None
+        self.dw_optimizer: Optional[torch.optim.Optimizer] = None
+        if cfg.iql_use_dw:
+            self.weight_net = DensityRatioWeightNet(
+                state_dim=cfg.state_dim,
+                action_dim=cfg.action_dim,
+                hidden_dim=cfg.dw_hidden_dim,
+                n_hidden=cfg.dw_n_hidden,
+                mode=cfg.dw_mode,
+                weight_temp=cfg.dw_weight_temp,
+                clip_ratio=cfg.dw_clip_ratio,
+                flow_discount=cfg.dw_flow_discount,
+                use_done_mask=cfg.dw_use_done_mask,
+                weight_min=cfg.dw_weight_min,
+                weight_max=cfg.dw_weight_max,
+            ).to(cfg.device)
+            self.dw_optimizer = torch.optim.Adam(self.weight_net.parameters(), lr=cfg.dw_lr)
+
+    def _normalize_dw_reward(self, rewards: torch.Tensor) -> torch.Tensor:
+        mode = str(self.cfg.dw_reward_norm).lower()
+        if mode == "none":
+            return rewards
+        if mode == "std":
+            denom = max(float(self.cfg.dw_reward_std), 1e-8)
+            return rewards / denom
+        if mode in ("minmax", "max-min"):
+            lo = float(self.cfg.dw_reward_min)
+            hi = float(self.cfg.dw_reward_max)
+            denom = max(hi - lo, 1e-8)
+            return (rewards - lo) / denom
+        raise ValueError(f"Unknown dw_reward_norm: {self.cfg.dw_reward_norm!r}")
+
+    def _update_weight_net(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        next_observations: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        log_dict: Dict[str, float],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.weight_net is not None and self.dw_optimizer is not None
+        should_optimize = (
+            self.cfg.dw_update_ratio <= 1
+            or self.total_it % int(self.cfg.dw_update_ratio) == 0
+        )
+        if should_optimize:
+            self.dw_optimizer.zero_grad()
+            dw_rewards = self._normalize_dw_reward(rewards)
+            dw_loss, dw_stats = self.weight_net.compute_dw_loss(
+                observations,
+                actions,
+                next_observations,
+                dw_rewards,
+                done=dones,
+                lambda_flow=self.cfg.dw_lambda_flow,
+                lambda_kl=self.cfg.dw_lambda_kl,
+                center_reward=self.cfg.dw_center_reward,
+            )
+            dw_loss.backward()
+            if self.cfg.max_grad_norm is not None:
+                clip_grad_norm_(self.weight_net.parameters(), self.cfg.max_grad_norm)
+            self.dw_optimizer.step()
+            log_dict.update(dw_stats)
+
+        with torch.no_grad():
+            weight_out = self.weight_net(observations, actions, next_observations)
+            w_s_iql = weight_out["w_s_iql"]
+            w_sa_iql = weight_out["w_sa_iql"]
+            if not should_optimize:
+                log_dict.update(weight_statistics(w_sa_iql, reward=rewards))
+
+        if self.total_it <= self.cfg.dw_warmup_steps:
+            w_s_iql = torch.ones_like(w_s_iql)
+            w_sa_iql = torch.ones_like(w_sa_iql)
+        return w_s_iql, w_sa_iql
+
+    def _update_v(
+        self,
+        observations,
+        actions,
+        log_dict,
+        w_s: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         value loss（v_loss）的含义和计算方式如下：
 
@@ -249,7 +358,11 @@ class IQLPlanner:
             target_q = torch.min(q1, q2)
         v = self.vf(observations)
         adv = target_q - v
-        v_loss = asymmetric_l2_loss(adv, self.cfg.iql_tau)
+        if w_s is None:
+            v_loss = asymmetric_l2_loss(adv, self.cfg.iql_tau)
+        else:
+            per_sample = asymmetric_l2_loss_per_sample(adv, self.cfg.iql_tau)
+            v_loss = (w_s * per_sample).mean()
         self.v_optimizer.zero_grad()
         v_loss.backward()
         if self.cfg.max_grad_norm is not None:
@@ -258,7 +371,16 @@ class IQLPlanner:
         log_dict["value_loss"] = float(v_loss.item())
         return adv
 
-    def _update_q(self, next_v, observations, actions, rewards, dones, log_dict):
+    def _update_q(
+        self,
+        next_v,
+        observations,
+        actions,
+        rewards,
+        dones,
+        log_dict,
+        w_sa: Optional[torch.Tensor] = None,
+    ):
         """
         q_loss 表示 Q 网络（Critic）的损失函数，衡量 Q 网络当前对 (s, a) 的预测值与目标 Q-value 之间的均方误差（MSE）。
         作用是让训练出来的 Q 网络能更准确地拟合环境的价值函数。
@@ -285,7 +407,11 @@ class IQLPlanner:
         """
         targets = rewards + (1.0 - dones.float()) * self.cfg.discount * next_v.detach()
         q1, q2 = self.qf.both(observations, actions)
-        q_loss = 0.5 * (F.mse_loss(q1, targets) + F.mse_loss(q2, targets))
+        if w_sa is None:
+            q_loss = 0.5 * (F.mse_loss(q1, targets) + F.mse_loss(q2, targets))
+        else:
+            sq_err = (q1 - targets) ** 2 + (q2 - targets) ** 2
+            q_loss = 0.5 * (sq_err * w_sa).mean()
         self.q_optimizer.zero_grad()
         q_loss.backward()
         if self.cfg.max_grad_norm is not None:
@@ -293,8 +419,23 @@ class IQLPlanner:
         self.q_optimizer.step()
         soft_update(self.q_target, self.qf, self.cfg.tau)
         log_dict["q_loss"] = float(q_loss.item())
+        if w_sa is not None:
+            log_dict["target_q_mean"] = float(targets.mean().item())
+            log_dict["target_q_std"] = float(targets.std(unbiased=False).item())
+            log_dict["target_q_abs_max"] = float(targets.abs().max().item())
+            td_err = 0.5 * ((q1 - targets) ** 2 + (q2 - targets) ** 2)
+            log_dict["corr_weight_td_error"] = weight_statistics(
+                w_sa, td_error=td_err
+            )["corr_weight_td_error"]
 
-    def _update_policy(self, adv, observations, actions, log_dict):
+    def _update_policy(
+        self,
+        adv,
+        observations,
+        actions,
+        log_dict,
+        w_sa: Optional[torch.Tensor] = None,
+    ):
         """
         该函数用于更新 actor policy（策略网络）的参数。policy loss 的计算方式如下：
 
@@ -314,7 +455,10 @@ class IQLPlanner:
             bc_losses = -policy_out.log_prob(actions).sum(-1)
         else:
             bc_losses = ((policy_out - actions) ** 2).sum(-1)
-        policy_loss = torch.mean(exp_adv * bc_losses)
+        if w_sa is None:
+            policy_loss = torch.mean(exp_adv * bc_losses)
+        else:
+            policy_loss = torch.mean(w_sa * exp_adv * bc_losses)
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
         if self.cfg.max_grad_norm is not None:
@@ -322,6 +466,9 @@ class IQLPlanner:
         self.actor_optimizer.step()
         self.actor_lr_schedule.step()
         log_dict["actor_loss"] = float(policy_loss.item())
+        if w_sa is not None:
+            log_dict["exp_adv_mean"] = float(exp_adv.mean().item())
+            log_dict["exp_adv_max"] = float(exp_adv.max().item())
 
     def train_step(self, batch: TensorBatch) -> Dict[str, float]:
         self.total_it += 1
@@ -329,11 +476,21 @@ class IQLPlanner:
         rewards = rewards.squeeze(-1)
         dones = dones.squeeze(-1)
         log_dict: Dict[str, float] = {}
-        adv = self._update_v(observations, actions, log_dict)
+
+        w_s: Optional[torch.Tensor] = None
+        w_sa: Optional[torch.Tensor] = None
+        if self.cfg.iql_use_dw:
+            w_s, w_sa = self._update_weight_net(
+                observations, actions, next_observations, rewards, dones, log_dict
+            )
+
+        adv = self._update_v(observations, actions, log_dict, w_s=w_s)
         with torch.no_grad():
             next_v = self.vf(next_observations)
-        self._update_q(next_v, observations, actions, rewards, dones, log_dict)
-        self._update_policy(adv, observations, actions, log_dict)
+        self._update_q(
+            next_v, observations, actions, rewards, dones, log_dict, w_sa=w_sa
+        )
+        self._update_policy(adv, observations, actions, log_dict, w_sa=w_sa)
         return log_dict
 
     @torch.no_grad()
@@ -341,7 +498,7 @@ class IQLPlanner:
         return self.actor.act(state, device=self.cfg.device)
 
     def state_dict(self) -> Dict:
-        return {
+        state = {
             "actor": self.actor.state_dict(),
             "qf": self.qf.state_dict(),
             "q_target": self.q_target.state_dict(),
@@ -353,6 +510,11 @@ class IQLPlanner:
             "total_it": self.total_it,
             "cfg": self.cfg.__dict__,
         }
+        if self.weight_net is not None:
+            state["weight_net"] = self.weight_net.state_dict()
+        if self.dw_optimizer is not None:
+            state["dw_optimizer"] = self.dw_optimizer.state_dict()
+        return state
 
     def load_eval_weights(self, state: Dict) -> None:
         """Load networks for evaluation (ignores optimizers / schedulers)."""
@@ -368,8 +530,11 @@ class IQLPlanner:
         cfg_dict = dict(state["cfg"])
         cfg_dict["device"] = device
         cfg_dict.setdefault("max_grad_norm", None)
-        cfg = IQLPlannerConfig(**cfg_dict)
+        valid_keys = {f.name for f in fields(IQLPlannerConfig)}
+        cfg = IQLPlannerConfig(**{k: v for k, v in cfg_dict.items() if k in valid_keys})
         planner = cls(cfg)
         planner.load_eval_weights(state)
+        if planner.weight_net is not None and "weight_net" in state:
+            planner.weight_net.load_state_dict(state["weight_net"])
         planner.actor.eval()
         return planner

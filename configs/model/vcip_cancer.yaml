@@ -111,8 +111,8 @@ exp:
   iql_n_hidden: 2
   # iql_tau: 策略价值函数加权的 expectile 参数，控制“policy value”与“critic value”之间的偏置。具体地，TD3+BC 和 IQL 论文中用于 expectile regression，建议在 0.5~0.9 之间，越大代表更乐观估计。
   iql_tau: 0.5  # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_beta: 3.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_discount: 0.99
+  iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
+  iql_discount: 0.95
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005
   iql_actor_lr: 3.0e-4
@@ -133,6 +133,24 @@ exp:
   iql_max_grad_norm: 5.0
   iql_deterministic: false
   iql_actor_dropout: null
+  # Density-ratio Weighted IQL (DW-IQL); false restores legacy uniform IQL losses.
+  iql_use_dw: false
+  dw_hidden_dim: 256
+  dw_n_hidden: 2
+  dw_lr: 3.0e-4
+  dw_lambda_flow: 1.0
+  dw_lambda_kl: 0.2
+  dw_flow_discount: 1.0
+  dw_weight_temp: 1.0
+  dw_clip_ratio: 0.2
+  dw_mode: reference
+  dw_use_done_mask: True
+  dw_reward_norm: std
+  dw_weight_min: 0.05
+  dw_weight_max: 10.0
+  dw_update_ratio: 1
+  dw_warmup_steps: 0
+  dw_center_reward: false
   # eval_iql_planner.py: empty -> iql_models/seed_{seed}/gamma_{coeff}/iql_planner.pt
   iql_eval_ckpt: ""
   # Roll out τ steps: each step replans from CT state after appending (a_t, y_{t+1}); false = repeat first action (legacy)
@@ -159,7 +177,8 @@ exp:
   ct_weight_align_metric: sinkhorn
   ct_weight_sinkhorn_blur: 0.01
   ct_weight_use_time_shuffle: true
-  ct_weight_normalize: softmax_time
+  # CTD-NKO-style: global softmax on sigmoid scores during refresh; legacy: softmax_time
+  ct_weight_normalize: global
   ct_weight_cache_dir: ""
   ct_weight_log_diagnostics: true
   # If true, after each refresh compute val alignment / balance diagnostics only (val loss still w=1).

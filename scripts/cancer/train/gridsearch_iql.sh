@@ -41,15 +41,15 @@ echo "[worker ${GRID_WORKER_ID}/${GRID_NUM_WORKERS}] gamma=${gamma} gpu=${gpu}"
 
 # ---------- IQL search space ----------
 IQL_TAU_LIST=("0.5")
-IQL_BETA_LIST=("3.0" "5.0" "10.0")
+IQL_BETA_LIST=("5.0")
 IQL_TARGET_TAU_LIST=("0.001")
-IQL_LR_LIST=("3e-4" "5e-4")
-IQL_DISCOUNT_LIST=("0.95" "0.9")
+IQL_LR_LIST=("3e-4")
+IQL_DISCOUNT_LIST=("0.95")
 
 if [[ -n "${GRID_SEEDS:-}" ]]; then
   read -r -a SEEDS <<< "${GRID_SEEDS}"
 else
-  SEEDS=(10 101 2020)
+  SEEDS=(10 101 1010 10101 101010 20 202 2020 20202 202020)
 fi
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"

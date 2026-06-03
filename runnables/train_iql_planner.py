@@ -27,6 +27,29 @@ logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
+IQL_LOSS_KEYS = ("actor_loss", "q_loss", "value_loss")
+# Logged every 200 steps when exp.iql_use_dw=true (see dw_iql_experiment_protocol.md).
+DW_LOG_KEYS = (
+    "dw_loss",
+    "dw_return_term",
+    "dw_flow_penalty",
+    "dw_kl_penalty",
+    "weight_mean",
+    "weight_std",
+    "weight_min",
+    "weight_max",
+    "weight_p95",
+    "weight_p99",
+    "weight_ess",
+    "corr_weight_reward",
+    "corr_weight_td_error",
+    "target_q_abs_max",
+    "exp_adv_max",
+    "dw_w_sa_train_mean",
+    "dw_w_sa_iql_mean",
+    "dw_log_w_sa_mean",
+    "dw_log_w_sa_std",
+)
 
 def _default_iql_model_dir(original_cwd: Path, args: DictConfig) -> Path:
     """
@@ -181,7 +204,34 @@ def main(args: DictConfig):
         actor_dropout=OmegaConf.select(args, "exp.iql_actor_dropout", default=None),
         max_grad_norm=iql_max_grad,
         device=device,
+        iql_use_dw=bool(OmegaConf.select(args, "exp.iql_use_dw", default=False)),
+        dw_hidden_dim=int(OmegaConf.select(args, "exp.dw_hidden_dim", default=256)),
+        dw_n_hidden=int(OmegaConf.select(args, "exp.dw_n_hidden", default=2)),
+        dw_lr=float(OmegaConf.select(args, "exp.dw_lr", default=3e-4)),
+        dw_lambda_flow=float(OmegaConf.select(args, "exp.dw_lambda_flow", default=1.0)),
+        dw_lambda_kl=float(OmegaConf.select(args, "exp.dw_lambda_kl", default=0.01)),
+        dw_flow_discount=float(OmegaConf.select(args, "exp.dw_flow_discount", default=1.0)),
+        dw_weight_temp=float(OmegaConf.select(args, "exp.dw_weight_temp", default=1.0)),
+        dw_clip_ratio=float(OmegaConf.select(args, "exp.dw_clip_ratio", default=0.2)),
+        dw_mode=str(OmegaConf.select(args, "exp.dw_mode", default="reference")),
+        dw_use_done_mask=bool(OmegaConf.select(args, "exp.dw_use_done_mask", default=False)),
+        dw_weight_min=float(OmegaConf.select(args, "exp.dw_weight_min", default=0.05)),
+        dw_weight_max=float(OmegaConf.select(args, "exp.dw_weight_max", default=10.0)),
+        dw_update_ratio=int(OmegaConf.select(args, "exp.dw_update_ratio", default=1)),
+        dw_warmup_steps=int(OmegaConf.select(args, "exp.dw_warmup_steps", default=0)),
+        dw_center_reward=bool(OmegaConf.select(args, "exp.dw_center_reward", default=False)),
+        dw_reward_norm=str(OmegaConf.select(args, "exp.dw_reward_norm", default="std")),
+        dw_reward_std=1.0,
+        dw_reward_min=0.0,
+        dw_reward_max=1.0,
     )
+    dw_reward_norm = str(planner_cfg.dw_reward_norm).lower()
+    rewards_flat = transitions["rewards"].reshape(-1).astype(np.float64)
+    if dw_reward_norm == "std":
+        planner_cfg.dw_reward_std = float(rewards_flat.std() + 1e-8)
+    elif dw_reward_norm in ("minmax", "max-min"):
+        planner_cfg.dw_reward_min = float(rewards_flat.min())
+        planner_cfg.dw_reward_max = float(rewards_flat.max())
 
     planner = IQLPlanner(planner_cfg)
     replay = TransitionReplayBuffer(transitions, device=device)
@@ -260,20 +310,42 @@ def main(args: DictConfig):
     val_trace: List[Dict[str, Any]] = []
     prev_action_fingerprints: Dict[str, Optional[str]] = {w: None for w in val_worlds}
 
-    loss_keys = ("actor_loss", "q_loss", "value_loss")
+    loss_keys = IQL_LOSS_KEYS
     loss_buf = {k: deque(maxlen=max(1, log_window)) for k in loss_keys}
+    iql_use_dw = bool(planner_cfg.iql_use_dw)
+    dw_log_keys = DW_LOG_KEYS if iql_use_dw else ()
+    dw_buf = {k: deque(maxlen=max(1, log_window)) for k in dw_log_keys}
+    if iql_use_dw:
+        logger.info(
+            "DW-IQL enabled: logging %d diagnostic keys every 200 steps (%s ...)",
+            len(dw_log_keys),
+            ", ".join(dw_log_keys[:4]),
+        )
 
     for step in range(1, iql_updates + 1):
         batch = replay.sample(iql_batch_size)
         logs = planner.train_step(batch)
         for k in loss_keys:
             loss_buf[k].append(logs[k])
+        for k in dw_log_keys:
+            if k in logs:
+                dw_buf[k].append(logs[k])
         if step % 200 == 0 or step == 1:
             parts = [f"[{step}/{iql_updates}]"]
             for k in loss_keys:
                 last = logs[k]
                 mean = float(np.mean(loss_buf[k]))
                 parts.append(f"{k}={last:.4f} (mean_{min(step, log_window)}={mean:.4f})")
+            if dw_log_keys:
+                dw_parts = []
+                for k in dw_log_keys:
+                    if k not in logs:
+                        continue
+                    last = logs[k]
+                    mean = float(np.mean(dw_buf[k])) if dw_buf[k] else last
+                    dw_parts.append(f"{k}={last:.4g} (mean_{min(step, log_window)}={mean:.4g})")
+                if dw_parts:
+                    parts.append("| DW: " + ", ".join(dw_parts))
             logger.info(", ".join(parts))
 
         if _should_run_iql_val(step, iql_updates, iql_val_every):

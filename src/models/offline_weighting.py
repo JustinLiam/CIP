@@ -5,8 +5,15 @@ Learns dataset/time-level balancing weights on frozen encoder latents:
   joint   = concat([Z_t, A_t])
   marginal = concat([Z_t, A_perm_t])  (A shuffled within time step when possible)
 
-Default input to OfflineWeightNet is [Z, A] (joint sample features), matching the
-balancing target P_w(Z, A) vs P(Z)P(A).
+Weight stabilization follows CTD-NKO (``wass_calculator.WeightNetwork``):
+  1. OfflineWeightNet outputs sigmoid scores in (0, 1)
+  2. Softmax normalization on the current index set (minibatch during training,
+     full dataset optional for diagnostics)
+  3. M-step applies another batch-level softmax on dataloader weights
+     (see :func:`apply_batch_softmax_weights` used from ``train_ct.py``)
+
+The weight table stores **sigmoid scores** (pre-M-step-softmax), not fully
+normalized masses.
 """
 from __future__ import annotations
 
@@ -27,51 +34,46 @@ logger = logging.getLogger(__name__)
 
 class OfflineWeightNet(nn.Module):
     """
-    MLP on concat([Z_t, A_t]) -> scalar **raw logit**.
-
-    No sigmoid / softplus on output; all mass normalization happens in
-    :func:`normalize_weights` during alignment and when building the weight table.
+    MLP on concat([Z_t, A_t]) -> scalar in (0, 1), matching CTD-NKO ``WeightNetwork``.
     """
 
     def __init__(self, input_dim: int, hidden_dim: int = 16):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return torch.sigmoid(x).squeeze(-1)
 
 
 def normalize_weights(
-    logits: torch.Tensor,
+    scores: torch.Tensor,
     group_ids: Optional[torch.Tensor] = None,
-    mode: str = "softmax_time",
+    mode: str = "global",
 ) -> torch.Tensor:
     """
-    Normalize raw logits into non-negative weights [N, 1].
+    Normalize bounded WeightNet scores into non-negative weights [N, 1].
 
-    ``softmax_time``: per ``group_ids`` (e.g. time_id), softmax then multiply by
-    group size so within-group mean ≈ 1.
-    ``mean_one``: global weights scaled to mean 1.
+    ``global`` (CTD-NKO default): ``softmax(scores, dim=0) * N`` so mean ≈ 1.
+    ``softmax_time``: per ``group_ids`` (legacy VCIP); softmax within each time group.
+    ``mean_one``: alias for ``global``.
     """
-    w = logits.reshape(-1)
+    w = scores.reshape(-1)
     n = w.numel()
     if n == 0:
         return w.new_zeros(0, 1)
 
-    if mode == "mean_one":
-        w_pos = F.softmax(w, dim=0) * float(n)
-        return w_pos.reshape(-1, 1)
+    mode_key = str(mode).strip().lower()
+    if mode_key in ("global", "mean_one"):
+        return (F.softmax(w, dim=0) * float(n)).reshape(-1, 1)
 
-    if mode != "softmax_time":
+    if mode_key != "softmax_time":
         raise ValueError(f"Unknown ct_weight_normalize mode: {mode}")
 
     if group_ids is None:
-        w_pos = F.softmax(w, dim=0) * float(n)
-        return w_pos.reshape(-1, 1)
+        return (F.softmax(w, dim=0) * float(n)).reshape(-1, 1)
 
     gids = group_ids.reshape(-1).long()
     out = torch.zeros_like(w)
@@ -86,31 +88,51 @@ def normalize_weights(
     return out.reshape(-1, 1)
 
 
+def apply_batch_softmax_weights(w: torch.Tensor) -> torch.Tensor:
+    """
+    CTD-NKO M-step: ``w = F.softmax(w, dim=0) * batch_size`` on the current minibatch.
+    """
+    w = w.reshape(-1)
+    n = w.numel()
+    if n == 0:
+        return w
+    return F.softmax(w, dim=0) * float(n)
+
+
 def compute_weighted_alignment_loss(
     joint: torch.Tensor,
     marginal: torch.Tensor,
-    weight_logits: torch.Tensor,
+    weight_scores: torch.Tensor,
     metric: str = "sinkhorn",
     blur: float = 0.01,
     group_ids: Optional[torch.Tensor] = None,
-    normalize_mode: str = "softmax_time",
+    normalize_mode: str = "global",
 ) -> torch.Tensor:
     """
     Weighted alignment between joint (source, weighted) and marginal (target, uniform).
 
     joint, marginal: [N, D]
-    weight_logits: [N] or [N, 1] raw logits from OfflineWeightNet
+    weight_scores: [N] or [N, 1] sigmoid scores from OfflineWeightNet.
+
+    Sinkhorn (CTD-NKO): pass scores to geomloss; ``F.softmax(wa, dim=0)`` runs once inside
+    :func:`~src.utils.utils.compute_weighted_wasserstein_geomloss`.
+    MMD: ``normalize_weights`` then weighted MMD (legacy path).
     """
     if joint.shape != marginal.shape:
         raise ValueError(
             f"joint and marginal must match shape, got {tuple(joint.shape)} vs {tuple(marginal.shape)}"
         )
-    w = normalize_weights(weight_logits, group_ids=group_ids, mode=normalize_mode).reshape(-1)
+    scores = weight_scores.reshape(-1)
     n = joint.size(0)
     if n == 0:
         return joint.new_zeros(())
 
     if metric == "mmd":
+        w = normalize_weights(
+            scores,
+            group_ids=group_ids,
+            mode=normalize_mode,
+        ).reshape(-1)
         return compute_mmd_weighted(joint, marginal, w)
 
     if metric == "sinkhorn":
@@ -118,12 +140,17 @@ def compute_weighted_alignment_loss(
             from src.utils.utils import compute_weighted_wasserstein_joint_marginal_flat
 
             return compute_weighted_wasserstein_joint_marginal_flat(
-                joint, marginal, w, blur=blur
+                joint, marginal, scores, blur=blur
             )
         except (ImportError, Exception) as exc:
             logger.warning(
                 "Sinkhorn alignment failed (%s); falling back to MMD.", exc
             )
+            w = normalize_weights(
+                scores,
+                group_ids=group_ids,
+                mode=normalize_mode,
+            ).reshape(-1)
             return compute_mmd_weighted(joint, marginal, w)
 
     raise ValueError(f"Unknown alignment metric: {metric}")
@@ -400,9 +427,15 @@ def _align_on_subset(
     else:
         jb, mb, tb = joint_samples, marginal_samples, time_ids
     with torch.no_grad():
-        logits = weight_net(jb)
+        scores = weight_net(jb)
         loss = compute_weighted_alignment_loss(
-            jb, mb, logits, metric=metric, blur=blur, group_ids=tb, normalize_mode=normalize_mode
+            jb,
+            mb,
+            scores,
+            metric=metric,
+            blur=blur,
+            group_ids=tb,
+            normalize_mode=normalize_mode,
         )
     return float(loss.item())
 
@@ -418,7 +451,7 @@ def train_offline_weightnet(
     metric: str,
     blur: float,
     device: torch.device,
-    normalize_mode: str = "softmax_time",
+    normalize_mode: str = "global",
     logger_obj: Optional[logging.Logger] = None,
 ) -> Tuple[OfflineWeightNet, Dict[str, float]]:
     """
@@ -437,7 +470,13 @@ def train_offline_weightnet(
     optimizer = torch.optim.Adam(weight_net.parameters(), lr=float(lr))
 
     align_initial = _align_on_subset(
-        joint_samples, marginal_samples, time_ids, weight_net, metric, blur, normalize_mode
+        joint_samples,
+        marginal_samples,
+        time_ids,
+        weight_net,
+        metric,
+        blur,
+        normalize_mode,
     )
 
     dataset = TensorDataset(joint_samples, marginal_samples, time_ids)
@@ -447,11 +486,11 @@ def train_offline_weightnet(
     for _ in range(int(epochs)):
         for jb, mb, tb in loader:
             optimizer.zero_grad(set_to_none=True)
-            logits = weight_net(jb)
+            scores = weight_net(jb)
             loss = compute_weighted_alignment_loss(
                 jb,
                 mb,
-                logits,
+                scores,
                 metric=metric,
                 blur=blur,
                 group_ids=tb,
@@ -462,10 +501,16 @@ def train_offline_weightnet(
 
     weight_net.eval()
     with torch.no_grad():
-        logits_f = weight_net(joint_samples)
-        weights_f = normalize_weights(logits_f, group_ids=time_ids, mode=normalize_mode)
+        scores_f = weight_net(joint_samples)
+        weights_f = normalize_weights(scores_f, group_ids=time_ids, mode=normalize_mode)
         align_final = _align_on_subset(
-            joint_samples, marginal_samples, time_ids, weight_net, metric, blur, normalize_mode
+            joint_samples,
+            marginal_samples,
+            time_ids,
+            weight_net,
+            metric,
+            blur,
+            normalize_mode,
         )
 
     diag = _weight_diagnostics(weights_f, time_ids=time_ids)
@@ -605,7 +650,7 @@ def refresh_offline_weights_for_dataset(
     metric: str = "sinkhorn",
     blur: float = 0.01,
     use_time_shuffle: bool = True,
-    normalize_mode: str = "softmax_time",
+    normalize_mode: str = "global",
     num_workers: int = 0,
     cache_dir: str = "",
     epoch: int = 0,
@@ -665,18 +710,21 @@ def refresh_offline_weights_for_dataset(
     )
 
     with torch.no_grad():
-        logits = weight_net(joint_std)
-        weights = normalize_weights(logits, group_ids=time_ids, mode=normalize_mode)
+        # Store sigmoid scores (CTD-NKO); M-step applies batch softmax via train_ct.
+        scores = weight_net(joint_std)
+        weights_store = scores.reshape(-1, 1)
+        weights_norm = normalize_weights(scores, group_ids=time_ids, mode=normalize_mode)
+        diag["weight_table_store"] = "sigmoid"
 
-    balance = compute_balance_diagnostics(Z, A, weights, treatment_mode=treatment_mode)
-    time_diag = _time_level_weight_diagnostics(weights, collected["time_ids"])
+    balance = compute_balance_diagnostics(Z, A, weights_norm, treatment_mode=treatment_mode)
+    time_diag = _time_level_weight_diagnostics(weights_norm, collected["time_ids"])
     diag.update(diag_collect)
     diag.update(balance)
     diag.update(time_diag)
 
     n_pat = train_ds.data["current_treatments"].shape[0]
     max_len = train_ds.data["current_treatments"].shape[1]
-    table = build_weight_table(patient_ids, collected["time_ids"], weights, n_pat, max_len)
+    table = build_weight_table(patient_ids, collected["time_ids"], weights_store, n_pat, max_len)
 
     train_ds.set_weight_table(table)
 
@@ -689,7 +737,8 @@ def refresh_offline_weights_for_dataset(
                 "weight_table": table,
                 "patient_ids": patient_ids,
                 "time_ids": collected["time_ids"],
-                "weights": weights.cpu(),
+                "weights": weights_store.cpu(),
+                "weights_normalized": weights_norm.cpu(),
                 "diagnostics": diag,
                 "epoch": epoch,
             },
