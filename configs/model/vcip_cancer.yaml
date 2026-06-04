@@ -111,12 +111,14 @@ exp:
   iql_n_hidden: 2
   # iql_tau: 策略价值函数加权的 expectile 参数，控制“policy value”与“critic value”之间的偏置。具体地，TD3+BC 和 IQL 论文中用于 expectile regression，建议在 0.5~0.9 之间，越大代表更乐观估计。
   iql_tau: 0.5  # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
+  iql_beta: 5 # revised in April 26, Sunday, by gridsearch in Thinkstation
+  iql_q_loss: huber        # mse | huber
+  iql_huber_delta: 1.0   # only used when iql_q_loss=huber
   iql_discount: 0.95
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
-  iql_target_tau: 0.005
+  iql_target_tau: 0.001
   iql_actor_lr: 3.0e-4
-  iql_qf_lr: 3.0e-4
+  iql_qf_lr: 1.0e-4
   iql_vf_lr: 3.0e-4
   # Periodic val MAE on train_f-side val_f during IQL training; 0 disables (last-step ckpt only).
   # Selection metric is computed on val_f only (no test_f exposure), with a fixed RNG snapshot
@@ -134,12 +136,12 @@ exp:
   iql_deterministic: false
   iql_actor_dropout: null
   # Density-ratio Weighted IQL (DW-IQL); false restores legacy uniform IQL losses.
-  iql_use_dw: false
+  iql_use_dw: true
   dw_hidden_dim: 256
   dw_n_hidden: 2
   dw_lr: 3.0e-4
-  dw_lambda_flow: 1.0
-  dw_lambda_kl: 0.2
+  dw_lambda_flow: 5.0
+  dw_lambda_kl: 0.1
   dw_flow_discount: 1.0
   dw_weight_temp: 1.0
   dw_clip_ratio: 0.2
@@ -164,6 +166,15 @@ exp:
   # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
   # Must appear in iql_val_worlds.
   iql_val_selection_world: predictor
+  # MLflow (train_iql_planner.py); default off — no effect on training when false.
+  use_mlflow: true
+  mlflow_experiment: vcip_tumor
+  # Where training WRITES metrics (not the browser URL). Use file: on the training machine.
+  # Example: file:/home/liam/pythonProject/VCIP-ICML-main/mlruns
+  # http://... is only if you run ``mlflow server`` separately; ``mlflow ui`` is for viewing only.
+  mlflow_uri: http://127.0.0.1:5000
+  mlflow_log_artifacts: true
+  mlflow_combo_id: ""  # optional tag for grid search / pipeline scripts
   # Horizon-aware IQL: normalize time-to-go; must match iql_dataset_builder / eval_iql_planner
   max_tau: 12.0
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)

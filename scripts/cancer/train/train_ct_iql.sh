@@ -21,6 +21,8 @@
 #   CT_IQL_SEEDS="10 101"       - override default seed list
 #   CT_IQL_EVAL_TAUS="4 6 12"   - override default eval horizon list
 #   CT_IQL_SKIP_TRAIN=1         - skip train_ct + train_iql, eval only
+#   CT_IQL_GRID_CT=1            - Plan B: grid-best CT hparams (gamma_4 summary.csv top-1)
+#   CT_IQL_CT_EXTRA="exp.ct_lr=1e-4 ..."  - extra Hydra overrides for train_ct only
 #
 # Checkpoints (canonical paths, match gridsearch layout under tumor_generator):
 #   ct_checkpoints/tumor_generator/seed_${seed}/coeff_${gamma}/ct_best_encoder.pt
@@ -57,6 +59,24 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "${ROOT}"
+
+# Extra Hydra args forwarded to train_ct.py only.
+CT_TRAIN_EXTRA=()
+if [[ "${CT_IQL_GRID_CT:-0}" == "1" ]]; then
+  COMBO_ID="grid_ct_best_k1"
+  CT_TRAIN_EXTRA=(
+    exp.ct_lr=1e-4
+    exp.ct_w_lr=5e-3
+    exp.ct_multi_k_max=1
+    exp.ct_multi_eta=0.3
+    exp.ct_es_metric=mae_uw
+    exp.ct_anchor_weight=0.5
+    exp.ct_dyn_hidden=128
+    exp.ct_dyn_consistency_weight=0.1
+  )
+elif [[ -n "${CT_IQL_CT_EXTRA:-}" ]]; then
+  read -r -a CT_TRAIN_EXTRA <<< "${CT_IQL_CT_EXTRA}"
+fi
 
 DATASET_NAME="tumor_generator"
 
@@ -254,7 +274,8 @@ for seed in "${SEEDS[@]}"; do
     CUDA_VISIBLE_DEVICES=${gpu} python runnables/train_ct.py \
       +dataset=cancer_sim_cont +model=vcip_cancer "+model/hparams/cancer=${gamma}*" \
       exp.seed="${seed}" dataset.coeff="${gamma}" \
-      "+exp.ct_ckpt_dir=${CT_DIR}"
+      "+exp.ct_ckpt_dir=${CT_DIR}" \
+      "${CT_TRAIN_EXTRA[@]}"
 
     if [[ ! -f "${CT_CKPT}" ]]; then
       echo "ERROR: CT checkpoint missing after train_ct: ${CT_CKPT}" >&2

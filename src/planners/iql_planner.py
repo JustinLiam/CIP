@@ -14,7 +14,7 @@ from src.planners.dw_weighting import DensityRatioWeightNet, weight_statistics
 
 
 TensorBatch = List[torch.Tensor]
-EXP_ADV_MAX = 100.0
+EXP_ADV_MAX = 80.0
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
 
@@ -29,6 +29,8 @@ class IQLPlannerConfig:
     n_hidden: int = 2
     iql_tau: float = 0.7
     beta: float = 3.0
+    iql_q_loss: str = "mse"  # mse | huber
+    iql_huber_delta: float = 1.0
     discount: float = 0.99
     tau: float = 0.005
     actor_lr: float = 3e-4
@@ -407,11 +409,25 @@ class IQLPlanner:
         """
         targets = rewards + (1.0 - dones.float()) * self.cfg.discount * next_v.detach()
         q1, q2 = self.qf.both(observations, actions)
-        if w_sa is None:
-            q_loss = 0.5 * (F.mse_loss(q1, targets) + F.mse_loss(q2, targets))
+        q_loss_type = str(self.cfg.iql_q_loss).lower()
+        if q_loss_type == "huber":
+            q1_err = F.smooth_l1_loss(
+                q1, targets, reduction="none", beta=float(self.cfg.iql_huber_delta)
+            )
+            q2_err = F.smooth_l1_loss(
+                q2, targets, reduction="none", beta=float(self.cfg.iql_huber_delta)
+            )
+        elif q_loss_type == "mse":
+            q1_err = (q1 - targets) ** 2
+            q2_err = (q2 - targets) ** 2
         else:
-            sq_err = (q1 - targets) ** 2 + (q2 - targets) ** 2
-            q_loss = 0.5 * (sq_err * w_sa).mean()
+            raise ValueError(f"Unknown iql_q_loss: {self.cfg.iql_q_loss!r}")
+
+        if w_sa is None:
+            q_loss = 0.5 * (q1_err.mean() + q2_err.mean())
+        else:
+            per_sample = q1_err + q2_err
+            q_loss = 0.5 * (per_sample * w_sa).mean()
         self.q_optimizer.zero_grad()
         q_loss.backward()
         if self.cfg.max_grad_norm is not None:
@@ -423,7 +439,7 @@ class IQLPlanner:
             log_dict["target_q_mean"] = float(targets.mean().item())
             log_dict["target_q_std"] = float(targets.std(unbiased=False).item())
             log_dict["target_q_abs_max"] = float(targets.abs().max().item())
-            td_err = 0.5 * ((q1 - targets) ** 2 + (q2 - targets) ** 2)
+            td_err = 0.5 * (q1_err + q2_err)
             log_dict["corr_weight_td_error"] = weight_statistics(
                 w_sa, td_error=td_err
             )["corr_weight_td_error"]
