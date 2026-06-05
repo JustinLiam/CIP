@@ -2,7 +2,7 @@
 CT encoder + WeightNet + Predictor for ctd.md standalone training.
 Does not modify TransformerMultiInputBlock internals.
 """
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -96,6 +96,21 @@ class OutcomePredictor(nn.Module):
         return self.net(z_a)
 
 
+class OutcomeDecoder(nn.Module):
+    """MLP(Z) -> Y; used for k-step latent rollout decoding (no action in head)."""
+
+    def __init__(self, z_dim: int, y_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(z_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, y_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
 class LatentDynamicsPredictor(nn.Module):
     """MLP(Z_t, A_t) -> Z_{t+1}; residual form stabilizes one-step latent transitions."""
 
@@ -148,6 +163,7 @@ class CTDeconfoundModel(nn.Module):
         self.z_dynamics = LatentDynamicsPredictor(
             self.z_dim, self.treatment_dim, hidden_dim=dh, residual=dyn_residual
         )
+        self.outcome_decoder = OutcomeDecoder(self.z_dim, self.output_dim, hidden_dim=ph)
 
     def encode(self, H_t: Dict[str, torch.Tensor]) -> tuple:
         """
@@ -286,3 +302,146 @@ class CTDeconfoundModel(nn.Module):
         loss_w = (w_fixed * se * active_t).sum() / w_denom
         loss_anchor = (se * active_t).sum() / (active_t.sum() + 1e-8)
         return loss_w, y_hat, loss_anchor
+
+    def rollout_dynamics_loss(
+        self,
+        H_t: Dict[str, torch.Tensor],
+        a_seq: torch.Tensor,
+        a_seq_mask: torch.Tensor,
+        horizon_k: torch.Tensor,
+        y_future: torch.Tensor,
+        H_future_list: Optional[List[Dict[str, torch.Tensor]]] = None,
+        *,
+        Z_t: Optional[torch.Tensor] = None,
+        latent_weight: float = 0.1,
+        decode_each_step: bool = False,
+    ) -> tuple:
+        """
+        Action-conditioned latent rollout: z_{t+j} = g(z_{t+j-1}, a_{t+j-1}), decode y_{t+k}.
+
+        ``horizon_k`` is 1-based; loss_y compares decoded y at step k to ``y_future``.
+        Optional ``H_future_list[j-1]`` provides stop-gradient latent targets at H_{t+j}.
+        Pass ``Z_t`` from a prior ``encode(H_t)`` to avoid a duplicate encoder forward.
+        Rollout depth truncates to ``max(horizon_k)`` in the batch (loss-exact).
+        """
+        del decode_each_step  # reserved for per-step decode supervision in later versions
+        if Z_t is None:
+            Z_t, _ = self.encode(H_t)
+        active_t = H_t["active_entries"][:, -1, 0].float()
+        n_act = active_t.sum() + 1e-8
+
+        B, k_max, _ = a_seq.shape
+        k_roll = int(horizon_k.long().max().clamp(min=1, max=k_max).item())
+
+        z_roll = Z_t
+        z_by_step = [Z_t]
+        y_by_step = []
+        for j in range(k_roll):
+            a_j = a_seq[:, j, :]
+            z_roll = self.z_dynamics(z_roll, a_j)
+            z_by_step.append(z_roll)
+            y_by_step.append(self.outcome_decoder(z_roll))
+
+        y_hat_stack = torch.stack(y_by_step, dim=1)  # [B, k_roll, y_dim]
+        idx = (horizon_k.long().clamp(min=1, max=k_roll) - 1).view(B, 1, 1).expand(
+            -1, 1, y_hat_stack.size(-1)
+        )
+        y_hat_k = y_hat_stack.gather(1, idx).squeeze(1)
+        se_y = (y_hat_k - y_future).pow(2).mean(dim=-1)
+        loss_y = (se_y * active_t).sum() / n_act
+
+        z_tgt_cached: List[Optional[torch.Tensor]] = []
+        loss_z = torch.zeros((), device=Z_t.device, dtype=Z_t.dtype)
+        if H_future_list is not None and latent_weight > 0.0:
+            z_losses = []
+            hk = horizon_k.long()
+            n_future = min(len(H_future_list), k_roll)
+            for j in range(1, n_future + 1):
+                H_fj = H_future_list[j - 1]
+                if H_fj is None:
+                    z_tgt_cached.append(None)
+                    continue
+                with torch.no_grad():
+                    z_tgt, _ = self.encode(H_fj)
+                z_tgt_cached.append(z_tgt)
+                z_pred = z_by_step[j]
+                se_z = (z_pred - z_tgt).pow(2).mean(dim=-1)
+                step_mask = (hk >= j).float() * a_seq_mask[:, j - 1] * active_t
+                denom = step_mask.sum() + 1e-8
+                z_losses.append((se_z * step_mask).sum() / denom)
+            if z_losses:
+                loss_z = torch.stack(z_losses).mean()
+
+        loss_total = loss_y + float(latent_weight) * loss_z
+        with torch.no_grad():
+            if k_roll < k_max:
+                z_roll_ext = z_by_step[-1]
+                for j in range(k_roll, k_max):
+                    z_roll_ext = self.z_dynamics(z_roll_ext, a_seq[:, j, :])
+                    z_by_step.append(z_roll_ext)
+
+            mae_norm = ((y_hat_k - y_future).abs().mean(dim=-1) * active_t).sum() / n_act
+            mean_k = float((horizon_k.float() * active_t).sum() / n_act)
+            k_frac_eq1 = float(((horizon_k == 1).float() * active_t).sum() / n_act)
+
+            def _masked_mean_l2(z: torch.Tensor) -> float:
+                zn = z.pow(2).sum(dim=-1).sqrt()
+                return float((zn * active_t).sum() / n_act)
+
+            z_norm_init = _masked_mean_l2(Z_t)
+            z_stack = torch.stack(z_by_step, dim=1)  # [B, Kmax+1, z_dim]; index j = z_hat_{t+j}
+            idx_k = horizon_k.long().clamp(1, k_max).view(B, 1, 1).expand(-1, 1, self.z_dim)
+            z_at_hk = z_stack.gather(1, idx_k).squeeze(1)
+            z_norm_at_hk = _masked_mean_l2(z_at_hk)
+            zn_init_per = Z_t.pow(2).sum(dim=-1).sqrt()
+            zn_at_hk_per = z_at_hk.pow(2).sum(dim=-1).sqrt()
+            ratio_per = zn_at_hk_per / (zn_init_per + 1e-8)
+            z_norm_ratio = float((ratio_per * active_t).sum() / n_act)
+            z_shrink_frac = float(((ratio_per < 0.5).float() * active_t).sum() / n_act)
+            z_norm_at_kmax = _masked_mean_l2(z_by_step[-1])
+
+            z_rel_err_hk = float("nan")
+            z_cos_hk = float("nan")
+            if H_future_list is not None and len(H_future_list) > 0:
+                # horizon_k <= k_roll, so z_tgt at index hk-1 only needs futures 1..k_roll.
+                n_tgt = min(len(H_future_list), k_roll)
+                z_tgt_list: List[torch.Tensor] = []
+                for j in range(n_tgt):
+                    if j < len(z_tgt_cached) and z_tgt_cached[j] is not None:
+                        z_tgt_list.append(z_tgt_cached[j])
+                    else:
+                        with torch.no_grad():
+                            z_j, _ = self.encode(H_future_list[j])
+                        z_tgt_list.append(z_j)
+                z_tgt_stack = torch.stack(z_tgt_list, dim=1)
+                idx_tgt = (horizon_k.long().clamp(1, len(H_future_list)) - 1).view(
+                    B, 1, 1
+                ).expand(-1, 1, self.z_dim)
+                z_tgt_hk = z_tgt_stack.gather(1, idx_tgt).squeeze(1)
+                err = (z_at_hk - z_tgt_hk).pow(2).sum(dim=-1).sqrt()
+                tgt_norm = z_tgt_hk.pow(2).sum(dim=-1).sqrt()
+                z_rel_err_hk = float(((err / (tgt_norm + 1e-8)) * active_t).sum() / n_act)
+                cos = F.cosine_similarity(z_at_hk, z_tgt_hk, dim=-1)
+                z_cos_hk = float((cos * active_t).sum() / n_act)
+
+            # Per-step ||z|| / ||z_t|| to spot monotonic shrink across rollout depth.
+            step_ratios = []
+            for j in range(1, len(z_by_step)):
+                step_ratios.append(_masked_mean_l2(z_by_step[j]) / (z_norm_init + 1e-8))
+
+        diag = {
+            "loss_rollout_y": float(loss_y.detach()),
+            "loss_rollout_z": float(loss_z.detach()) if torch.is_tensor(loss_z) else float(loss_z),
+            "rollout_mae_norm": float(mae_norm),
+            "mean_k": mean_k,
+            "k_frac_eq1": k_frac_eq1,
+            "z_norm_init": z_norm_init,
+            "z_norm_at_hk": z_norm_at_hk,
+            "z_norm_ratio": z_norm_ratio,
+            "z_norm_at_kmax": z_norm_at_kmax,
+            "z_norm_step_ratio_last": float(step_ratios[-1]) if step_ratios else float("nan"),
+            "z_rel_err_hk": z_rel_err_hk,
+            "z_cos_hk": z_cos_hk,
+            "z_shrink_frac": z_shrink_frac,
+        }
+        return loss_total, diag

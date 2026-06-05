@@ -196,7 +196,7 @@ exp:
   ct_weight_val_diagnostics: false
   ct_align_loss: sinkhorn
   # ct_alpha: 0.1 使用EM方法后， 该参数不生效
-  ct_lr: 5e-5
+  ct_lr: 1e-5
   ct_epochs: 200
   ct_patience: 20
   ct_weight_decay: 1e-05
@@ -217,11 +217,10 @@ exp:
   #   l1       : k=1 WeightNet-reweighted val MSE. BIASED when WeightNet concentrates
   #              mass onto easy samples — gives rosy numbers that mask the true
   #              population-level predictor error (see ct_anchor_weight docs).
-  #   mae_uw   : k=1 UN-weighted val MAE on normalized y. This is the factual
-  #              prediction accuracy the downstream IQL outcome_predictor actually
-  #              uses during rollouts, and matches CFRNet / Causal Transformer /
-  #              CTD-NKO paper conventions. Recommended when ct_anchor_weight > 0.
-  ct_es_metric: mae_uw
+  #   mae_uw      : k=1 UN-weighted val MAE on normalized y. Recommended for legacy CT.
+  #   rollout_mae : fixed-k rollout val MAE (requires ct_rollout_mode=latent_dynamics).
+  #                 Uses ct_rollout_val_k on val (not random geometric). Align with IQL tau.
+  ct_es_metric: rollout_mae
   # Log the full percentile distribution of WeightNet outputs every N epochs
   # (the compact ESS/std/min/max line is logged every epoch regardless).
   ct_weight_log_every: 5
@@ -263,3 +262,18 @@ exp:
   # Residual latent transition: z_next_pred = z_t + delta(z_t, a_t). Usually stabilizes
   # one-step latent prediction and reduces rollout drift.
   ct_dyn_residual: true
+  # Action-conditioned latent dynamics rollout for CT training.
+  # none: legacy CT training (one-step + optional fixed multi-k).
+  # latent_dynamics: train z_{t+j}=g(z_{t+j-1},a_{t+j-1}) and decode y_{t+k} with random k.
+  ct_rollout_mode: latent_dynamics
+  ct_rollout_k_max: 6
+  ct_rollout_k_dist: geometric  # uniform | geometric
+  ct_rollout_eta: 0.9
+  ct_rollout_loss_weight: 1.0
+  # Training loss weight for one-step outcome_predictor anchor (not the ES metric).
+  ct_rollout_one_step_weight: 1.0
+  ct_rollout_latent_weight: 0.1
+  ct_rollout_decode_each_step: false
+  # Val uses fixed k (not sampled). k=6 aligns with typical IQL tau for cancer_sim.
+  ct_rollout_val_k: 6
+  ct_rollout_return_future_prefixes: true

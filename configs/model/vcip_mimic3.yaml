@@ -217,3 +217,16 @@ exp:
   # Residual latent transition: z_next_pred = z_t + delta(z_t, a_t). Usually stabilizes
   # one-step latent prediction and reduces rollout drift.
   ct_dyn_residual: true
+  # Action-conditioned latent dynamics rollout for CT training.
+  # none: legacy CT training (one-step + optional fixed multi-k).
+  # latent_dynamics: train z_{t+j}=g(z_{t+j-1},a_{t+j-1}) and decode y_{t+k} with random k.
+  ct_rollout_mode: none
+  ct_rollout_k_max: 6
+  ct_rollout_k_dist: geometric  # uniform | geometric
+  ct_rollout_eta: 0.7
+  ct_rollout_loss_weight: 1.0
+  ct_rollout_one_step_weight: 1.0
+  ct_rollout_latent_weight: 0.1
+  ct_rollout_decode_each_step: false
+  ct_rollout_val_k: 1
+  ct_rollout_return_future_prefixes: true

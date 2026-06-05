@@ -13,6 +13,67 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _infer_mlp_hidden_dim(state_dict: Dict[str, torch.Tensor], weight_key: str = "net.0.weight") -> int:
+    """First Linear in CT MLP heads: out_features = hidden_dim."""
+    w = state_dict[weight_key]
+    return int(w.shape[0])
+
+
+def _attach_latent_rollout_modules(
+    inference_model,
+    obj: Dict[str, Any],
+) -> bool:
+    """
+    Build ``z_dynamics`` / ``outcome_decoder`` with widths matching the CT checkpoint, then load weights.
+    Returns True on success.
+    """
+    from src.models.ct_deconfound import LatentDynamicsPredictor, OutcomeDecoder
+
+    if "z_dynamics" not in obj or "outcome_decoder" not in obj:
+        return False
+
+    z_dim = int(getattr(inference_model, "z_dim", 0))
+    a_dim = int(getattr(inference_model, "treatment_dim", getattr(inference_model, "treatment_size", 0)))
+    y_dim = int(getattr(inference_model, "output_dim", 0))
+
+    z_sd = obj["z_dynamics"]
+    dec_sd = obj["outcome_decoder"]
+    ph = int(obj.get("predictor_hidden", 64))
+    dyn_hidden = int(obj.get("dyn_hidden", _infer_mlp_hidden_dim(z_sd)))
+    dec_hidden = int(obj.get("decoder_hidden", obj.get("predictor_hidden", _infer_mlp_hidden_dim(dec_sd))))
+    dyn_residual = bool(obj.get("dyn_residual", obj.get("ct_dyn_residual", True)))
+
+    if hasattr(inference_model, "z_dynamics"):
+        del inference_model.z_dynamics
+    if hasattr(inference_model, "outcome_decoder"):
+        del inference_model.outcome_decoder
+
+    inference_model.add_module(
+        "z_dynamics",
+        LatentDynamicsPredictor(z_dim, a_dim, hidden_dim=dyn_hidden, residual=dyn_residual),
+    )
+    inference_model.add_module(
+        "outcome_decoder",
+        OutcomeDecoder(z_dim, y_dim, hidden_dim=dec_hidden),
+    )
+    inference_model.z_dynamics.load_state_dict(z_sd, strict=True)
+    inference_model.outcome_decoder.load_state_dict(dec_sd, strict=True)
+    inference_model._ct_rollout_loaded = True
+    inference_model._ct_rollout_mode = obj.get("rollout_mode", "latent_dynamics")
+    inference_model._ct_rollout_k_max = int(obj.get("rollout_k_max", 1))
+    inference_model._ct_dyn_hidden = dyn_hidden
+    inference_model._ct_decoder_hidden = dec_hidden
+    logger.info(
+        "Loaded z_dynamics (hidden=%s, residual=%s) + outcome_decoder (hidden=%s) "
+        "from checkpoint (rollout_mode=%s).",
+        dyn_hidden,
+        dyn_residual,
+        dec_hidden,
+        inference_model._ct_rollout_mode,
+    )
+    return True
+
+
 def load_inference_checkpoint(inference_model, ckpt_path: str, device: str) -> None:
     if not ckpt_path:
         logger.info("No inference checkpoint path. Using randomly initialized CT encoder + projection.")
@@ -59,6 +120,22 @@ def load_inference_checkpoint(inference_model, ckpt_path: str, device: str) -> N
                 "simulator-based val will still work.",
                 ckpt_path,
             )
+
+        # Optional latent-rollout modules (train_ct ct_rollout_mode=latent_dynamics).
+        inference_model._ct_rollout_loaded = False
+        if "z_dynamics" in obj and "outcome_decoder" in obj:
+            try:
+                _attach_latent_rollout_modules(inference_model, obj)
+            except Exception as e:
+                inference_model._ct_rollout_loaded = False
+                logger.warning(
+                    "Could not load latent rollout modules from %s (%s). "
+                    "IQL will use outcome_predictor only.",
+                    ckpt_path,
+                    e,
+                )
+        elif "rollout_mode" in obj:
+            inference_model._ct_rollout_mode = obj.get("rollout_mode", "none")
         return
 
     state_dict: Dict[str, torch.Tensor] = obj

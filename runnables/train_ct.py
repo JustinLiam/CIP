@@ -20,7 +20,12 @@ from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.ct_transition_dataset import CTTransitionDataset, collate_ct_batch, _covariate_stream_dim
+from src.data.ct_transition_dataset import (
+    CTTransitionDataset,
+    collate_ct_batch,
+    _covariate_stream_dim,
+    rollout_horizon_distribution,
+)
 from src.models.ct_deconfound import CTDeconfoundModel, active_weight_from_logits
 from src.models.offline_weighting import (
     apply_batch_softmax_weights,
@@ -197,6 +202,161 @@ def _scheduled_prev_outputs(
             po[b, idx, :] = yd[b]
             n_used += 1
     return Hm, n_used
+
+
+def _batch_H_future_list(batch, device, k_max: int):
+    """Collect ``H_t_future_1`` .. ``H_t_future_{k_max}`` from collated batch, if present."""
+    lst = []
+    for j in range(1, int(k_max) + 1):
+        key = f"H_t_future_{j}"
+        if key not in batch:
+            break
+        lst.append({k: v.to(device) for k, v in batch[key].items()})
+    return lst if lst else None
+
+
+def _run_epoch_latent_rollout(
+    model,
+    loader,
+    optimizer_theta,
+    device,
+    train: bool,
+    *,
+    rollout_loss_weight: float = 1.0,
+    rollout_one_step_weight: float = 1.0,
+    rollout_latent_weight: float = 0.1,
+    rollout_decode_each_step: bool = False,
+    rollout_k_max: int = 6,
+    train_std_outcome: float = 1.0,
+):
+    """M-step only: one-step anchor + action-conditioned latent rollout loss (no WeightNet)."""
+    if train:
+        model.train()
+    else:
+        model.eval()
+    total_theta = 0.0
+    sum_rollout_y = 0.0
+    sum_rollout_z = 0.0
+    sum_rollout_mae = 0.0
+    sum_mean_k = 0.0
+    sum_k_frac_eq1 = 0.0
+    sum_z_norm_init = 0.0
+    sum_z_norm_at_hk = 0.0
+    sum_z_norm_ratio = 0.0
+    sum_z_norm_at_kmax = 0.0
+    sum_z_norm_step_ratio_last = 0.0
+    sum_z_rel_err_hk = 0.0
+    sum_z_cos_hk = 0.0
+    sum_z_shrink_frac = 0.0
+    sum_l1_anchor = 0.0
+    sum_mae_uw_norm = 0.0
+    sum_mae_uw_denom = 0.0
+    n_batches = 0
+
+    for batch in loader:
+        H_t = {k: v.to(device) for k, v in batch["H_t"].items()}
+        y_next = batch["y_next"].to(device)
+        a_seq = batch["a_seq"].to(device)
+        a_seq_mask = batch["a_seq_mask"].to(device)
+        horizon_k = batch["horizon_k"].to(device)
+        y_future = batch["y_future"].to(device)
+        H_future_list = _batch_H_future_list(batch, device, rollout_k_max)
+
+        active_t_mask = (H_t["active_entries"][:, -1, 0].detach() > 0.5)
+        w_ones = active_t_mask.float()
+
+        with torch.set_grad_enabled(train):
+            Z_t, A_t = model.encode(H_t)
+            active_t = H_t["active_entries"][:, -1, 0].float()
+            n_act = active_t.sum() + 1e-8
+            y_hat1 = model.predictor(torch.cat([Z_t, A_t], dim=-1))
+            se_anchor = (y_hat1 - y_next).pow(2).mean(dim=-1)
+            loss_pred1_anchor = (se_anchor * active_t).sum() / n_act
+            loss_rollout, rdiag = model.rollout_dynamics_loss(
+                H_t,
+                a_seq,
+                a_seq_mask,
+                horizon_k,
+                y_future,
+                H_future_list=H_future_list,
+                Z_t=Z_t,
+                latent_weight=rollout_latent_weight,
+                decode_each_step=rollout_decode_each_step,
+            )
+            loss_theta = (
+                float(rollout_one_step_weight) * loss_pred1_anchor
+                + float(rollout_loss_weight) * loss_rollout
+            )
+
+            if train:
+                optimizer_theta.zero_grad(set_to_none=True)
+                loss_theta.backward()
+                torch.nn.utils.clip_grad_norm_(model.ct_encoder.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.projection.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.predictor.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.z_dynamics.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.outcome_decoder.parameters(), max_norm=1.0)
+                optimizer_theta.step()
+
+            with torch.no_grad():
+                mae_per = (y_hat1 - y_next).abs().mean(dim=-1)
+                act1_last = active_t_mask.float()
+                sum_mae_uw_norm += float((mae_per * act1_last).sum())
+                sum_mae_uw_denom += float(act1_last.sum())
+
+        total_theta += float(loss_theta.detach())
+        sum_rollout_y += rdiag["loss_rollout_y"]
+        sum_rollout_z += rdiag["loss_rollout_z"]
+        sum_rollout_mae += rdiag["rollout_mae_norm"]
+        sum_mean_k += rdiag["mean_k"]
+        sum_k_frac_eq1 += rdiag.get("k_frac_eq1", 0.0)
+        sum_z_norm_init += rdiag.get("z_norm_init", 0.0)
+        sum_z_norm_at_hk += rdiag.get("z_norm_at_hk", 0.0)
+        sum_z_norm_ratio += rdiag.get("z_norm_ratio", 0.0)
+        sum_z_norm_at_kmax += rdiag.get("z_norm_at_kmax", 0.0)
+        sum_z_norm_step_ratio_last += rdiag.get("z_norm_step_ratio_last", 0.0)
+        zre = rdiag.get("z_rel_err_hk", float("nan"))
+        if zre == zre:
+            sum_z_rel_err_hk += zre
+        zcos = rdiag.get("z_cos_hk", float("nan"))
+        if zcos == zcos:
+            sum_z_cos_hk += zcos
+        zsf = rdiag.get("z_shrink_frac", float("nan"))
+        if zsf == zsf:
+            sum_z_shrink_frac += zsf
+        sum_l1_anchor += float(loss_pred1_anchor.detach())
+        n_batches += 1
+
+    nb = max(n_batches, 1)
+    mae_uw_norm = sum_mae_uw_norm / max(sum_mae_uw_denom, 1e-8)
+    extras = {
+        "mean_l1": sum_l1_anchor / nb,
+        "mean_l1_anchor": sum_l1_anchor / nb,
+        "mean_l2": 0.0,
+        "mean_l3": 0.0,
+        "mae_uw_norm": float(mae_uw_norm),
+        "mae_uw_unscaled": float(mae_uw_norm * float(train_std_outcome)),
+        "mae_uw_uns": float(mae_uw_norm * float(train_std_outcome)),
+        "ss_frac": 0.0,
+        "ss_disabled": True,
+        "align_pre": 0.0,
+        "mean_dyn": 0.0,
+        "rollout_y": sum_rollout_y / nb,
+        "rollout_z": sum_rollout_z / nb,
+        "rollout_mae_norm": sum_rollout_mae / nb,
+        "rollout_mae_unscaled": float(sum_rollout_mae / nb * float(train_std_outcome)),
+        "mean_k": sum_mean_k / nb,
+        "k_frac_eq1": sum_k_frac_eq1 / nb,
+        "z_norm_init": sum_z_norm_init / nb,
+        "z_norm_at_hk": sum_z_norm_at_hk / nb,
+        "z_norm_ratio": sum_z_norm_ratio / nb,
+        "z_norm_at_kmax": sum_z_norm_at_kmax / nb,
+        "z_norm_step_ratio_last": sum_z_norm_step_ratio_last / nb,
+        "z_rel_err_hk": sum_z_rel_err_hk / nb,
+        "z_cos_hk": sum_z_cos_hk / nb,
+        "z_shrink_frac": sum_z_shrink_frac / nb,
+    }
+    return total_theta / nb, 0.0, extras
 
 
 def _batch_fixed_weights(
@@ -603,11 +763,33 @@ def main(args: DictConfig):
     dyn_consistency_weight = float(OmegaConf.select(args, "exp.ct_dyn_consistency_weight", default=0.0))
     dyn_consistency_weight = max(0.0, dyn_consistency_weight)
 
+    ct_rollout_mode = str(OmegaConf.select(args, "exp.ct_rollout_mode", default="none")).strip().lower()
+    ct_rollout_k_max = max(1, int(OmegaConf.select(args, "exp.ct_rollout_k_max", default=6)))
+    ct_rollout_k_dist = str(OmegaConf.select(args, "exp.ct_rollout_k_dist", default="geometric")).strip().lower()
+    ct_rollout_eta = float(OmegaConf.select(args, "exp.ct_rollout_eta", default=0.7))
+    ct_rollout_loss_weight = float(OmegaConf.select(args, "exp.ct_rollout_loss_weight", default=1.0))
+    ct_rollout_one_step_weight = float(OmegaConf.select(args, "exp.ct_rollout_one_step_weight", default=1.0))
+    ct_rollout_latent_weight = float(OmegaConf.select(args, "exp.ct_rollout_latent_weight", default=0.1))
+    ct_rollout_decode_each_step = bool(
+        OmegaConf.select(args, "exp.ct_rollout_decode_each_step", default=False)
+    )
+    ct_rollout_val_k = max(1, int(OmegaConf.select(args, "exp.ct_rollout_val_k", default=1)))
+    ct_rollout_return_future_prefixes = bool(
+        OmegaConf.select(args, "exp.ct_rollout_return_future_prefixes", default=True)
+    )
+    use_latent_rollout = ct_rollout_mode == "latent_dynamics"
+
     # CT weighting mode: online (per-batch E-step), offline_periodic (CTD-NKO-style), none (uniform).
     ct_weight_mode = str(OmegaConf.select(args, "exp.ct_weight_mode", default="online")).strip().lower()
     if ct_weight_mode not in ("none", "online", "offline_periodic"):
         logger.warning("Unknown exp.ct_weight_mode=%r; using 'online'.", ct_weight_mode)
         ct_weight_mode = "online"
+    if use_latent_rollout and ct_weight_mode != "none":
+        logger.warning(
+            "ct_rollout_mode=latent_dynamics requires ct_weight_mode=none; forcing none (was %r).",
+            ct_weight_mode,
+        )
+        ct_weight_mode = "none"
     ct_weight_refresh_freq = max(1, int(OmegaConf.select(args, "exp.ct_weight_refresh_freq", default=20)))
     ct_weight_epochs = max(1, int(OmegaConf.select(args, "exp.ct_weight_epochs", default=5)))
     ct_weight_batch_size = int(OmegaConf.select(args, "exp.ct_weight_batch_size", default=1024))
@@ -648,6 +830,10 @@ def main(args: DictConfig):
             dataset_collection = repeat_static(dataset_collection)
 
     multi_k_max = int(OmegaConf.select(args, "exp.ct_multi_k_max", default=1))
+    if use_latent_rollout:
+        multi_k_max = 1
+        dyn_consistency_weight = 0.0
+        anchor_weight = 1.0
     ct_multi_eta = float(OmegaConf.select(args, "exp.ct_multi_eta", default=0.5))
     ct_sched_p_start = float(OmegaConf.select(args, "exp.ct_sched_p_start", default=0.0))
     ct_sched_p_end = float(OmegaConf.select(args, "exp.ct_sched_p_end", default=0.3))
@@ -655,28 +841,44 @@ def main(args: DictConfig):
     horiz_w = _ct_horizon_weights(ct_multi_eta, max(1, multi_k_max))
 
     # Early-stop / checkpoint-selection metric.
-    #   "weighted" : multi-horizon WeightNet-reweighted MSE (legacy default).
-    #   "l1"       : k=1 WeightNet-reweighted MSE (legacy).
-    #   "mae_uw"   : k=1 UN-weighted MAE on normalized y. Recommended default
-    #                post predictor-bias fix (ct_anchor_weight > 0): this is the
-    #                unbiased factual-prediction metric and matches how downstream
-    #                IQL uses the outcome_predictor during rollouts. Standard in
-    #                CFRNet / Causal Transformer / CTD-NKO model selection.
+    #   "weighted"    : multi-horizon WeightNet-reweighted MSE (legacy default).
+    #   "l1"          : k=1 WeightNet-reweighted MSE (legacy).
+    #   "mae_uw"      : k=1 UN-weighted MAE on normalized y. Recommended for legacy CT.
+    #   "rollout_mae" : fixed-k rollout MAE on normalized y (requires latent_dynamics).
     ct_es_metric = str(OmegaConf.select(args, "exp.ct_es_metric", default="weighted")).strip().lower()
-    if ct_es_metric not in ("weighted", "l1", "mae_uw"):
+    if ct_es_metric not in ("weighted", "l1", "mae_uw", "rollout_mae"):
         logger.warning(f"Unknown exp.ct_es_metric={ct_es_metric!r}; using 'weighted'.")
         ct_es_metric = "weighted"
+    if ct_es_metric == "rollout_mae" and not use_latent_rollout:
+        logger.warning(
+            "ct_es_metric='rollout_mae' requires ct_rollout_mode=latent_dynamics; "
+            "falling back to 'mae_uw'."
+        )
+        ct_es_metric = "mae_uw"
 
-    need_next_prefix = dyn_consistency_weight > 0.0
+    need_next_prefix = dyn_consistency_weight > 0.0 and not use_latent_rollout
+    ds_rollout_kw = dict(
+        rollout_mode=ct_rollout_mode,
+        rollout_k_max=ct_rollout_k_max,
+        rollout_k_dist=ct_rollout_k_dist,
+        rollout_eta=ct_rollout_eta,
+        rollout_return_future_prefixes=ct_rollout_return_future_prefixes,
+    )
     train_ds = CTTransitionDataset(
         dataset_collection.train_f.data,
         multi_k_max=multi_k_max,
         include_next_prefix=need_next_prefix,
+        train=True,
+        rollout_val_k=ct_rollout_val_k,
+        **ds_rollout_kw,
     )
     val_ds = CTTransitionDataset(
         dataset_collection.val_f.data,
         multi_k_max=multi_k_max,
         include_next_prefix=need_next_prefix,
+        train=False,
+        rollout_val_k=ct_rollout_val_k,
+        **ds_rollout_kw,
     )
     # Outcome std used only to rescale MAE for human-readable logs.
     outcome_scale_key = str(OmegaConf.select(args, "exp.outcome_scale_key", default="outputs"))
@@ -684,6 +886,19 @@ def main(args: DictConfig):
         dataset_collection.train_scaling_params,
         preferred_key=outcome_scale_key,
     )
+    rollout_log = ""
+    if use_latent_rollout:
+        exp_mean_k, k_probs = rollout_horizon_distribution(
+            ct_rollout_k_max, ct_rollout_k_dist, ct_rollout_eta
+        )
+        prob_str = " ".join(f"P(k={j})={p:.3f}" for j, p in enumerate(k_probs, start=1))
+        rollout_log = (
+            f" rollout_mode=latent_dynamics k_max={ct_rollout_k_max} k_dist={ct_rollout_k_dist} "
+            f"eta={ct_rollout_eta:g} E_train[k]={exp_mean_k:.3f} ({prob_str}) "
+            f"val_eval_k={ct_rollout_val_k} (fixed, not sampled) "
+            f"rollout_w={ct_rollout_loss_weight:g} one_step_w={ct_rollout_one_step_weight:g} "
+            f"latent_w={ct_rollout_latent_weight:g} future_prefixes={ct_rollout_return_future_prefixes}"
+        )
     logger.info(
         f"CT transitions: train={len(train_ds)}, val={len(val_ds)} | multi_k_max={multi_k_max} "
         f"horiz_w={horiz_w} sched_p=[{ct_sched_p_start}->{ct_sched_p_end} over {ct_sched_ramp_epochs} ep] "
@@ -691,6 +906,7 @@ def main(args: DictConfig):
         f"dyn_w={dyn_consistency_weight:g} next_prefix={need_next_prefix} "
         f"weight_mode={ct_weight_mode} refresh_freq={ct_weight_refresh_freq} "
         f"train_std_outcome={train_std_outcome:.4f} (scale_key={outcome_scale_key_used})"
+        f"{rollout_log}"
     )
     if ct_weight_mode == "offline_periodic":
         logger.info(
@@ -732,10 +948,13 @@ def main(args: DictConfig):
     
     # 分离网络参数
     w_params = list(model.weight_net.parameters())
-    theta_params = list(model.ct_encoder.parameters()) + \
-                   list(model.projection.parameters()) + \
-                   list(model.predictor.parameters()) + \
-                   list(model.z_dynamics.parameters())
+    theta_params = (
+        list(model.ct_encoder.parameters())
+        + list(model.projection.parameters())
+        + list(model.predictor.parameters())
+        + list(model.z_dynamics.parameters())
+        + list(model.outcome_decoder.parameters())
+    )
 
     optimizer_w = None
     if ct_weight_mode == "online":
@@ -767,15 +986,18 @@ def main(args: DictConfig):
     def _es_score(va_extras: dict, va_pred_f: float) -> float:
         """
         Scalar for early stopping / best-ckpt selection. Lower = better.
-            - "weighted" : multi-horizon WeightNet-reweighted val MSE (legacy).
-            - "l1"       : k=1 WeightNet-reweighted val MSE (legacy, BIASED when
-                           WeightNet concentrates mass; see ct_anchor_weight docs).
-            - "mae_uw"   : k=1 UN-weighted val MAE on normalized y (recommended).
+            - "weighted"    : multi-horizon WeightNet-reweighted val MSE (legacy).
+            - "l1"          : k=1 WeightNet-reweighted val MSE (legacy, BIASED when
+                              WeightNet concentrates mass; see ct_anchor_weight docs).
+            - "mae_uw"      : k=1 UN-weighted val MAE on normalized y.
+            - "rollout_mae" : fixed-k rollout val MAE on normalized y (latent_dynamics).
         """
         if ct_es_metric == "l1":
             return float(va_extras["mean_l1"])
         if ct_es_metric == "mae_uw":
             return float(va_extras["mae_uw_norm"])
+        if ct_es_metric == "rollout_mae":
+            return float(va_extras["rollout_mae_norm"])
         return float(va_pred_f)
 
     best_es = float("inf")
@@ -836,49 +1058,78 @@ def main(args: DictConfig):
                     )
                     log_w_balance(val_balance, prefix="[W-val-diag]", logger_obj=logger)
 
-        ss_p = _ct_sched_sampling_p(epoch, ct_sched_p_start, ct_sched_p_end, ct_sched_ramp_epochs)
-        tr_pred, tr_align, tr_ex = _run_epoch(
-            model,
-            train_loader,
-            optimizer_w,
-            optimizer_theta,
-            device,
-            ct_align,
-            ct_blur,
-            True,
-            weight_mode=ct_weight_mode,
-            multi_k_max=multi_k_max,
-            horiz_w=horiz_w,
-            ss_p=ss_p,
-            k_inner=k_inner,
-            w_clip=w_clip,
-            anchor_weight=anchor_weight,
-            train_std_outcome=train_std_outcome,
-            dyn_consistency_weight=dyn_consistency_weight,
-            offline_align_last=offline_align_last,
+        ss_p = 0.0 if use_latent_rollout else _ct_sched_sampling_p(
+            epoch, ct_sched_p_start, ct_sched_p_end, ct_sched_ramp_epochs
         )
-        with torch.no_grad():
-            # Val never steps the optimizer, so k_inner is irrelevant here; the inner
-            # loop body is gated by the ``train`` flag and effectively skipped in eval.
-            va_pred, va_align, va_ex = _run_epoch(
+        if use_latent_rollout:
+            tr_pred, tr_align, tr_ex = _run_epoch_latent_rollout(
                 model,
-                val_loader,
-                None,
-                None,
+                train_loader,
+                optimizer_theta,
+                device,
+                True,
+                rollout_loss_weight=ct_rollout_loss_weight,
+                rollout_one_step_weight=ct_rollout_one_step_weight,
+                rollout_latent_weight=ct_rollout_latent_weight,
+                rollout_decode_each_step=ct_rollout_decode_each_step,
+                rollout_k_max=ct_rollout_k_max,
+                train_std_outcome=train_std_outcome,
+            )
+            with torch.no_grad():
+                va_pred, va_align, va_ex = _run_epoch_latent_rollout(
+                    model,
+                    val_loader,
+                    optimizer_theta,
+                    device,
+                    False,
+                    rollout_loss_weight=ct_rollout_loss_weight,
+                    rollout_one_step_weight=ct_rollout_one_step_weight,
+                    rollout_latent_weight=ct_rollout_latent_weight,
+                    rollout_decode_each_step=ct_rollout_decode_each_step,
+                    rollout_k_max=ct_rollout_k_max,
+                    train_std_outcome=train_std_outcome,
+                )
+        else:
+            tr_pred, tr_align, tr_ex = _run_epoch(
+                model,
+                train_loader,
+                optimizer_w,
+                optimizer_theta,
                 device,
                 ct_align,
                 ct_blur,
-                False,
+                True,
                 weight_mode=ct_weight_mode,
                 multi_k_max=multi_k_max,
                 horiz_w=horiz_w,
-                ss_p=0.0,
-                k_inner=1,
+                ss_p=ss_p,
+                k_inner=k_inner,
+                w_clip=w_clip,
                 anchor_weight=anchor_weight,
                 train_std_outcome=train_std_outcome,
                 dyn_consistency_weight=dyn_consistency_weight,
                 offline_align_last=offline_align_last,
             )
+            with torch.no_grad():
+                va_pred, va_align, va_ex = _run_epoch(
+                    model,
+                    val_loader,
+                    None,
+                    None,
+                    device,
+                    ct_align,
+                    ct_blur,
+                    False,
+                    weight_mode=ct_weight_mode,
+                    multi_k_max=multi_k_max,
+                    horiz_w=horiz_w,
+                    ss_p=0.0,
+                    k_inner=1,
+                    anchor_weight=anchor_weight,
+                    train_std_outcome=train_std_outcome,
+                    dyn_consistency_weight=dyn_consistency_weight,
+                    offline_align_last=offline_align_last,
+                )
 
         if ct_weight_mode == "offline_periodic":
             train_align_label = "offline_train_align_last"
@@ -895,25 +1146,56 @@ def main(args: DictConfig):
             ss_msg = "train_ss_frac=0.0000 (disabled: multi_k_max=1; ss_p applies only to k>=2)"
         else:
             ss_msg = f"train_ss_frac={tr_ex['ss_frac']:.4f}"
-        logger.info(
-            f"Epoch {epoch}/{ct_epochs} ss_p={ss_p:.4f} "
-            f"train_pred={tr_pred:.6f} {train_align_label}={tr_align:.6f} {ss_msg} "
-            f"train_L1={tr_ex['mean_l1']:.6f} train_L2={tr_ex['mean_l2']:.6f} train_L3={tr_ex['mean_l3']:.6f} | "
-            f"val_pred={va_pred:.6f} {val_align_msg} "
-            f"val_L1={va_ex['mean_l1']:.6f} val_L2={va_ex['mean_l2']:.6f} val_L3={va_ex['mean_l3']:.6f}"
-        )
+        if use_latent_rollout:
+            logger.info(
+                f"Epoch {epoch}/{ct_epochs} rollout_mode=latent_dynamics weight_mode=none "
+                f"k_max={ct_rollout_k_max} k_dist={ct_rollout_k_dist} latent_w={ct_rollout_latent_weight:g} "
+                f"one_step_w={ct_rollout_one_step_weight:g} rollout_w={ct_rollout_loss_weight:g} | "
+                f"train_pred={tr_pred:.6f} train_rollout_y={tr_ex['rollout_y']:.6f} "
+                f"train_rollout_z={tr_ex['rollout_z']:.6f} train_rollout_mae_norm={tr_ex['rollout_mae_norm']:.6f} "
+                f"train_mean_k={tr_ex['mean_k']:.3f} (sampled) k_frac_eq1={tr_ex.get('k_frac_eq1', 0):.3f} "
+                f"train_L1={tr_ex['mean_l1']:.6f} | "
+                f"val_pred={va_pred:.6f} val_rollout_y={va_ex['rollout_y']:.6f} "
+                f"val_rollout_z={va_ex['rollout_z']:.6f} val_rollout_mae_norm={va_ex['rollout_mae_norm']:.6f} "
+                f"val_eval_k={ct_rollout_val_k} (fixed) val_L1={va_ex['mean_l1']:.6f}"
+            )
+            logger.info(
+                f"  [Rollout-z-diag] train: z_norm_init={tr_ex.get('z_norm_init', float('nan')):.4f} "
+                f"z_at_k={tr_ex.get('z_norm_at_hk', float('nan')):.4f} "
+                f"ratio={tr_ex.get('z_norm_ratio', float('nan')):.4f} "
+                f"ratio@kmax={tr_ex.get('z_norm_step_ratio_last', float('nan')):.4f} "
+                f"z_rel_err@k={tr_ex.get('z_rel_err_hk', float('nan')):.4f} "
+                f"z_cos@k={tr_ex.get('z_cos_hk', float('nan')):.4f} "
+                f"shrink_frac(ratio<0.5)={tr_ex.get('z_shrink_frac', float('nan')):.3f} | "
+                f"val: z_norm_init={va_ex.get('z_norm_init', float('nan')):.4f} "
+                f"z_at_k={va_ex.get('z_norm_at_hk', float('nan')):.4f} "
+                f"ratio={va_ex.get('z_norm_ratio', float('nan')):.4f} "
+                f"z_rel_err@k={va_ex.get('z_rel_err_hk', float('nan')):.4f} "
+                f"z_cos@k={va_ex.get('z_cos_hk', float('nan')):.4f}"
+            )
+        else:
+            logger.info(
+                f"Epoch {epoch}/{ct_epochs} ss_p={ss_p:.4f} "
+                f"train_pred={tr_pred:.6f} {train_align_label}={tr_align:.6f} {ss_msg} "
+                f"train_L1={tr_ex['mean_l1']:.6f} train_L2={tr_ex['mean_l2']:.6f} train_L3={tr_ex['mean_l3']:.6f} | "
+                f"val_pred={va_pred:.6f} {val_align_msg} "
+                f"val_L1={va_ex['mean_l1']:.6f} val_L2={va_ex['mean_l2']:.6f} val_L3={va_ex['mean_l3']:.6f}"
+            )
         # Predictor-bias diagnostic: weighted vs un-weighted + MAE in unscaled units.
-        # Healthy signs: (a) val_L1_anchor roughly equal to val_L1 (no WeightNet
-        # concentration bias); (b) val_MAE_uw_unscaled < 0.3 on cancer_sim γ=4.
-        # Symptoms of the pre-anchor pathology: val_L1 ~1e-5 but val_MAE_uw_unscaled ~1.7.
-        logger.info(
-            f"  [Pred-diag] train: L1w={tr_ex['mean_l1']:.3e} L1anc={tr_ex['mean_l1_anchor']:.3e} "
-            f"MAE_uw_norm={tr_ex['mae_uw_norm']:.5f} MAE_uw_unscaled={tr_ex['mae_uw_unscaled']:.4f} "
-            f"Zdyn={tr_ex.get('mean_dyn', float('nan')):.3e} | "
-            f"val: L1w={va_ex['mean_l1']:.3e} L1anc={va_ex['mean_l1_anchor']:.3e} "
-            f"MAE_uw_norm={va_ex['mae_uw_norm']:.5f} MAE_uw_unscaled={va_ex['mae_uw_unscaled']:.4f} "
-            f"Zdyn={va_ex.get('mean_dyn', float('nan')):.3e}"
-        )
+        if not use_latent_rollout:
+            logger.info(
+                f"  [Pred-diag] train: L1w={tr_ex['mean_l1']:.3e} L1anc={tr_ex['mean_l1_anchor']:.3e} "
+                f"MAE_uw_norm={tr_ex['mae_uw_norm']:.5f} MAE_uw_unscaled={tr_ex['mae_uw_unscaled']:.4f} | "
+                f"val: L1w={va_ex['mean_l1']:.3e} L1anc={va_ex['mean_l1_anchor']:.3e} "
+                f"MAE_uw_norm={va_ex['mae_uw_norm']:.5f} MAE_uw_unscaled={va_ex['mae_uw_unscaled']:.4f}"
+            )
+        else:
+            logger.info(
+                f"  [Pred-diag] train: L1anc={tr_ex['mean_l1_anchor']:.3e} "
+                f"MAE_uw_norm={tr_ex['mae_uw_norm']:.5f} MAE_uw_unscaled={tr_ex['mae_uw_unscaled']:.4f} | "
+                f"val: L1anc={va_ex['mean_l1_anchor']:.3e} "
+                f"MAE_uw_norm={va_ex['mae_uw_norm']:.5f} MAE_uw_unscaled={va_ex['mae_uw_unscaled']:.4f}"
+            )
         # When k_inner>1, report the per-batch-averaged pre/post alignment. Interpretation:
         #   * drop = align_pre - align_post > 0 and large   => inner loop is usefully
         #     reducing alignment within each batch (E-step is converging).
@@ -965,6 +1247,28 @@ def main(args: DictConfig):
         if es_score < best_es:
             best_es = es_score
             patience_left = ct_patience
+            ph_ckpt = int(OmegaConf.select(args, "exp.ct_predictor_hidden", default=64))
+            dh_ckpt = int(OmegaConf.select(args, "exp.ct_dyn_hidden", default=ph_ckpt))
+            dyn_residual_ckpt = bool(OmegaConf.select(args, "exp.ct_dyn_residual", default=True))
+            ckpt_extra = {
+                "dyn_hidden": dh_ckpt,
+                "dyn_residual": dyn_residual_ckpt,
+                "decoder_hidden": ph_ckpt,
+            }
+            if use_latent_rollout:
+                ckpt_extra.update(
+                    {
+                        "outcome_decoder": model.outcome_decoder.state_dict(),
+                        "rollout_mode": ct_rollout_mode,
+                        "rollout_k_max": ct_rollout_k_max,
+                        "rollout_k_dist": ct_rollout_k_dist,
+                        "rollout_eta": ct_rollout_eta,
+                        "rollout_loss_weight": ct_rollout_loss_weight,
+                        "rollout_one_step_weight": ct_rollout_one_step_weight,
+                        "rollout_latent_weight": ct_rollout_latent_weight,
+                        "rollout_val_k": ct_rollout_val_k,
+                    }
+                )
             torch.save(
                 {
                     "ct_history_encoder": model.ct_encoder.state_dict(),
@@ -973,7 +1277,8 @@ def main(args: DictConfig):
                     # (roll out with p(y_{t+1} | z_t, a_t) instead of the cancer simulator).
                     "outcome_predictor": model.predictor.state_dict(),
                     "z_dynamics": model.z_dynamics.state_dict(),
-                    "predictor_hidden": int(OmegaConf.select(args, "exp.ct_predictor_hidden", default=64)),
+                    "predictor_hidden": ph_ckpt,
+                    **ckpt_extra,
                     "val_loss_pred": va_pred,
                     "val_loss_l1": float(va_ex["mean_l1"]),
                     "val_loss_l1_anchor": float(va_ex["mean_l1_anchor"]),
@@ -981,6 +1286,8 @@ def main(args: DictConfig):
                     "val_mae_uw_unscaled": float(va_ex["mae_uw_unscaled"]),
                     # Backward-compatible alias for existing consumers.
                     "val_mae_uw_uns": float(va_ex["mae_uw_unscaled"]),
+                    "val_rollout_mae_norm": float(va_ex.get("rollout_mae_norm", float("nan"))),
+                    "val_rollout_mae_unscaled": float(va_ex.get("rollout_mae_unscaled", float("nan"))),
                     "val_loss_z_dyn": float(va_ex.get("mean_dyn", 0.0)),
                     "val_loss_align": float(va_align),
                     "anchor_weight": float(anchor_weight),
@@ -994,11 +1301,18 @@ def main(args: DictConfig):
                 },
                 ckpt_path,
             )
-            logger.info(
+            save_msg = (
                 f"Saved encoder checkpoint to {ckpt_path} "
                 f"(early_stop_metric={ct_es_metric}, score={es_score:.6f}, val_pred={va_pred:.6f}, "
-                f"val_L1={va_ex['mean_l1']:.6f} val_MAE_uw_unscaled={va_ex['mae_uw_unscaled']:.4f})"
+                f"val_L1={va_ex['mean_l1']:.6f} val_MAE_uw_unscaled={va_ex['mae_uw_unscaled']:.4f}"
             )
+            if use_latent_rollout:
+                save_msg += (
+                    f" val_rollout_mae_norm={va_ex['rollout_mae_norm']:.6f} "
+                    f"val_rollout_mae_unscaled={va_ex.get('rollout_mae_unscaled', float('nan')):.4f} "
+                    f"val_eval_k={ct_rollout_val_k}"
+                )
+            logger.info(save_msg + ")")
         else:
             patience_left -= 1
             if patience_left <= 0:
@@ -1009,7 +1323,8 @@ def main(args: DictConfig):
 
     es_label = {
         "l1": "val_L1 (weighted, biased)",
-        "mae_uw": "val_MAE_uw_norm (un-weighted, recommended)",
+        "mae_uw": "val_MAE_uw_norm (un-weighted)",
+        "rollout_mae": f"val_rollout_mae_norm @ k={ct_rollout_val_k}",
         "weighted": "val_pred (weighted)",
     }[ct_es_metric]
     logger.info(f"Done. Best {es_label}={best_es:.6f} (early_stop={ct_es_metric}). Encoder-only file: {ckpt_path}")

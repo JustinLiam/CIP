@@ -1,6 +1,7 @@
 """
 Transitions (patient, t) for standalone Causal Transformer training (ctd.md).
 """
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -8,6 +9,46 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.iql_dataset_builder import _static_for_prefix
+
+
+def rollout_horizon_distribution(
+    k_max: int,
+    k_dist: str,
+    eta: float,
+) -> Tuple[float, List[float]]:
+    """
+    Return (E[k], P(k=1..k_max)) for logging.
+
+    geometric: P(k=j) ∝ eta^(j-1), j=1..k_max (favors short horizons when eta<1).
+    uniform: P(k=j) = 1/k_max.
+    """
+    k_max = max(1, int(k_max))
+    if str(k_dist).strip().lower() == "uniform":
+        probs = [1.0 / k_max] * k_max
+    else:
+        weights = [float(eta) ** (j - 1) for j in range(1, k_max + 1)]
+        s = sum(weights)
+        probs = [w / s for w in weights]
+    mean_k = sum((j + 1) * p for j, p in enumerate(probs))
+    return float(mean_k), probs
+
+
+def _sample_rollout_horizon_k(
+    k_max: int,
+    k_dist: str,
+    eta: float,
+    *,
+    train: bool,
+    val_k: int,
+) -> int:
+    """Sample rollout horizon k in {1, ..., k_max} (1-based)."""
+    if not train:
+        return max(1, min(int(val_k), int(k_max)))
+    if k_dist == "uniform":
+        return random.randint(1, int(k_max))
+    # geometric: P(k=j) ∝ eta^(j-1)
+    _, probs = rollout_horizon_distribution(k_max, k_dist, eta)
+    return random.choices(range(1, int(k_max) + 1), weights=probs, k=1)[0]
 
 
 def _covariate_stream_dim(dataset_cfg: Dict[str, Any]) -> int:
@@ -58,6 +99,9 @@ class CTTransitionDataset(Dataset):
 
     If ``multi_k_max`` > 1, also returns longer teacher prefixes for k=2..K targets Y_{t+2}..Y_{t+K}
     (requires length >= t + K + 1).
+
+    If ``rollout_mode`` == ``latent_dynamics``, returns action sequence A_{t:t+k-1}, horizon k,
+    Y_{t+k}, and optional future history prefixes for latent consistency targets.
     """
 
     def __init__(
@@ -65,21 +109,40 @@ class CTTransitionDataset(Dataset):
         data: Dict[str, np.ndarray],
         multi_k_max: int = 1,
         include_next_prefix: bool = False,
+        *,
+        rollout_mode: str = "none",
+        rollout_k_max: int = 1,
+        rollout_k_dist: str = "geometric",
+        rollout_eta: float = 0.7,
+        rollout_return_future_prefixes: bool = True,
+        train: bool = True,
+        rollout_val_k: int = 1,
     ):
         self.data = data
         self.multi_k_max = int(multi_k_max)
         self.include_next_prefix = bool(include_next_prefix)
+        self.rollout_mode = str(rollout_mode).strip().lower()
+        self.rollout_k_max = max(1, int(rollout_k_max))
+        self.rollout_k_dist = str(rollout_k_dist).strip().lower()
+        self.rollout_eta = float(rollout_eta)
+        self.rollout_return_future_prefixes = bool(rollout_return_future_prefixes)
+        self.train = bool(train)
+        self.rollout_val_k = max(1, int(rollout_val_k))
         # Optional [num_patients, max_seq_len, 1] dataset/time-level weights (offline refresh).
         self.weight_table: Optional[torch.Tensor] = None
         self.index: List[Tuple[int, int]] = []
         n = data["current_treatments"].shape[0]
-        min_len = self.multi_k_max + 2
+        if self.rollout_mode == "latent_dynamics":
+            k_bound = self.rollout_k_max
+        else:
+            k_bound = self.multi_k_max
+        min_len = k_bound + 2
         for i in range(n):
             active = data["active_entries"][i]
             length = int(active.sum())
             if length < min_len:
                 continue
-            for t in range(1, length - self.multi_k_max):
+            for t in range(1, length - k_bound):
                 self.index.append((i, t))
 
     def __len__(self) -> int:
@@ -108,6 +171,30 @@ class CTTransitionDataset(Dataset):
             "time_id": torch.tensor(t, dtype=torch.long),
             "w": torch.tensor(w_val, dtype=torch.float32),
         }
+
+        if self.rollout_mode == "latent_dynamics":
+            k = _sample_rollout_horizon_k(
+                self.rollout_k_max,
+                self.rollout_k_dist,
+                self.rollout_eta,
+                train=self.train,
+                val_k=self.rollout_val_k,
+            )
+            action_dim = self.data["current_treatments"].shape[-1]
+            a_seq = torch.zeros(self.rollout_k_max, action_dim, dtype=torch.float32)
+            a_raw = self.data["current_treatments"][i, t : t + k, :]
+            a_seq[:k, :] = torch.tensor(a_raw, dtype=torch.float32)
+            a_seq_mask = torch.zeros(self.rollout_k_max, dtype=torch.float32)
+            a_seq_mask[:k] = 1.0
+            out["a_seq"] = a_seq
+            out["a_seq_mask"] = a_seq_mask
+            out["horizon_k"] = torch.tensor(k, dtype=torch.long)
+            out["y_future"] = torch.tensor(self.data["outputs"][i, t + k, :], dtype=torch.float32)
+            if self.rollout_return_future_prefixes:
+                for j in range(1, self.rollout_k_max + 1):
+                    out[f"H_t_future_{j}"] = _build_H_slice(self.data, i, t + j + 1)
+            return out
+
         if self.include_next_prefix:
             out["H_t_next"] = _build_H_slice(self.data, i, t + 2)
         if self.multi_k_max >= 2:
@@ -182,4 +269,14 @@ def collate_ct_batch(samples: List[Dict]) -> Dict[str, Any]:
     if "H_t_k3" in samples[0]:
         out["H_t_k3"] = _collate_pad_H(samples, "H_t_k3", device_dtype)
         out["y_next3"] = torch.stack([s["y_next3"] for s in samples], dim=0)
+    if "a_seq" in samples[0]:
+        out["a_seq"] = torch.stack([s["a_seq"] for s in samples], dim=0)
+        out["a_seq_mask"] = torch.stack([s["a_seq_mask"] for s in samples], dim=0)
+        out["horizon_k"] = torch.stack([s["horizon_k"] for s in samples], dim=0)
+        out["y_future"] = torch.stack([s["y_future"] for s in samples], dim=0)
+        for j in range(1, 64):
+            key = f"H_t_future_{j}"
+            if key not in samples[0]:
+                break
+            out[key] = _collate_pad_H(samples, key, device_dtype)
     return out
