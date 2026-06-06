@@ -195,6 +195,25 @@ class VCIPMlflowTracker:
                     metrics[f"train/dw/{k}_mean_{win}"] = float(np.mean(buf))
         self.log_metrics(metrics, step=step)
 
+    def log_eval_tau_metrics(
+        self,
+        per_tau: Mapping[int, Mapping[str, float]],
+        *,
+        step: int = 0,
+    ) -> None:
+        """
+        Scheme 3: ``eval/tau{k}/mae_uns`` etc. so MLflow Compare aligns the same key across seeds.
+        """
+        if not self.enabled or not self._active:
+            return
+        metrics: Dict[str, float] = {}
+        for tau, vals in per_tau.items():
+            prefix = f"eval/tau{int(tau)}"
+            for key, val in vals.items():
+                if val is not None and _is_finite(float(val)):
+                    metrics[f"{prefix}/{key}"] = float(val)
+        self.log_metrics(metrics, step=int(step))
+
     def log_iql_val_step(
         self,
         step: int,

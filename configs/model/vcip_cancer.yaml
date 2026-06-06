@@ -139,7 +139,7 @@ exp:
   iql_use_dw: true
   dw_hidden_dim: 256
   dw_n_hidden: 2
-  dw_lr: 3.0e-4
+  dw_lr: 1.0e-4
   dw_lambda_flow: 5.0
   dw_lambda_kl: 0.1
   dw_flow_discount: 1.0
@@ -157,6 +157,10 @@ exp:
   iql_eval_ckpt: ""
   # Roll out τ steps: each step replans from CT state after appending (a_t, y_{t+1}); false = repeat first action (legacy)
   iql_eval_autoregressive: true
+  # eval_iql_planner.py: if non-empty, evaluate all horizons in one process / one MLflow run.
+  # Metrics are logged as eval/tau{k}/mae_uns (scheme 3 — compare same key across seeds).
+  # When null, only exp.tau is evaluated (single horizon).
+  iql_eval_tau_list: null
   # Model-based OPE A/B during IQL val:
   #   - sim:       ground-truth cancer simulator oracle (synthetic benchmark only).
   #   - predictor: learned OutcomePredictor from ct_best_encoder.pt (works on real data).
@@ -168,7 +172,7 @@ exp:
   iql_val_selection_world: predictor
   # MLflow (train_iql_planner.py); default off — no effect on training when false.
   use_mlflow: true
-  mlflow_experiment: vcip_tumor
+  mlflow_experiment: vcip_tumor_June_7
   # Where training WRITES metrics (not the browser URL). Use file: on the training machine.
   # Example: file:/home/liam/pythonProject/VCIP-ICML-main/mlruns
   # http://... is only if you run ``mlflow server`` separately; ``mlflow ui`` is for viewing only.
@@ -196,7 +200,7 @@ exp:
   ct_weight_val_diagnostics: false
   ct_align_loss: sinkhorn
   # ct_alpha: 0.1 使用EM方法后， 该参数不生效
-  ct_lr: 1e-5
+  ct_lr: 5e-5
   ct_epochs: 200
   ct_patience: 20
   ct_weight_decay: 1e-05
