@@ -17,7 +17,7 @@ conda activate vcip
 # --- configuration (edit in place) ---
 GPU=0
 GAMMA=4
-SEEDS=(10 101 1010 10101 101010)
+SEEDS=(10 10101 101010)
 EVAL_TAUS=(1 2 3 4 5 6 8 10 12 15)
 # false = val split, true = test split; eval runs once per entry (separate MLflow run each)
 EVAL_TESTS=(false true)
