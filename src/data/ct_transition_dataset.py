@@ -55,29 +55,24 @@ class CTTransitionDataset(Dataset):
     """
     One sample = one time index t with history [0..t], target Y_{t+1}.
     t runs from 1 .. length-2 so that outputs[t+1] exists.
-
-    If ``multi_k_max`` > 1, also returns longer teacher prefixes for k=2..K targets Y_{t+2}..Y_{t+K}
-    (requires length >= t + K + 1).
     """
 
     def __init__(
         self,
         data: Dict[str, np.ndarray],
-        multi_k_max: int = 1,
         include_next_prefix: bool = False,
     ):
         self.data = data
-        self.multi_k_max = int(multi_k_max)
         self.include_next_prefix = bool(include_next_prefix)
         self.index: List[Tuple[int, int]] = []
         n = data["current_treatments"].shape[0]
-        min_len = self.multi_k_max + 2
+        min_len = 3
         for i in range(n):
             active = data["active_entries"][i]
             length = int(active.sum())
             if length < min_len:
                 continue
-            for t in range(1, length - self.multi_k_max):
+            for t in range(1, length - 1):
                 self.index.append((i, t))
 
     def __len__(self) -> int:
@@ -92,12 +87,6 @@ class CTTransitionDataset(Dataset):
         out: Dict = {"H_t": H, "y_next": y_next}
         if self.include_next_prefix:
             out["H_t_next"] = _build_H_slice(self.data, i, t + 2)
-        if self.multi_k_max >= 2:
-            out["H_t_k2"] = _build_H_slice(self.data, i, t + 2)
-            out["y_next2"] = torch.tensor(self.data["outputs"][i, t + 2, :], dtype=torch.float32)
-        if self.multi_k_max >= 3:
-            out["H_t_k3"] = _build_H_slice(self.data, i, t + 3)
-            out["y_next3"] = torch.tensor(self.data["outputs"][i, t + 3, :], dtype=torch.float32)
         return out
 
 
@@ -149,10 +138,4 @@ def collate_ct_batch(samples: List[Dict]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"H_t": H_batch, "y_next": y_next}
     if "H_t_next" in samples[0]:
         out["H_t_next"] = _collate_pad_H(samples, "H_t_next", device_dtype)
-    if "H_t_k2" in samples[0]:
-        out["H_t_k2"] = _collate_pad_H(samples, "H_t_k2", device_dtype)
-        out["y_next2"] = torch.stack([s["y_next2"] for s in samples], dim=0)
-    if "H_t_k3" in samples[0]:
-        out["H_t_k3"] = _collate_pad_H(samples, "H_t_k3", device_dtype)
-        out["y_next3"] = torch.stack([s["y_next3"] for s in samples], dim=0)
     return out

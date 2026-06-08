@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Dict, List
 
 import hydra
 import numpy as np
@@ -29,6 +30,7 @@ from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_ac
 from src.models.inference_model import InferenceModel
 from src.planners.iql_planner import IQLPlanner
 from src.utils.inference_ckpt import load_inference_checkpoint
+from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import repeat_static, set_seed, to_float
 
 logging.basicConfig(level=logging.INFO)
@@ -144,6 +146,15 @@ def _extend_h_work_after_one_step(
         H["current_covariates"] = torch.cat([cc, ext], dim=1)
 
 
+def _resolve_eval_tau_list(args: DictConfig) -> List[int]:
+    raw = OmegaConf.select(args, "exp.iql_eval_tau_list", default=None)
+    if raw is not None:
+        taus = [int(t) for t in list(raw)]
+        if taus:
+            return taus
+    return [int(args.exp.tau)]
+
+
 def _resolve_iql_ckpt(args: DictConfig, original_cwd: Path) -> Path:
     explicit = OmegaConf.select(args, "exp.iql_eval_ckpt", default="")
     if explicit:
@@ -208,146 +219,168 @@ def main(args: DictConfig):
         raise FileNotFoundError(f"IQL checkpoint not found: {planner_path}. Set exp.iql_eval_ckpt or train first.")
     planner = IQLPlanner.from_checkpoint(str(planner_path), device=device)
     max_action = float(planner.cfg.max_action)
-    # tau 加载自 args.exp.tau，默认由 cancer_sim_cont.yaml（如 dataset/projection_horizon/tau）或 config.yaml（如 exp.tau）提供。
-    # 你可以在命令行用 `python runnables/eval_iql_planner.py exp.tau=8` 这样的覆盖参数，Hydra 会自动覆盖 config.yaml 和任何 defaults 里的 tau 配置。
-    tau = int(args.exp.tau)
     max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
     if max_tau <= 0:
         raise ValueError("exp.max_tau must be positive for horizon-aware IQL evaluation.")
     autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
     mean_ser, std_ser = dataset_collection.train_scaling_params
-    logger.info(
-        f"IQL eval autoregressive action rollout: {autoregressive_eval} (tau={tau}, max_tau={max_tau})"
-    )
+    tau_list = _resolve_eval_tau_list(args)
 
-    losses = []
-    losses_2 = []
-    ture_output_list = []
-    output_after_actions_list = []
-    ture_output_actions_list = []
+    mlf = VCIPMlflowTracker.from_hydra(args, stage="eval")
+    mlf.tags["eval_split"] = split_name
+    mlf.tags["eval_tau_list"] = ",".join(str(t) for t in tau_list)
+    mlf.start(args)
 
-    with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            H_t, targets = batch
-            H_t = align_h_t_static_to_history(H_t)
-            for key in H_t:
-                H_t[key] = H_t[key].to(device)
-            for key in targets:
-                targets[key] = targets[key].to(device)
+    per_tau_metrics: Dict[int, Dict[str, float]] = {}
+    try:
+        for tau in tau_list:
+            logger.info(
+                f"IQL eval autoregressive action rollout: {autoregressive_eval} "
+                f"(tau={tau}, max_tau={max_tau}, split={split_name})"
+            )
 
-            if autoregressive_eval:
-                eval_target = targets["outputs"][:, -1, :]
-                H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
-                # Previous action (simulator interval) before the first planned step: last factual treatment in prefix.
-                a_prev_sim = H_work["current_treatments"][:, -1, :].clone()
-                planned = []
-                for step in range(tau):
-                    H_work = align_h_t_static_to_history(H_work)
-                    z, _, _ = inference_model.ct_hidden_history(H_work)
-                    a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
-                    obs = _iql_augmented_state(z, eval_target, step, tau, max_tau, a_prev_tanh)
-                    po = planner.actor(obs)
-                    ma = planner.actor.max_action
-                    if isinstance(po, Distribution):
-                        a_raw = torch.clamp(ma * po.mean, -ma, ma)
+            losses = []
+            losses_2 = []
+            ture_output_list = []
+            output_after_actions_list = []
+            ture_output_actions_list = []
+
+            with torch.no_grad():
+                for i, batch in enumerate(dataloader):
+                    H_t, targets = batch
+                    H_t = align_h_t_static_to_history(H_t)
+                    for key in H_t:
+                        H_t[key] = H_t[key].to(device)
+                    for key in targets:
+                        targets[key] = targets[key].to(device)
+
+                    if autoregressive_eval:
+                        eval_target = targets["outputs"][:, -1, :]
+                        H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
+                        a_prev_sim = H_work["current_treatments"][:, -1, :].clone()
+                        planned = []
+                        for step in range(tau):
+                            H_work = align_h_t_static_to_history(H_work)
+                            z, _, _ = inference_model.ct_hidden_history(H_work)
+                            a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
+                            obs = _iql_augmented_state(z, eval_target, step, tau, max_tau, a_prev_tanh)
+                            po = planner.actor(obs)
+                            ma = planner.actor.max_action
+                            if isinstance(po, Distribution):
+                                a_raw = torch.clamp(ma * po.mean, -ma, ma)
+                            else:
+                                a_raw = torch.clamp(po * ma, -ma, ma)
+                            a_sim = _policy_to_sim_interval_torch(a_raw, max_action)
+                            planned.append(a_sim)
+                            y_np = fold.simulate_output_after_actions(
+                                H_work,
+                                a_sim.unsqueeze(1),
+                                dataset_collection.train_scaling_params,
+                            )
+                            y_norm = torch.as_tensor(y_np, device=device, dtype=torch.float32)
+                            _extend_h_work_after_one_step(
+                                H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
+                            )
+                            a_prev_sim = a_sim
+                        a_seq = torch.stack(planned, dim=1).contiguous()
                     else:
-                        a_raw = torch.clamp(po * ma, -ma, ma)
-                    a_sim = _policy_to_sim_interval_torch(a_raw, max_action)
-                    planned.append(a_sim)
-                    y_np = fold.simulate_output_after_actions(
-                        H_work,
-                        a_sim.unsqueeze(1),
-                        dataset_collection.train_scaling_params,
+                        z, _, _ = inference_model.ct_hidden_history(H_t)
+                        z_np = z.detach().cpu().numpy()
+                        eval_target_np = targets["outputs"][:, -1, :].detach().cpu().numpy()
+                        a_prev_raw = H_t["current_treatments"][:, -1, :].detach().cpu().numpy()
+                        a_prev_feat = dataset_actions_to_tanh_policy_space(a_prev_raw, max_action)
+                        bsz = z_np.shape[0]
+                        delta_scalar = float(tau - 0) / max_tau
+                        delta_vec = np.array([delta_scalar], dtype=np.float32)
+                        a_rows = []
+                        for b in range(bsz):
+                            obs_b = np.concatenate([z_np[b], eval_target_np[b], delta_vec, a_prev_feat[b]], axis=0)
+                            a_rows.append(planner.act(obs_b))
+                        a_raw = np.stack(a_rows, axis=0)
+                        a_sim = _actions_to_sim_interval(a_raw, max_action)
+                        a_seq = torch.tensor(a_sim, device=device, dtype=torch.float32).unsqueeze(1).expand(-1, tau, -1).contiguous()
+
+                    output_after_actions = fold.simulate_output_after_actions(
+                        H_t, a_seq, dataset_collection.train_scaling_params
                     )
-                    y_norm = torch.as_tensor(y_np, device=device, dtype=torch.float32)
-                    _extend_h_work_after_one_step(
-                        H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
+                    ture_output = targets["outputs"][:, -1, :].detach().cpu().numpy()
+                    loss = np.sqrt(((output_after_actions - ture_output) ** 2).mean())
+                    losses.append(loss)
+
+                    true_actions = targets["current_treatments"]
+                    ture_output_actions = fold.simulate_output_after_actions(
+                        H_t, true_actions, dataset_collection.train_scaling_params
                     )
-                    a_prev_sim = a_sim
-                a_seq = torch.stack(planned, dim=1).contiguous()
-            else:
-                z, _, _ = inference_model.ct_hidden_history(H_t)
-                z_np = z.detach().cpu().numpy()
-                eval_target_np = targets["outputs"][:, -1, :].detach().cpu().numpy()
-                a_prev_raw = H_t["current_treatments"][:, -1, :].detach().cpu().numpy()
-                a_prev_feat = dataset_actions_to_tanh_policy_space(a_prev_raw, max_action)
-                bsz = z_np.shape[0]
-                delta_scalar = float(tau - 0) / max_tau
-                delta_vec = np.array([delta_scalar], dtype=np.float32)
-                a_rows = []
-                for b in range(bsz):
-                    obs_b = np.concatenate([z_np[b], eval_target_np[b], delta_vec, a_prev_feat[b]], axis=0)
-                    a_rows.append(planner.act(obs_b))
-                a_raw = np.stack(a_rows, axis=0)
-                a_sim = _actions_to_sim_interval(a_raw, max_action)
-                a_seq = torch.tensor(a_sim, device=device, dtype=torch.float32).unsqueeze(1).expand(-1, tau, -1).contiguous()
+                    loss_2 = np.sqrt(((ture_output_actions - ture_output) ** 2).mean())
+                    losses_2.append(loss_2)
 
-            output_after_actions = fold.simulate_output_after_actions(
-                H_t, a_seq, dataset_collection.train_scaling_params
+                    ture_output_list.append(ture_output)
+                    output_after_actions_list.append(output_after_actions)
+                    ture_output_actions_list.append(ture_output_actions)
+
+                    logger.info(f"Batch {i} RMSE (IQL plan): {loss:.6f}, RMSE (factual actions): {loss_2:.6f}")
+
+            ture_output_list = np.concatenate(ture_output_list, axis=0)
+            output_after_actions_list = np.concatenate(output_after_actions_list, axis=0)
+            ture_output_actions_list = np.concatenate(ture_output_actions_list, axis=0)
+
+            rmse_norm = float(np.sqrt(((output_after_actions_list - ture_output_list) ** 2).mean()))
+            rmse_factual_norm = float(np.sqrt(((ture_output_actions_list - ture_output_list) ** 2).mean()))
+
+            iql_y_norm = output_after_actions_list.reshape(-1)
+            true_y_norm = ture_output_list.reshape(-1)
+            iql_y_uns = _unscaled_cancer_volume_np(output_after_actions_list, mean_ser, std_ser).reshape(-1)
+            true_y_uns = _unscaled_cancer_volume_np(ture_output_list, mean_ser, std_ser).reshape(-1)
+
+            mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
+            mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
+            rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
+
+            logger.info("--- Aggregate (same protocol as optimize_interventions_onetime) ---")
+            logger.info(f"Split: {split_name}")
+            logger.info(f"Mean per-batch RMSE (IQL): {float(np.mean(losses)):.6f}")
+            logger.info(f"Mean per-batch RMSE (factual traj): {float(np.mean(losses_2)):.6f}")
+            logger.info(f"Global RMSE on stacked batches (normalized space): {rmse_norm:.6f}")
+            logger.info(f"Global RMSE × std (cancer volume scale, VCIP-style): {rmse_norm * std:.6f}")
+            logger.info(f"Factual global RMSE × std: {rmse_factual_norm * std:.6f}")
+
+            logger.info("--- t+tau tumor volume (IQL planned actions vs target outputs[:, -1]) ---")
+            logger.info(
+                f"IQL pred normalized:   mean={float(np.mean(iql_y_norm)):.6f} std={float(np.std(iql_y_norm)):.6f} "
+                f"min={float(np.min(iql_y_norm)):.6f} max={float(np.max(iql_y_norm)):.6f}"
             )
-            ture_output = targets["outputs"][:, -1, :].detach().cpu().numpy()
-            loss = np.sqrt(((output_after_actions - ture_output) ** 2).mean())
-            losses.append(loss)
-
-            true_actions = targets["current_treatments"]
-            ture_output_actions = fold.simulate_output_after_actions(
-                H_t, true_actions, dataset_collection.train_scaling_params
+            logger.info(
+                f"Target normalized:       mean={float(np.mean(true_y_norm)):.6f} std={float(np.std(true_y_norm)):.6f} "
+                f"min={float(np.min(true_y_norm)):.6f} max={float(np.max(true_y_norm)):.6f}"
             )
-            loss_2 = np.sqrt(((ture_output_actions - ture_output) ** 2).mean())
-            losses_2.append(loss_2)
+            logger.info(
+                f"IQL pred unscaled:     mean={float(np.mean(iql_y_uns)):.6f} std={float(np.std(iql_y_uns)):.6f} "
+                f"min={float(np.min(iql_y_uns)):.6f} max={float(np.max(iql_y_uns)):.6f}"
+            )
+            logger.info(
+                f"Target unscaled:       mean={float(np.mean(true_y_uns)):.6f} std={float(np.std(true_y_uns)):.6f} "
+                f"min={float(np.min(true_y_uns)):.6f} max={float(np.max(true_y_uns)):.6f}"
+            )
+            logger.info(
+                f"Train scaling cancer_volume: mean={float(mean_ser['cancer_volume']):.6f} std={float(std_ser['cancer_volume']):.6f}"
+            )
+            logger.info(
+                f"MAE normalized: {mae_norm:.6f} | MAE unscaled: {mae_uns:.6f} | RMSE unscaled: {rmse_uns:.6f}"
+            )
 
-            ture_output_list.append(ture_output)
-            output_after_actions_list.append(output_after_actions)
-            ture_output_actions_list.append(ture_output_actions)
+            per_tau_metrics[tau] = {
+                "mae_norm": mae_norm,
+                "mae_uns": mae_uns,
+                "rmse_uns": rmse_uns,
+                "rmse_norm": rmse_norm,
+                "rmse_factual_norm": rmse_factual_norm,
+                "mean_batch_rmse_iql": float(np.mean(losses)),
+                "mean_batch_rmse_factual": float(np.mean(losses_2)),
+            }
 
-            logger.info(f"Batch {i} RMSE (IQL plan): {loss:.6f}, RMSE (factual actions): {loss_2:.6f}")
-
-    ture_output_list = np.concatenate(ture_output_list, axis=0)
-    output_after_actions_list = np.concatenate(output_after_actions_list, axis=0)
-    ture_output_actions_list = np.concatenate(ture_output_actions_list, axis=0)
-
-    rmse_norm = float(np.sqrt(((output_after_actions_list - ture_output_list) ** 2).mean()))
-    rmse_factual_norm = float(np.sqrt(((ture_output_actions_list - ture_output_list) ** 2).mean()))
-
-    # t+tau tumor volume under IQL plan vs ground truth (normalized = train scaling space)
-    iql_y_norm = output_after_actions_list.reshape(-1)
-    true_y_norm = ture_output_list.reshape(-1)
-    iql_y_uns = _unscaled_cancer_volume_np(output_after_actions_list, mean_ser, std_ser).reshape(-1)
-    true_y_uns = _unscaled_cancer_volume_np(ture_output_list, mean_ser, std_ser).reshape(-1)
-
-    mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
-    mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
-    rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
-
-    logger.info("--- Aggregate (same protocol as optimize_interventions_onetime) ---")
-    logger.info(f"Split: {split_name}")
-    logger.info(f"Mean per-batch RMSE (IQL): {float(np.mean(losses)):.6f}")
-    logger.info(f"Mean per-batch RMSE (factual traj): {float(np.mean(losses_2)):.6f}")
-    logger.info(f"Global RMSE on stacked batches (normalized space): {rmse_norm:.6f}")
-    logger.info(f"Global RMSE × std (cancer volume scale, VCIP-style): {rmse_norm * std:.6f}")
-    logger.info(f"Factual global RMSE × std: {rmse_factual_norm * std:.6f}")
-
-    logger.info("--- t+tau tumor volume (IQL planned actions vs target outputs[:, -1]) ---")
-    logger.info(
-        f"IQL pred normalized:   mean={float(np.mean(iql_y_norm)):.6f} std={float(np.std(iql_y_norm)):.6f} "
-        f"min={float(np.min(iql_y_norm)):.6f} max={float(np.max(iql_y_norm)):.6f}"
-    )
-    logger.info(
-        f"Target normalized:       mean={float(np.mean(true_y_norm)):.6f} std={float(np.std(true_y_norm)):.6f} "
-        f"min={float(np.min(true_y_norm)):.6f} max={float(np.max(true_y_norm)):.6f}"
-    )
-    logger.info(
-        f"IQL pred unscaled:     mean={float(np.mean(iql_y_uns)):.6f} std={float(np.std(iql_y_uns)):.6f} "
-        f"min={float(np.min(iql_y_uns)):.6f} max={float(np.max(iql_y_uns)):.6f}"
-    )
-    logger.info(
-        f"Target unscaled:       mean={float(np.mean(true_y_uns)):.6f} std={float(np.std(true_y_uns)):.6f} "
-        f"min={float(np.min(true_y_uns)):.6f} max={float(np.max(true_y_uns)):.6f}"
-    )
-    logger.info(
-        f"Train scaling cancer_volume: mean={float(mean_ser['cancer_volume']):.6f} std={float(std_ser['cancer_volume']):.6f}"
-    )
-    logger.info(f"MAE normalized: {mae_norm:.6f} | MAE unscaled: {mae_uns:.6f} | RMSE unscaled: {rmse_uns:.6f}")
+        mlf.log_eval_tau_metrics(per_tau_metrics, step=0)
+    finally:
+        mlf.finish(final_step=0)
 
 
 if __name__ == "__main__":

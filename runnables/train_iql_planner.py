@@ -20,6 +20,7 @@ from src.evaluation.iql_planner_eval import aggregate_iql_planner_metrics
 from src.models.inference_model import InferenceModel
 from src.planners.iql_planner import IQLPlanner, IQLPlannerConfig, TransitionReplayBuffer
 from src.utils.inference_ckpt import load_inference_checkpoint
+from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import repeat_static, set_seed, to_float
 
 logging.basicConfig(level=logging.INFO)
@@ -249,189 +250,244 @@ def main(args: DictConfig):
     loss_keys = ("actor_loss", "q_loss", "value_loss")
     loss_buf = {k: deque(maxlen=max(1, log_window)) for k in loss_keys}
 
-    for step in range(1, iql_updates + 1):
-        batch = replay.sample(iql_batch_size)
-        logs = planner.train_step(batch)
-        for k in loss_keys:
-            loss_buf[k].append(logs[k])
-        if step % 200 == 0 or step == 1:
-            parts = [f"[{step}/{iql_updates}]"]
-            for k in loss_keys:
-                last = logs[k]
-                mean = float(np.mean(loss_buf[k]))
-                parts.append(f"{k}={last:.4f} (mean_{min(step, log_window)}={mean:.4f})")
-            logger.info(", ".join(parts))
+    mlf = VCIPMlflowTracker.from_hydra(args, stage="iql")
+    mlf.start(args)
 
-        if _should_run_iql_val(step, iql_updates, iql_val_every):
-            with _isolated_rng(val_seed):
-                metrics = aggregate_iql_planner_metrics(
-                    planner,
-                    inference_model,
-                    dataset_collection,
-                    dataset_collection.val_f,
-                    args,
-                    device=device,
-                    tau=eval_tau,
-                    max_tau=max_tau,
-                    autoregressive_eval=autoreg,
-                    val_batch_size=val_bs,
-                    log_batches=False,
-                    worlds=val_worlds,
-                    debug_panel=debug_panel_enabled,
-                )
-
-            per_world = metrics.get("per_world", {val_worlds[0]: metrics})
-
-            trace_entry: Dict[str, Any] = {"step": step}
-            improved_worlds: List[str] = []
-            for w in val_worlds:
-                m_w = float(per_world[w][val_metric_key])
-                trace_entry[w] = {
-                    "mae_norm": float(per_world[w]["mae_norm"]),
-                    "mae_uns": float(per_world[w]["mae_uns"]),
-                    "rmse_norm": float(per_world[w]["rmse_norm"]),
-                }
-                if m_w < best_per_world[w]["metric"]:
-                    best_per_world[w]["metric"] = m_w
-                    best_per_world[w]["state"] = _state_dict_to_cpu(planner.state_dict())
-                    best_per_world[w]["step"] = step
-                    improved_worlds.append(w)
-            val_trace.append(trace_entry)
-
-            parts = [f"[val step {step}/{iql_updates}]"]
-            for w in val_worlds:
-                m_w = per_world[w][val_metric_key]
-                tag = "*" if w in improved_worlds else ""
-                parts.append(
-                    f"{w}:{val_metric_key}={m_w:.6f}"
-                    f"(mae_norm={per_world[w]['mae_norm']:.6f}){tag}"
-                )
-            logger.info(" ".join(parts))
-            if debug_panel_enabled and "debug_panel" in metrics:
-                panel = metrics["debug_panel"]
-                panel["step"] = int(step)
-                panel["val_metric"] = val_metric_key
-                panel["worlds"] = list(val_worlds)
-                panel["selection_world"] = selection_world
-                action_flag = True
-                for w in val_worlds:
-                    world_panel = panel.get("per_world", {}).setdefault(w, {})
-                    action_info = world_panel.get("action_sequence", {})
-                    fingerprint = action_info.get("fingerprint")
-                    prev_fp = prev_action_fingerprints.get(w)
-                    changed_vs_prev = bool(fingerprint is not None and (prev_fp is None or fingerprint != prev_fp))
-                    world_panel["action_sequence_changed_vs_prev"] = changed_vs_prev
-                    if fingerprint is not None:
-                        prev_action_fingerprints[w] = str(fingerprint)
-                    action_flag = action_flag and changed_vs_prev
-                panel["summary_flags"]["action_sequence_changes"] = bool(action_flag)
-                with open(debug_panel_path, "a") as f:
-                    f.write(json.dumps(panel) + "\n")
-
-    # -------------------------------------------------------------------
-    # Cross-world diagnostics: how well does predictor-ranking track sim-ranking?
-    # -------------------------------------------------------------------
-    if len(val_worlds) >= 2 and len(val_trace) >= 2:
-        logger.info("=" * 80)
-        logger.info("Cross-world checkpoint-ranking diagnostics "
-                    f"(#val_points={len(val_trace)}, metric={val_metric_key})")
+    def _crossworld_mlflow_metrics() -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        if len(val_worlds) < 2 or len(val_trace) < 2:
+            for w, bw in best_per_world.items():
+                if bw["step"] >= 0:
+                    out[f"best/{w}/{val_metric_key}"] = float(bw["metric"])
+                    out[f"best/{w}/step"] = float(bw["step"])
+            return out
         series: Dict[str, List[float]] = {
             w: [float(entry[w][val_metric_key]) for entry in val_trace] for w in val_worlds
         }
-        steps_list = [int(entry["step"]) for entry in val_trace]
-
         for i in range(len(val_worlds)):
             for j in range(i + 1, len(val_worlds)):
                 w_a, w_b = val_worlds[i], val_worlds[j]
                 rho = _spearman_rho(series[w_a], series[w_b])
-                rho_str = f"{rho:.4f}" if rho is not None else "NaN"
-                logger.info(f"  Spearman rho({w_a}, {w_b}) = {rho_str}")
-                for K in (1, 3, 5):
-                    ov = _top_k_overlap(series[w_a], series[w_b], K)
-                    ov_str = f"{ov:.3f}" if ov is not None else "NaN"
-                    logger.info(f"  Top-{K} overlap({w_a}, {w_b}) = {ov_str}")
-
-        # Regret: picking by world w_sel, measured against w_ref
-        for w_ref in val_worlds:
-            ref_series = series[w_ref]
-            best_ref_idx = int(np.argmin(ref_series))
-            best_ref_val = ref_series[best_ref_idx]
-            for w_sel in val_worlds:
-                if w_sel == w_ref:
-                    continue
-                picked_idx = int(np.argmin(series[w_sel]))
-                picked_step = steps_list[picked_idx]
-                picked_ref_val = ref_series[picked_idx]
-                regret = picked_ref_val - best_ref_val
-                logger.info(
-                    f"  Regret: pick-by-{w_sel} vs best-by-{w_ref} "
-                    f"(ref={w_ref}:{val_metric_key}) = {regret:+.6f} "
-                    f"(picked step {picked_step}: {picked_ref_val:.6f}; "
-                    f"best step {steps_list[best_ref_idx]}: {best_ref_val:.6f})"
-                )
-        logger.info("=" * 80)
-
-    # -------------------------------------------------------------------
-    # Save checkpoints + val trace.
-    # -------------------------------------------------------------------
-    logger.info(f"IQL planner checkpoints will be saved under: {model_dir}")
-
-    any_val_improved = any(bw["state"] is not None for bw in best_per_world.values())
-
-    if iql_val_every > 0 and any_val_improved:
-        # Primary checkpoint = checkpoint selected by the configured selection world.
-        sel = best_per_world[selection_world]
-        if sel["state"] is None:
-            logger.warning(
-                f"No val improvement recorded for selection_world={selection_world!r}; "
-                "falling back to last-step weights for the primary checkpoint."
-            )
-            torch.save(_state_dict_to_cpu(planner.state_dict()), ckpt_path)
-        else:
-            torch.save(sel["state"], ckpt_path)
-            logger.info(
-                f"Saved BEST IQL planner (selection_world={selection_world!r}) to {ckpt_path} "
-                f"({val_metric_key}={sel['metric']:.6f} at step {sel['step']})"
-            )
-
-        # Per-world best checkpoints (for offline A/B comparison; do not overwrite primary).
+                if rho is not None:
+                    out[f"crossworld/spearman_{w_a}_{w_b}"] = float(rho)
+                for k in (1, 3, 5):
+                    ov = _top_k_overlap(series[w_a], series[w_b], k)
+                    if ov is not None:
+                        out[f"crossworld/top{k}_overlap_{w_a}_{w_b}"] = float(ov)
         for w, bw in best_per_world.items():
-            if bw["state"] is None:
-                continue
-            per_path = model_dir / f"iql_planner_best_{w}.pt"
-            torch.save(bw["state"], per_path)
+            if bw["step"] >= 0:
+                out[f"best/{w}/{val_metric_key}"] = float(bw["metric"])
+                out[f"best/{w}/step"] = float(bw["step"])
+        return out
+
+    try:
+        for step in range(1, iql_updates + 1):
+            batch = replay.sample(iql_batch_size)
+            logs = planner.train_step(batch)
+            for k in loss_keys:
+                loss_buf[k].append(logs[k])
+            if step % 200 == 0 or step == 1:
+                parts = [f"[{step}/{iql_updates}]"]
+                for k in loss_keys:
+                    last = logs[k]
+                    mean = float(np.mean(loss_buf[k]))
+                    parts.append(f"{k}={last:.4f} (mean_{min(step, log_window)}={mean:.4f})")
+                logger.info(", ".join(parts))
+                mlf.log_iql_training_step(step, logs, loss_keys, loss_buf, log_window)
+
+            if _should_run_iql_val(step, iql_updates, iql_val_every):
+                with _isolated_rng(val_seed):
+                    metrics = aggregate_iql_planner_metrics(
+                        planner,
+                        inference_model,
+                        dataset_collection,
+                        dataset_collection.val_f,
+                        args,
+                        device=device,
+                        tau=eval_tau,
+                        max_tau=max_tau,
+                        autoregressive_eval=autoreg,
+                        val_batch_size=val_bs,
+                        log_batches=False,
+                        worlds=val_worlds,
+                        debug_panel=debug_panel_enabled,
+                    )
+
+                per_world = metrics.get("per_world", {val_worlds[0]: metrics})
+
+                trace_entry: Dict[str, Any] = {"step": step}
+                improved_worlds: List[str] = []
+                for w in val_worlds:
+                    m_w = float(per_world[w][val_metric_key])
+                    trace_entry[w] = {
+                        "mae_norm": float(per_world[w]["mae_norm"]),
+                        "mae_uns": float(per_world[w]["mae_uns"]),
+                        "rmse_norm": float(per_world[w]["rmse_norm"]),
+                    }
+                    if m_w < best_per_world[w]["metric"]:
+                        best_per_world[w]["metric"] = m_w
+                        best_per_world[w]["state"] = _state_dict_to_cpu(planner.state_dict())
+                        best_per_world[w]["step"] = step
+                        improved_worlds.append(w)
+                val_trace.append(trace_entry)
+
+                parts = [f"[val step {step}/{iql_updates}]"]
+                for w in val_worlds:
+                    m_w = per_world[w][val_metric_key]
+                    tag = "*" if w in improved_worlds else ""
+                    parts.append(
+                        f"{w}:{val_metric_key}={m_w:.6f}"
+                        f"(mae_norm={per_world[w]['mae_norm']:.6f}){tag}"
+                    )
+                logger.info(" ".join(parts))
+                mlf.log_iql_val_step(
+                    step,
+                    per_world,
+                    val_worlds,
+                    val_metric_key,
+                    improved_worlds=improved_worlds,
+                )
+                if debug_panel_enabled and "debug_panel" in metrics:
+                    panel = metrics["debug_panel"]
+                    panel["step"] = int(step)
+                    panel["val_metric"] = val_metric_key
+                    panel["worlds"] = list(val_worlds)
+                    panel["selection_world"] = selection_world
+                    action_flag = True
+                    for w in val_worlds:
+                        world_panel = panel.get("per_world", {}).setdefault(w, {})
+                        action_info = world_panel.get("action_sequence", {})
+                        fingerprint = action_info.get("fingerprint")
+                        prev_fp = prev_action_fingerprints.get(w)
+                        changed_vs_prev = bool(fingerprint is not None and (prev_fp is None or fingerprint != prev_fp))
+                        world_panel["action_sequence_changed_vs_prev"] = changed_vs_prev
+                        if fingerprint is not None:
+                            prev_action_fingerprints[w] = str(fingerprint)
+                        action_flag = action_flag and changed_vs_prev
+                    panel["summary_flags"]["action_sequence_changes"] = bool(action_flag)
+                    with open(debug_panel_path, "a") as f:
+                        f.write(json.dumps(panel) + "\n")
+
+        # -------------------------------------------------------------------
+        # Cross-world diagnostics: how well does predictor-ranking track sim-ranking?
+        # -------------------------------------------------------------------
+        if len(val_worlds) >= 2 and len(val_trace) >= 2:
+            logger.info("=" * 80)
+            logger.info("Cross-world checkpoint-ranking diagnostics "
+                        f"(#val_points={len(val_trace)}, metric={val_metric_key})")
+            series: Dict[str, List[float]] = {
+                w: [float(entry[w][val_metric_key]) for entry in val_trace] for w in val_worlds
+            }
+            steps_list = [int(entry["step"]) for entry in val_trace]
+
+            for i in range(len(val_worlds)):
+                for j in range(i + 1, len(val_worlds)):
+                    w_a, w_b = val_worlds[i], val_worlds[j]
+                    rho = _spearman_rho(series[w_a], series[w_b])
+                    rho_str = f"{rho:.4f}" if rho is not None else "NaN"
+                    logger.info(f"  Spearman rho({w_a}, {w_b}) = {rho_str}")
+                    for K in (1, 3, 5):
+                        ov = _top_k_overlap(series[w_a], series[w_b], K)
+                        ov_str = f"{ov:.3f}" if ov is not None else "NaN"
+                        logger.info(f"  Top-{K} overlap({w_a}, {w_b}) = {ov_str}")
+
+            # Regret: picking by world w_sel, measured against w_ref
+            for w_ref in val_worlds:
+                ref_series = series[w_ref]
+                best_ref_idx = int(np.argmin(ref_series))
+                best_ref_val = ref_series[best_ref_idx]
+                for w_sel in val_worlds:
+                    if w_sel == w_ref:
+                        continue
+                    picked_idx = int(np.argmin(series[w_sel]))
+                    picked_step = steps_list[picked_idx]
+                    picked_ref_val = ref_series[picked_idx]
+                    regret = picked_ref_val - best_ref_val
+                    logger.info(
+                        f"  Regret: pick-by-{w_sel} vs best-by-{w_ref} "
+                        f"(ref={w_ref}:{val_metric_key}) = {regret:+.6f} "
+                        f"(picked step {picked_step}: {picked_ref_val:.6f}; "
+                        f"best step {steps_list[best_ref_idx]}: {best_ref_val:.6f})"
+                    )
+            logger.info("=" * 80)
+
+        # -------------------------------------------------------------------
+        # Save checkpoints + val trace.
+        # -------------------------------------------------------------------
+        logger.info(f"IQL planner checkpoints will be saved under: {model_dir}")
+
+        any_val_improved = any(bw["state"] is not None for bw in best_per_world.values())
+
+        if iql_val_every > 0 and any_val_improved:
+            # Primary checkpoint = checkpoint selected by the configured selection world.
+            sel = best_per_world[selection_world]
+            if sel["state"] is None:
+                logger.warning(
+                    f"No val improvement recorded for selection_world={selection_world!r}; "
+                    "falling back to last-step weights for the primary checkpoint."
+                )
+                torch.save(_state_dict_to_cpu(planner.state_dict()), ckpt_path)
+            else:
+                torch.save(sel["state"], ckpt_path)
+                logger.info(
+                    f"Saved BEST IQL planner (selection_world={selection_world!r}) to {ckpt_path} "
+                    f"({val_metric_key}={sel['metric']:.6f} at step {sel['step']})"
+                )
+
+            # Per-world best checkpoints (for offline A/B comparison; do not overwrite primary).
+            for w, bw in best_per_world.items():
+                if bw["state"] is None:
+                    continue
+                per_path = model_dir / f"iql_planner_best_{w}.pt"
+                torch.save(bw["state"], per_path)
+                logger.info(
+                    f"Saved per-world BEST IQL planner [{w}] to {per_path} "
+                    f"({val_metric_key}={bw['metric']:.6f} at step {bw['step']})"
+                )
+
+            if save_last_ckpt:
+                torch.save(_state_dict_to_cpu(planner.state_dict()), last_path)
+                logger.info(f"Saved LAST-step IQL planner to {last_path}")
+        else:
+            torch.save(_state_dict_to_cpu(planner.state_dict()), ckpt_path)
             logger.info(
-                f"Saved per-world BEST IQL planner [{w}] to {per_path} "
-                f"({val_metric_key}={bw['metric']:.6f} at step {bw['step']})"
+                f"Saved IQL planner to {ckpt_path} "
+                "(periodic val disabled or no val improvement; last-step weights)"
             )
 
-        if save_last_ckpt:
-            torch.save(_state_dict_to_cpu(planner.state_dict()), last_path)
-            logger.info(f"Saved LAST-step IQL planner to {last_path}")
-    else:
-        torch.save(_state_dict_to_cpu(planner.state_dict()), ckpt_path)
-        logger.info(
-            f"Saved IQL planner to {ckpt_path} "
-            "(periodic val disabled or no val improvement; last-step weights)"
-        )
+        if val_trace:
+            trace_payload = {
+                "val_metric": val_metric_key,
+                "worlds": list(val_worlds),
+                "selection_world": selection_world,
+                "tau": eval_tau,
+                "max_tau": max_tau,
+                "val_seed": val_seed,
+                "history": val_trace,
+                "best_per_world": {
+                    w: {"metric": bw["metric"], "step": bw["step"]}
+                    for w, bw in best_per_world.items()
+                },
+            }
+            with open(trace_path, "w") as f:
+                json.dump(trace_payload, f, indent=2)
+            logger.info(f"Saved val trace to {trace_path}")
 
-    if val_trace:
-        trace_payload = {
-            "val_metric": val_metric_key,
-            "worlds": list(val_worlds),
-            "selection_world": selection_world,
-            "tau": eval_tau,
-            "max_tau": max_tau,
-            "val_seed": val_seed,
-            "history": val_trace,
-            "best_per_world": {
-                w: {"metric": bw["metric"], "step": bw["step"]}
-                for w, bw in best_per_world.items()
-            },
-        }
-        with open(trace_path, "w") as f:
-            json.dump(trace_payload, f, indent=2)
-        logger.info(f"Saved val trace to {trace_path}")
+    finally:
+        artifact_paths = [
+            p
+            for p in (
+                ckpt_path,
+                last_path if save_last_ckpt and iql_val_every > 0 else None,
+                trace_path if val_trace else None,
+            )
+            if p is not None and Path(p).is_file()
+        ]
+        mlf.finish(
+            artifact_paths=artifact_paths,
+            final_metrics=_crossworld_mlflow_metrics(),
+            final_step=iql_updates,
+        )
 
 
 if __name__ == "__main__":

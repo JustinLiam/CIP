@@ -4,16 +4,14 @@
 # Sweeps (edit arrays below; defaults match configs/model/vcip.yaml):
 #   exp.ct_lr                      - encoder + outcome-predictor LR
 #   exp.ct_w_lr                    - WeightNet LR (see vcip.yaml; often >= ct_lr)
-#   exp.ct_multi_k_max             - multi-horizon depth {1, 2, 3}
-#   exp.ct_multi_eta               - geometric horizon weights
 #   exp.ct_es_metric               - early-stop metric: l1 | weighted | mae_uw
 #   exp.ct_anchor_weight           - Plan-A anchor blend vs WeightNet MSE
 #   exp.ct_dyn_hidden              - width of latent dynamics g(z,a); unused if dyn loss off
 #   exp.ct_dyn_consistency_weight  - latent dynamics regularizer (0 = off)
 #
-# summary.csv schema (20 columns):
+# summary.csv schema (18 columns):
 #   combo_id, seed,
-#   ct_lr, ct_w_lr, ct_multi_k_max, ct_multi_eta, ct_es_metric, ct_anchor_weight,
+#   ct_lr, ct_w_lr, ct_es_metric, ct_anchor_weight,
 #   ct_dyn_hidden, ct_dyn_con_w,
 #   ct_val_L1w, ct_val_L1anc, ct_val_MAE_uw_norm, ct_val_MAE_uw_uns,
 #   ct_val_align, ct_best_epoch,
@@ -84,8 +82,6 @@ echo "[worker ${GRID_WORKER_ID}/${GRID_NUM_WORKERS}] gamma=${gamma} gpu=${gpu}"
 CT_LR_LIST=("1e-4" "5e-4" "1e-3")
 # ct_w_lr default: 1e-2; comments suggest trying 5e-3–1e-2 when ct_k_inner>1
 CT_W_LR_LIST=("5e-3" "1e-2" "3e-2")
-CT_MULTI_K_MAX_LIST=("1" "2" "3")
-CT_MULTI_ETA_LIST=("0.3" "0.5" "0.7")
 CT_ANCHOR_WEIGHT_LIST=("0.3" "0.5" "0.7")
 CT_DYN_HIDDEN_LIST=("64" "128")
 # ct_dyn_consistency_weight default 0.0; yaml suggests {1e-2, 5e-2, 1e-1} when on
@@ -109,7 +105,7 @@ summary_csv="${grid_root}/summary.csv"
 summary_lock="${grid_root}/.summary.lock"
 
 # Authoritative header (keep in sync with run_combo_seed append / error rows).
-EXPECTED_HEADER="combo_id,seed,ct_lr,ct_w_lr,ct_multi_k_max,ct_multi_eta,ct_es_metric,ct_anchor_weight,ct_dyn_hidden,ct_dyn_con_w,ct_val_L1w,ct_val_L1anc,ct_val_MAE_uw_norm,ct_val_MAE_uw_uns,ct_val_align,ct_best_epoch,iql_best_val_mae_uns,iql_best_step,mae_uns_eval_split,eval_split"
+EXPECTED_HEADER="combo_id,seed,ct_lr,ct_w_lr,ct_es_metric,ct_anchor_weight,ct_dyn_hidden,ct_dyn_con_w,ct_val_L1w,ct_val_L1anc,ct_val_MAE_uw_norm,ct_val_MAE_uw_uns,ct_val_align,ct_best_epoch,iql_best_val_mae_uns,iql_best_step,mae_uns_eval_split,eval_split"
 with_lock() {
   ( flock -x 9; "$@" ) 9> "${summary_lock}"
 }
@@ -202,8 +198,8 @@ PY
 
 
 run_combo_seed() {
-  local lr="$1" w_lr="$2" kmax="$3" eta="$4" esm="$5" aw="$6" dyn_h="$7" dyn_cw="$8" seed="$9"
-  local combo_id="lr-${lr}_wlr-${w_lr}_k-${kmax}_eta-${eta}_esm-${esm}_aw-${aw}_dh-${dyn_h}_dcw-${dyn_cw}"
+  local lr="$1" w_lr="$2" esm="$3" aw="$4" dyn_h="$5" dyn_cw="$6" seed="$7"
+  local combo_id="lr-${lr}_wlr-${w_lr}_esm-${esm}_aw-${aw}_dh-${dyn_h}_dcw-${dyn_cw}"
   local tag="${combo_id}__seed_${seed}"
   local log_file="${grid_root}/logs/${tag}.log"
   local ct_work_dir="${grid_root}/ct_ckpts_work/${tag}"
@@ -234,8 +230,6 @@ run_combo_seed() {
     exp.seed="${seed}" dataset.coeff="${gamma}" \
     exp.ct_lr="${lr}" \
     exp.ct_w_lr="${w_lr}" \
-    exp.ct_multi_k_max="${kmax}" \
-    exp.ct_multi_eta="${eta}" \
     exp.ct_es_metric="${esm}" \
     exp.ct_anchor_weight="${aw}" \
     exp.ct_dyn_hidden="${dyn_h}" \
@@ -248,7 +242,7 @@ run_combo_seed() {
 
   if [[ ! -f "${ct_ckpt_src}" ]]; then
     echo "ERROR: CT ckpt missing for ${tag} at ${ct_ckpt_src}" >&2
-    with_lock bash -c "echo '${combo_id},${seed},${lr},${w_lr},${kmax},${eta},${esm},${aw},${dyn_h},${dyn_cw},NA,NA,NA,NA,NA,NA,NA,NA,NA,${TEST_SPLIT}' >> '${summary_csv}'"
+    with_lock bash -c "echo '${combo_id},${seed},${lr},${w_lr},${esm},${aw},${dyn_h},${dyn_cw},NA,NA,NA,NA,NA,NA,NA,NA,NA,${TEST_SPLIT}' >> '${summary_csv}'"
     return 0
   fi
   cp "${ct_ckpt_src}" "${ct_ckpt_grid}"
@@ -281,7 +275,7 @@ run_combo_seed() {
 
     if [[ ! -f "${iql_ckpt_src}" ]]; then
       echo "ERROR: IQL ckpt missing for ${tag} at ${iql_ckpt_src}" >&2
-      with_lock bash -c "echo '${combo_id},${seed},${lr},${w_lr},${kmax},${eta},${esm},${aw},${dyn_h},${dyn_cw},${ct_l1w},${ct_l1anc},${ct_mae_norm},${ct_mae_uns},${ct_align},${ct_best_ep},NA,NA,NA,${TEST_SPLIT}' >> '${summary_csv}'"
+      with_lock bash -c "echo '${combo_id},${seed},${lr},${w_lr},${esm},${aw},${dyn_h},${dyn_cw},${ct_l1w},${ct_l1anc},${ct_mae_norm},${ct_mae_uns},${ct_align},${ct_best_ep},NA,NA,NA,${TEST_SPLIT}' >> '${summary_csv}'"
       return 0
     fi
     cp "${iql_ckpt_src}" "${iql_ckpt_grid}"
@@ -306,38 +300,23 @@ run_combo_seed() {
     [[ -z "${mae_eval}" ]] && mae_eval="NA"
   fi
 
-  with_lock bash -c "echo '${combo_id},${seed},${lr},${w_lr},${kmax},${eta},${esm},${aw},${dyn_h},${dyn_cw},${ct_l1w},${ct_l1anc},${ct_mae_norm},${ct_mae_uns},${ct_align},${ct_best_ep},${iql_best_mae},${iql_best_step},${mae_eval},${TEST_SPLIT}' >> '${summary_csv}'"
+  with_lock bash -c "echo '${combo_id},${seed},${lr},${w_lr},${esm},${aw},${dyn_h},${dyn_cw},${ct_l1w},${ct_l1anc},${ct_mae_norm},${ct_mae_uns},${ct_align},${ct_best_ep},${iql_best_mae},${iql_best_step},${mae_eval},${TEST_SPLIT}' >> '${summary_csv}'"
   echo "[w${GRID_WORKER_ID}][${tag}] L1w=${ct_l1w} L1anc=${ct_l1anc} MAE_uw_uns=${ct_mae_uns} | iql_val=${iql_best_mae} mae_eval=${mae_eval}"
 }
 
 for lr in "${CT_LR_LIST[@]}"; do
   for w_lr in "${CT_W_LR_LIST[@]}"; do
-    for kmax in "${CT_MULTI_K_MAX_LIST[@]}"; do
-      # When kmax==1 the multi-horizon loss collapses to loss_pred1, so eta has
-      # no effect and ct_es_metric in {l1, weighted} reduce to mean_l1. Collapse
-      # eta+esm to their first entries to avoid training identical models.
-      # Note: mae_uw is independent from weighted/l1 even at kmax=1, so we keep
-      # the full esm list in that case. anchor_weight always varies.
-      if [[ "${kmax}" == "1" ]]; then
-        eta_iter=("${CT_MULTI_ETA_LIST[0]}")
-      else
-        eta_iter=("${CT_MULTI_ETA_LIST[@]}")
-      fi
-      for eta in "${eta_iter[@]}"; do
-        for esm in "${CT_ES_METRIC_LIST[@]}"; do
-          for aw in "${CT_ANCHOR_WEIGHT_LIST[@]}"; do
-            for dyn_cw in "${CT_DYN_CONSISTENCY_WEIGHT_LIST[@]}"; do
-              # Latent dynamics width is irrelevant when consistency loss is off (train_ct skips loss_dyn).
-              if python -c "import sys; sys.exit(0 if float('${dyn_cw}') > 0 else 1)"; then
-                dyn_h_iter=("${CT_DYN_HIDDEN_LIST[@]}")
-              else
-                dyn_h_iter=("${CT_DYN_HIDDEN_LIST[0]}")
-              fi
-              for dyn_h in "${dyn_h_iter[@]}"; do
-                for seed in "${SEEDS[@]}"; do
-                  run_combo_seed "${lr}" "${w_lr}" "${kmax}" "${eta}" "${esm}" "${aw}" "${dyn_h}" "${dyn_cw}" "${seed}"
-                done
-              done
+    for esm in "${CT_ES_METRIC_LIST[@]}"; do
+      for aw in "${CT_ANCHOR_WEIGHT_LIST[@]}"; do
+        for dyn_cw in "${CT_DYN_CONSISTENCY_WEIGHT_LIST[@]}"; do
+          if python -c "import sys; sys.exit(0 if float('${dyn_cw}') > 0 else 1)"; then
+            dyn_h_iter=("${CT_DYN_HIDDEN_LIST[@]}")
+          else
+            dyn_h_iter=("${CT_DYN_HIDDEN_LIST[0]}")
+          fi
+          for dyn_h in "${dyn_h_iter[@]}"; do
+            for seed in "${SEEDS[@]}"; do
+              run_combo_seed "${lr}" "${w_lr}" "${esm}" "${aw}" "${dyn_h}" "${dyn_cw}" "${seed}"
             done
           done
         done
@@ -444,7 +423,7 @@ print(f"Score column = {'ct_val_MAE_uw_norm (SKIP_IQL)' if skip_iql else 'mae_un
 hdr = (
     f"{'rank':<4}  {'score':<9}  {'iql_val':<9}  {'MAE_uns':<9}  "
     f"{'L1w':<10}  {'L1anc':<10}  {'ratio':<6}  {'align':<9}  "
-    f"{'n':<2}  lr        w_lr      k  eta   esm      aw    dyn_w  dh  combo_id"
+    f"{'n':<2}  lr        w_lr      esm      aw    dyn_w  dh  combo_id"
 )
 print(hdr)
 def fmt(x, digits=6):
@@ -457,8 +436,8 @@ for i, s in enumerate(scored[:15], 1):
         f"{fmt(s['ct_mae_uns'],4):<9}  {fmt(s['ct_l1w'],3):<10}  "
         f"{fmt(s['ct_l1anc'],3):<10}  {fmt(s['ratio'],2):<6}  "
         f"{fmt(s['ct_align'],3):<9}  {s['n']:<2}  "
-        f"{r['ct_lr']:<9} {r['ct_w_lr']:<9} {r['ct_multi_k_max']}  "
-        f"{r['ct_multi_eta']:<4}  {r['ct_es_metric']:<7}  "
+        f"{r['ct_lr']:<9} {r['ct_w_lr']:<9} "
+        f"{r['ct_es_metric']:<7}  "
         f"{r['ct_anchor_weight']:<5} {r['ct_dyn_con_w']:<5} {r['ct_dyn_hidden']:<3} "
         f"{s['combo_id']}"
     )

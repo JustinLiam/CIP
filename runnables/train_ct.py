@@ -21,6 +21,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.ct_transition_dataset import CTTransitionDataset, collate_ct_batch, _covariate_stream_dim
 from src.models.ct_deconfound import CTDeconfoundModel
+from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import (
     compute_mmd_weighted,
     compute_weighted_wasserstein_joint_marginal_flat,
@@ -55,52 +56,6 @@ def _alignment_loss(
     raise ValueError(f"Unknown ct_align_loss: {mode}")
 
 
-def _ct_sched_sampling_p(epoch: int, p_start: float, p_end: float, ramp_epochs: int) -> float:
-    if ramp_epochs <= 0:
-        return float(p_end)
-    t = min(1.0, float(epoch) / float(ramp_epochs))
-    return float(p_start) + t * (float(p_end) - float(p_start))
-
-
-def _ct_horizon_weights(eta: float, k_max: int) -> list:
-    raw = [float(eta) ** k for k in range(k_max)]
-    s = sum(raw)
-    return [x / s for x in raw]
-
-
-def _scheduled_prev_outputs(
-    H_work: dict,
-    y_hat_prev: torch.Tensor,
-    valid_len_prev: torch.Tensor,
-    p: float,
-) -> tuple:
-    """
-    With prob ``p`` per batch row, replace ``prev_outputs[b, idx, :]`` with ``y_hat_prev[b].detach()``,
-    where ``idx = valid_len_prev[b] - 1`` (last index of the shorter prefix that produced ``y_hat_prev``).
-    """
-    # Hm = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in H_work.items()}
-    Hm = {}
-    for k, v in H_work.items():
-        # 克隆张量以避免破坏原始 dataloader 里的数据
-        Hm[k] = v.clone() if torch.is_tensor(v) else v
-    po = Hm["prev_outputs"]
-    B = y_hat_prev.size(0)
-    device = y_hat_prev.device
-    n_used = 0
-    if p <= 0.0:
-        return Hm, n_used
-    # yd = y_hat_prev.detach()
-    yd = y_hat_prev
-    for b in range(B):
-        if float(torch.rand(1, device=device)) >= p:
-            continue
-        idx = int(valid_len_prev[b].item()) - 1
-        if 0 <= idx < po.size(1):
-            po[b, idx, :] = yd[b]
-            n_used += 1
-    return Hm, n_used
-
-
 def _run_epoch(
     model,
     loader,
@@ -111,9 +66,6 @@ def _run_epoch(
     blur: float,
     train: bool,
     *,
-    multi_k_max: int = 1,
-    horiz_w: list = None,
-    ss_p: float = 0.0,
     k_inner: int = 1,
     w_clip: float = 1.0,
     anchor_weight: float = 0.0,
@@ -125,8 +77,7 @@ def _run_epoch(
     ``loss_align(Z_t, A_t, w)``. With k_inner=1 the behaviour matches the legacy 1:1
     E/M interleaving exactly; k_inner>1 is the Plan-A analogue of CTD-NKO's per-epoch
     refit, giving the E-step more iterations to converge before the M-step moves
-    Z_t again. The M-step reuses the PRE-loop ``w_fix`` to stay backward-compatible
-    with the multi-horizon losses (only the WeightNet parameters advance faster).
+    Z_t again.
 
     ``anchor_weight``: blend the WeightNet-reweighted MSE (legacy) with an unweighted
     anchor MSE on the M-step: total = (1-a)*weighted + a*anchor. See ct_deconfound
@@ -134,8 +85,6 @@ def _run_epoch(
     ``train_std_cv``: cancer_volume std from train_scaling_params; used only for
     human-readable logging of un-weighted MAE in unscaled units.
     """
-    if horiz_w is None:
-        horiz_w = [1.0]
     k_inner_eff = max(1, int(k_inner))
     a_blend = max(0.0, min(1.0, float(anchor_weight)))
     total_pred = 0.0
@@ -144,14 +93,9 @@ def _run_epoch(
     total_dyn = 0.0         # latent dynamics consistency loss (z_next_pred -> z_{t+1})
     sum_l1 = 0.0            # k=1 weighted MSE (legacy)
     sum_l1_anchor = 0.0     # k=1 unweighted MSE (anchor)
-    # Un-weighted MAE on normalized y: populated only at k=1 using y_hat1, y_next.
-    # This is the primary diagnostic for Predictor offset bias (see debug_predictor_sensitivity.py).
+    # Un-weighted MAE on normalized y — primary diagnostic for Predictor offset bias.
     sum_mae_uw_norm = 0.0
     sum_mae_uw_denom = 0.0
-    sum_l2 = 0.0
-    sum_l3 = 0.0
-    sum_ss = 0
-    ss_denom = 0
     n_batches = 0
     # WeightNet health trackers (computed on active samples only, matching the loss mask).
     # Since w = softmax(logits) * B per batch => mean(w)=1 by construction; only var matters.
@@ -170,13 +114,6 @@ def _run_epoch(
         H_t_next = None
         if "H_t_next" in batch:
             H_t_next = {k: v.to(device) for k, v in batch["H_t_next"].items()}
-        elif "H_t_k2" in batch:
-            H_t_next = {k: v.to(device) for k, v in batch["H_t_k2"].items()}
-        Bsz = H_t["prev_treatments"].size(0)
-        if multi_k_max > 1:
-            ss_denom += Bsz * (multi_k_max - 1)
-        act1 = H_t["active_entries"][:, :, 0] if H_t["active_entries"].dim() == 3 else H_t["active_entries"]
-        valid_lens_h1 = act1.sum(dim=1).long().clamp(min=1)
         # Batch-level "is this sample active at the query step" mask, matching
         # CTDeconfoundModel.forward's active_t used in loss_pred. Shape (B,);
         # no .squeeze() so that B=1 edge case still yields a 1-D mask.
@@ -184,7 +121,6 @@ def _run_epoch(
 
         with torch.set_grad_enabled(train):
             loss_pred1_w, Z_t, A_t, w, _, y_hat1, loss_pred1_anchor = model(H_t, y_next)
-            w_fix = w.detach()
             # Blend the weighted and anchor losses for the M-step (Plan A).
             loss_pred1 = (1.0 - a_blend) * loss_pred1_w + a_blend * loss_pred1_anchor
             if dyn_consistency_weight > 0.0 and H_t_next is not None:
@@ -223,41 +159,7 @@ def _run_epoch(
                 # blowing memory if someone runs huge epochs (~200k values = ~1MB, fine).
                 w_samples.append(w_act.cpu())
 
-            # l2f 和 l3f 分别表示在多步(multi-horizon)情况下，第二步(k=2)和第三步(k=3)使用固定样本权重下的预测损失（weighted prediction loss）。
-            # 具体地，它们这样计算：
-            # - l2f: 针对 k=2（预测 y_{t+2}），用模型第一次E-step返回的权重 w_fix 计算 weighted loss；
-            # - l3f: 针对 k=3（预测 y_{t+3}），同样用相同（k=1时求得）的权重 w_fix 计算 weighted loss。
-            if multi_k_max <= 1:
-                loss_theta = loss_pred1 + float(dyn_consistency_weight) * loss_dyn
-                l2f = l3f = 0.0
-                ss_batch = 0
-            else:
-                l2f = l3f = 0.0
-                ss_batch = 0
-                # k=2
-                H2 = {k: v.to(device) for k, v in batch["H_t_k2"].items()}
-                y2 = batch["y_next2"].to(device)
-                H2m, n2 = _scheduled_prev_outputs(H2, y_hat1, valid_lens_h1, ss_p if train else 0.0)
-                ss_batch += n2
-                loss_pred2_w, y_hat2, loss_pred2_anchor = model.weighted_prediction_loss(H2m, y2, w_fix)
-                loss_pred2 = (1.0 - a_blend) * loss_pred2_w + a_blend * loss_pred2_anchor
-                l2f = float(loss_pred2_w.detach())
-
-                loss_theta = horiz_w[0] * loss_pred1 + horiz_w[1] * loss_pred2
-                if multi_k_max >= 3:
-                    # k=3
-                    H3 = {k: v.to(device) for k, v in batch["H_t_k3"].items()}
-                    y3 = batch["y_next3"].to(device)
-                    act2 = H2["active_entries"][:, :, 0] if H2["active_entries"].dim() == 3 else H2["active_entries"]
-                    valid_lens_h2 = act2.sum(dim=1).long().clamp(min=1)
-                    H3m, n3 = _scheduled_prev_outputs(H3, y_hat2, valid_lens_h2, ss_p if train else 0.0)
-                    ss_batch += n3
-                    loss_pred3_w, _, loss_pred3_anchor = model.weighted_prediction_loss(H3m, y3, w_fix)
-                    loss_pred3 = (1.0 - a_blend) * loss_pred3_w + a_blend * loss_pred3_anchor
-                    l3f = float(loss_pred3_w.detach())
-                    loss_theta = loss_theta + horiz_w[2] * loss_pred3
-                loss_theta = loss_theta + float(dyn_consistency_weight) * loss_dyn
-            # l2f, l3f 的值在下面用于均值统计与日志
+            loss_theta = loss_pred1 + float(dyn_consistency_weight) * loss_dyn
 
             if train:
                 # --- E-Step (inner loop of k_inner iterations) ---
@@ -293,7 +195,7 @@ def _run_epoch(
                 # --- M-Step: 与 E-step 后的 WeightNet 对齐 ---
                 # Inner loop 已更新 weight_net；若仍用 forward 时的 w_fix，则 encoder 的加权梯度
                 # 与当前 WeightNet 不一致。这里用同一 Z_t、A_t 重算 w_sync（Z_t.detach() 与 forward
-                # 中一致），仅替换加权 MSE 里的权重；anchor / dynamics / 多步 H2m、H3m 不变。
+                # 中一致），仅替换加权 MSE 里的权重；anchor / dynamics 不变。
                 za_sync = torch.cat([Z_t.detach(), A_t], dim=-1)
                 logits_sync = model.weight_net(za_sync)
                 w_sync = F.softmax(logits_sync, dim=0) * float(Z_t.size(0))
@@ -304,23 +206,7 @@ def _run_epoch(
                 l1f_old = l1f
                 l1f = float(loss_pred1_w_m.detach())
                 sum_l1 += l1f - l1f_old
-                if multi_k_max <= 1:
-                    loss_theta = loss_pred1_m + float(dyn_consistency_weight) * loss_dyn
-                else:
-                    loss_pred2_w, _, loss_pred2_anchor = model.weighted_prediction_loss(
-                        H2m, y2, w_sync.detach()
-                    )
-                    loss_pred2 = (1.0 - a_blend) * loss_pred2_w + a_blend * loss_pred2_anchor
-                    l2f = float(loss_pred2_w.detach())
-                    loss_theta = horiz_w[0] * loss_pred1_m + horiz_w[1] * loss_pred2
-                    if multi_k_max >= 3:
-                        loss_pred3_w, _, loss_pred3_anchor = model.weighted_prediction_loss(
-                            H3m, y3, w_sync.detach()
-                        )
-                        loss_pred3 = (1.0 - a_blend) * loss_pred3_w + a_blend * loss_pred3_anchor
-                        l3f = float(loss_pred3_w.detach())
-                        loss_theta = loss_theta + horiz_w[2] * loss_pred3
-                    loss_theta = loss_theta + float(dyn_consistency_weight) * loss_dyn
+                loss_theta = loss_pred1_m + float(dyn_consistency_weight) * loss_dyn
 
                 # --- M-Step: 更新ct_encoder和predictor parameters，仅loss_theta作用 ---
                 optimizer_theta.zero_grad(set_to_none=True)
@@ -341,9 +227,6 @@ def _run_epoch(
         else:
             # Should not happen, but keep running-sum consistent for safety.
             total_align_pre += float(loss_align.detach())
-        sum_l2 += l2f
-        sum_l3 += l3f
-        sum_ss += ss_batch
         n_batches += 1
 
     nb = max(n_batches, 1)
@@ -357,9 +240,6 @@ def _run_epoch(
         # un-weighted number reflects true population-level predictor quality.
         "mae_uw_norm": float(mae_uw_norm),
         "mae_uw_uns": float(mae_uw_norm * float(train_std_cv)),
-        "mean_l2": sum_l2 / nb,
-        "mean_l3": sum_l3 / nb,
-        "ss_frac": float(sum_ss) / float(max(1, ss_denom)) if multi_k_max > 1 else 0.0,
         # Pre-inner-loop alignment (what WeightNet would produce BEFORE this batch's
         # E-step updates). Compared against ``total_align/nb`` (post-inner-loop)
         # to quantify how much each batch's k_inner sub-iterations actually reduce
@@ -438,17 +318,10 @@ def main(args: DictConfig):
         if dims == 2:
             dataset_collection = repeat_static(dataset_collection)
 
-    multi_k_max = int(OmegaConf.select(args, "exp.ct_multi_k_max", default=1))
-    ct_multi_eta = float(OmegaConf.select(args, "exp.ct_multi_eta", default=0.5))
-    ct_sched_p_start = float(OmegaConf.select(args, "exp.ct_sched_p_start", default=0.0))
-    ct_sched_p_end = float(OmegaConf.select(args, "exp.ct_sched_p_end", default=0.3))
-    ct_sched_ramp_epochs = int(OmegaConf.select(args, "exp.ct_sched_ramp_epochs", default=100))
-    horiz_w = _ct_horizon_weights(ct_multi_eta, max(1, multi_k_max))
-
     # Early-stop / checkpoint-selection metric.
-    #   "weighted" : multi-horizon WeightNet-reweighted MSE (legacy default).
-    #   "l1"       : k=1 WeightNet-reweighted MSE (legacy).
-    #   "mae_uw"   : k=1 UN-weighted MAE on normalized y. Recommended default
+    #   "weighted" : WeightNet-reweighted val MSE (legacy default).
+    #   "l1"       : WeightNet-reweighted val MSE (legacy, BIASED when WeightNet concentrates mass).
+    #   "mae_uw"   : UN-weighted val MAE on normalized y. Recommended default
     #                post predictor-bias fix (ct_anchor_weight > 0): this is the
     #                unbiased factual-prediction metric and matches how downstream
     #                IQL uses the outcome_predictor during rollouts. Standard in
@@ -461,12 +334,10 @@ def main(args: DictConfig):
     need_next_prefix = dyn_consistency_weight > 0.0
     train_ds = CTTransitionDataset(
         dataset_collection.train_f.data,
-        multi_k_max=multi_k_max,
         include_next_prefix=need_next_prefix,
     )
     val_ds = CTTransitionDataset(
         dataset_collection.val_f.data,
-        multi_k_max=multi_k_max,
         include_next_prefix=need_next_prefix,
     )
     # cancer_volume std used only to rescale MAE for human-readable logs.
@@ -476,8 +347,7 @@ def main(args: DictConfig):
     except Exception:
         train_std_cv = 1.0
     logger.info(
-        f"CT transitions: train={len(train_ds)}, val={len(val_ds)} | multi_k_max={multi_k_max} "
-        f"horiz_w={horiz_w} sched_p=[{ct_sched_p_start}->{ct_sched_p_end} over {ct_sched_ramp_epochs} ep] "
+        f"CT transitions: train={len(train_ds)}, val={len(val_ds)} | "
         f"early_stop={ct_es_metric} k_inner={k_inner} anchor_w={anchor_weight:g} "
         f"dyn_w={dyn_consistency_weight:g} next_prefix={need_next_prefix} "
         f"train_std_cv={train_std_cv:.4f}"
@@ -544,10 +414,10 @@ def main(args: DictConfig):
     def _es_score(va_extras: dict, va_pred_f: float) -> float:
         """
         Scalar for early stopping / best-ckpt selection. Lower = better.
-            - "weighted" : multi-horizon WeightNet-reweighted val MSE (legacy).
-            - "l1"       : k=1 WeightNet-reweighted val MSE (legacy, BIASED when
+            - "weighted" : WeightNet-reweighted val MSE (legacy).
+            - "l1"       : WeightNet-reweighted val MSE (legacy, BIASED when
                            WeightNet concentrates mass; see ct_anchor_weight docs).
-            - "mae_uw"   : k=1 UN-weighted val MAE on normalized y (recommended).
+            - "mae_uw"   : UN-weighted val MAE on normalized y (recommended).
         """
         if ct_es_metric == "l1":
             return float(va_extras["mean_l1"])
@@ -557,159 +427,179 @@ def main(args: DictConfig):
 
     best_es = float("inf")
     patience_left = ct_patience
+    best_epoch = 0
 
-    for epoch in range(1, ct_epochs + 1):
-        ss_p = _ct_sched_sampling_p(epoch, ct_sched_p_start, ct_sched_p_end, ct_sched_ramp_epochs)
-        tr_pred, tr_align, tr_ex = _run_epoch(
-            model,
-            train_loader,
-            optimizer_w,
-            optimizer_theta,
-            device,
-            ct_align,
-            ct_blur,
-            True,
-            multi_k_max=multi_k_max,
-            horiz_w=horiz_w,
-            ss_p=ss_p,
-            k_inner=k_inner,
-            w_clip=w_clip,
-            anchor_weight=anchor_weight,
-            train_std_cv=train_std_cv,
-            dyn_consistency_weight=dyn_consistency_weight,
-        )
-        with torch.no_grad():
-            # Val never steps the optimizer, so k_inner is irrelevant here; the inner
-            # loop body is gated by the ``train`` flag and effectively skipped in eval.
-            va_pred, va_align, va_ex = _run_epoch(
+    mlf = VCIPMlflowTracker.from_hydra(args, stage="ct")
+    mlf.start(args)
+
+    try:
+        for epoch in range(1, ct_epochs + 1):
+            tr_pred, tr_align, tr_ex = _run_epoch(
                 model,
-                val_loader,
-                None,
-                None,
+                train_loader,
+                optimizer_w,
+                optimizer_theta,
                 device,
                 ct_align,
                 ct_blur,
-                False,
-                multi_k_max=multi_k_max,
-                horiz_w=horiz_w,
-                ss_p=0.0,
-                k_inner=1,
+                True,
+                k_inner=k_inner,
+                w_clip=w_clip,
                 anchor_weight=anchor_weight,
                 train_std_cv=train_std_cv,
                 dyn_consistency_weight=dyn_consistency_weight,
             )
+            with torch.no_grad():
+                # Val never steps the optimizer, so k_inner is irrelevant here; the inner
+                # loop body is gated by the ``train`` flag and effectively skipped in eval.
+                va_pred, va_align, va_ex = _run_epoch(
+                    model,
+                    val_loader,
+                    None,
+                    None,
+                    device,
+                    ct_align,
+                    ct_blur,
+                    False,
+                    k_inner=1,
+                    anchor_weight=anchor_weight,
+                    train_std_cv=train_std_cv,
+                    dyn_consistency_weight=dyn_consistency_weight,
+                )
 
-        logger.info(
-            f"Epoch {epoch}/{ct_epochs} ss_p={ss_p:.4f} "
-            f"train_pred={tr_pred:.6f} train_align={tr_align:.6f} train_ss_frac={tr_ex['ss_frac']:.4f} "
-            f"train_L1={tr_ex['mean_l1']:.6f} train_L2={tr_ex['mean_l2']:.6f} train_L3={tr_ex['mean_l3']:.6f} | "
-            f"val_pred={va_pred:.6f} val_align={va_align:.6f} "
-            f"val_L1={va_ex['mean_l1']:.6f} val_L2={va_ex['mean_l2']:.6f} val_L3={va_ex['mean_l3']:.6f}"
-        )
-        # Predictor-bias diagnostic: weighted vs un-weighted + MAE in unscaled units.
-        # Healthy signs: (a) val_L1_anchor roughly equal to val_L1 (no WeightNet
-        # concentration bias); (b) val_MAE_uw_uns < 0.3 on cancer_sim γ=4.
-        # Symptoms of the pre-anchor pathology: val_L1 ~1e-5 but val_MAE_uw_uns ~1.7.
-        logger.info(
-            f"  [Pred-diag] train: L1w={tr_ex['mean_l1']:.3e} L1anc={tr_ex['mean_l1_anchor']:.3e} "
-            f"MAE_uw_norm={tr_ex['mae_uw_norm']:.5f} MAE_uw_uns={tr_ex['mae_uw_uns']:.4f} "
-            f"Zdyn={tr_ex.get('mean_dyn', float('nan')):.3e} | "
-            f"val: L1w={va_ex['mean_l1']:.3e} L1anc={va_ex['mean_l1_anchor']:.3e} "
-            f"MAE_uw_norm={va_ex['mae_uw_norm']:.5f} MAE_uw_uns={va_ex['mae_uw_uns']:.4f} "
-            f"Zdyn={va_ex.get('mean_dyn', float('nan')):.3e}"
-        )
-        # When k_inner>1, report the per-batch-averaged pre/post alignment. Interpretation:
-        #   * drop = align_pre - align_post > 0 and large   => inner loop is usefully
-        #     reducing alignment within each batch (E-step is converging).
-        #   * drop ~ 0                                      => k_inner is not helping
-        #     (either already converged at i=0, or LR too small, or encoder drifts per-step).
-        #   * drop < 0 (rare)                               => WeightNet overshoots;
-        #     reduce k_inner or clip harder.
-        if k_inner > 1:
-            tr_pre = tr_ex.get("align_pre", float("nan"))
-            drop = tr_pre - tr_align
             logger.info(
-                f"  [E-inner ] k_inner={k_inner} train: align_pre={tr_pre:.6f} align_post={tr_align:.6f} "
-                f"drop={drop:+.6f}"
+                f"Epoch {epoch}/{ct_epochs} "
+                f"train_pred={tr_pred:.6f} train_align={tr_align:.6f} "
+                f"train_L1={tr_ex['mean_l1']:.6f} | "
+                f"val_pred={va_pred:.6f} val_align={va_align:.6f} "
+                f"val_L1={va_ex['mean_l1']:.6f}"
             )
-        # WeightNet health: compact line every epoch. Key diagnostic:
-        #   ESS_frac ~ 1.0 + w_std ~ 0.0   => WeightNet is uniform (no deconfounding).
-        #   ESS_frac ~ 0.3 + w_std large   => WeightNet collapsed onto few samples.
-        #   ESS_frac in [0.5, 0.95] with moderate std => healthy reweighting.
-        logger.info(
-            f"  [W-health] train: ESS={tr_ex.get('w_ess_frac', float('nan')):.3f} "
-            f"std={tr_ex.get('w_std', float('nan')):.3f} "
-            f"min={tr_ex.get('w_min', float('nan')):.3f} "
-            f"max={tr_ex.get('w_max', float('nan')):.3f} | "
-            f"val: ESS={va_ex.get('w_ess_frac', float('nan')):.3f} "
-            f"std={va_ex.get('w_std', float('nan')):.3f} "
-            f"min={va_ex.get('w_min', float('nan')):.3f} "
-            f"max={va_ex.get('w_max', float('nan')):.3f}"
-        )
-        # Full percentile dump every w_log_every epochs (and at epoch 1 + last).
-        if w_log_every > 0 and (epoch == 1 or epoch % w_log_every == 0):
-            if "w_p50" in tr_ex:
-                logger.info(
-                    f"  [W-pct  ] train: p01={tr_ex['w_p01']:.3f} p05={tr_ex['w_p05']:.3f} "
-                    f"p25={tr_ex['w_p25']:.3f} p50={tr_ex['w_p50']:.3f} p75={tr_ex['w_p75']:.3f} "
-                    f"p95={tr_ex['w_p95']:.3f} p99={tr_ex['w_p99']:.3f}"
-                )
-            if "w_p50" in va_ex:
-                logger.info(
-                    f"  [W-pct  ]   val: p01={va_ex['w_p01']:.3f} p05={va_ex['w_p05']:.3f} "
-                    f"p25={va_ex['w_p25']:.3f} p50={va_ex['w_p50']:.3f} p75={va_ex['w_p75']:.3f} "
-                    f"p95={va_ex['w_p95']:.3f} p99={va_ex['w_p99']:.3f}"
-                )
-
-        es_score = _es_score(va_ex, va_pred)
-        if es_score < best_es:
-            best_es = es_score
-            patience_left = ct_patience
-            torch.save(
-                {
-                    "ct_history_encoder": model.ct_encoder.state_dict(),
-                    "projection_head": model.projection.state_dict(),
-                    # Save the OutcomePredictor so downstream IQL can do model-based OPE
-                    # (roll out with p(y_{t+1} | z_t, a_t) instead of the cancer simulator).
-                    "outcome_predictor": model.predictor.state_dict(),
-                    "z_dynamics": model.z_dynamics.state_dict(),
-                    "predictor_hidden": int(OmegaConf.select(args, "exp.ct_predictor_hidden", default=64)),
-                    "val_loss_pred": va_pred,
-                    "val_loss_l1": float(va_ex["mean_l1"]),
-                    "val_loss_l1_anchor": float(va_ex["mean_l1_anchor"]),
-                    "val_mae_uw_norm": float(va_ex["mae_uw_norm"]),
-                    "val_mae_uw_uns": float(va_ex["mae_uw_uns"]),
-                    "val_loss_z_dyn": float(va_ex.get("mean_dyn", 0.0)),
-                    "val_loss_align": float(va_align),
-                    "anchor_weight": float(anchor_weight),
-                    "ct_dyn_consistency_weight": float(dyn_consistency_weight),
-                    "ct_es_metric": ct_es_metric,
-                    "val_es_score": es_score,
-                    "epoch": epoch,
-                    "x_dim": x_dim,
-                    "config": OmegaConf.to_yaml(args, resolve=True),
-                },
-                ckpt_path,
-            )
+            # Predictor-bias diagnostic: weighted vs un-weighted + MAE in unscaled units.
+            # Healthy signs: (a) val_L1_anchor roughly equal to val_L1 (no WeightNet
+            # concentration bias); (b) val_MAE_uw_uns < 0.3 on cancer_sim γ=4.
+            # Symptoms of the pre-anchor pathology: val_L1 ~1e-5 but val_MAE_uw_uns ~1.7.
             logger.info(
-                f"Saved encoder checkpoint to {ckpt_path} "
-                f"(early_stop_metric={ct_es_metric}, score={es_score:.6f}, val_pred={va_pred:.6f}, "
-                f"val_L1={va_ex['mean_l1']:.6f} val_MAE_uw_uns={va_ex['mae_uw_uns']:.4f})"
+                f"  [Pred-diag] train: L1w={tr_ex['mean_l1']:.3e} L1anc={tr_ex['mean_l1_anchor']:.3e} "
+                f"MAE_uw_norm={tr_ex['mae_uw_norm']:.5f} MAE_uw_uns={tr_ex['mae_uw_uns']:.4f} "
+                f"Zdyn={tr_ex.get('mean_dyn', float('nan')):.3e} | "
+                f"val: L1w={va_ex['mean_l1']:.3e} L1anc={va_ex['mean_l1_anchor']:.3e} "
+                f"MAE_uw_norm={va_ex['mae_uw_norm']:.5f} MAE_uw_uns={va_ex['mae_uw_uns']:.4f} "
+                f"Zdyn={va_ex.get('mean_dyn', float('nan')):.3e}"
             )
-        else:
-            patience_left -= 1
-            if patience_left <= 0:
+            # When k_inner>1, report the per-batch-averaged pre/post alignment. Interpretation:
+            #   * drop = align_pre - align_post > 0 and large   => inner loop is usefully
+            #     reducing alignment within each batch (E-step is converging).
+            #   * drop ~ 0                                      => k_inner is not helping
+            #     (either already converged at i=0, or LR too small, or encoder drifts per-step).
+            #   * drop < 0 (rare)                               => WeightNet overshoots;
+            #     reduce k_inner or clip harder.
+            if k_inner > 1:
+                tr_pre = tr_ex.get("align_pre", float("nan"))
+                drop = tr_pre - tr_align
                 logger.info(
-                    f"Early stopping (no improvement on early_stop_metric={ct_es_metric!r} for {ct_patience} epochs)."
+                    f"  [E-inner ] k_inner={k_inner} train: align_pre={tr_pre:.6f} align_post={tr_align:.6f} "
+                    f"drop={drop:+.6f}"
                 )
-                break
+            # WeightNet health: compact line every epoch. Key diagnostic:
+            #   ESS_frac ~ 1.0 + w_std ~ 0.0   => WeightNet is uniform (no deconfounding).
+            #   ESS_frac ~ 0.3 + w_std large   => WeightNet collapsed onto few samples.
+            #   ESS_frac in [0.5, 0.95] with moderate std => healthy reweighting.
+            logger.info(
+                f"  [W-health] train: ESS={tr_ex.get('w_ess_frac', float('nan')):.3f} "
+                f"std={tr_ex.get('w_std', float('nan')):.3f} "
+                f"min={tr_ex.get('w_min', float('nan')):.3f} "
+                f"max={tr_ex.get('w_max', float('nan')):.3f} | "
+                f"val: ESS={va_ex.get('w_ess_frac', float('nan')):.3f} "
+                f"std={va_ex.get('w_std', float('nan')):.3f} "
+                f"min={va_ex.get('w_min', float('nan')):.3f} "
+                f"max={va_ex.get('w_max', float('nan')):.3f}"
+            )
+            # Full percentile dump every w_log_every epochs (and at epoch 1 + last).
+            if w_log_every > 0 and (epoch == 1 or epoch % w_log_every == 0):
+                if "w_p50" in tr_ex:
+                    logger.info(
+                        f"  [W-pct  ] train: p01={tr_ex['w_p01']:.3f} p05={tr_ex['w_p05']:.3f} "
+                        f"p25={tr_ex['w_p25']:.3f} p50={tr_ex['w_p50']:.3f} p75={tr_ex['w_p75']:.3f} "
+                        f"p95={tr_ex['w_p95']:.3f} p99={tr_ex['w_p99']:.3f}"
+                    )
+                if "w_p50" in va_ex:
+                    logger.info(
+                        f"  [W-pct  ]   val: p01={va_ex['w_p01']:.3f} p05={va_ex['w_p05']:.3f} "
+                        f"p25={va_ex['w_p25']:.3f} p50={va_ex['w_p50']:.3f} p75={va_ex['w_p75']:.3f} "
+                        f"p95={va_ex['w_p95']:.3f} p99={va_ex['w_p99']:.3f}"
+                    )
 
-    es_label = {
-        "l1": "val_L1 (weighted, biased)",
-        "mae_uw": "val_MAE_uw_norm (un-weighted, recommended)",
-        "weighted": "val_pred (weighted)",
-    }[ct_es_metric]
-    logger.info(f"Done. Best {es_label}={best_es:.6f} (early_stop={ct_es_metric}). Encoder-only file: {ckpt_path}")
+            es_score = _es_score(va_ex, va_pred)
+            mlf.log_ct_epoch_metrics(
+                epoch,
+                train_pred=tr_pred,
+                train_align=tr_align,
+                train_ex=tr_ex,
+                val_pred=va_pred,
+                val_align=va_align,
+                val_ex=va_ex,
+                es_score=es_score,
+            )
+            if es_score < best_es:
+                best_es = es_score
+                best_epoch = epoch
+                patience_left = ct_patience
+                torch.save(
+                    {
+                        "ct_history_encoder": model.ct_encoder.state_dict(),
+                        "projection_head": model.projection.state_dict(),
+                        # Save the OutcomePredictor so downstream IQL can do model-based OPE
+                        # (roll out with p(y_{t+1} | z_t, a_t) instead of the cancer simulator).
+                        "outcome_predictor": model.predictor.state_dict(),
+                        "z_dynamics": model.z_dynamics.state_dict(),
+                        "predictor_hidden": int(OmegaConf.select(args, "exp.ct_predictor_hidden", default=64)),
+                        "val_loss_pred": va_pred,
+                        "val_loss_l1": float(va_ex["mean_l1"]),
+                        "val_loss_l1_anchor": float(va_ex["mean_l1_anchor"]),
+                        "val_mae_uw_norm": float(va_ex["mae_uw_norm"]),
+                        "val_mae_uw_uns": float(va_ex["mae_uw_uns"]),
+                        "val_loss_z_dyn": float(va_ex.get("mean_dyn", 0.0)),
+                        "val_loss_align": float(va_align),
+                        "anchor_weight": float(anchor_weight),
+                        "ct_dyn_consistency_weight": float(dyn_consistency_weight),
+                        "ct_es_metric": ct_es_metric,
+                        "val_es_score": es_score,
+                        "epoch": epoch,
+                        "x_dim": x_dim,
+                        "config": OmegaConf.to_yaml(args, resolve=True),
+                    },
+                    ckpt_path,
+                )
+                logger.info(
+                    f"Saved encoder checkpoint to {ckpt_path} "
+                    f"(early_stop_metric={ct_es_metric}, score={es_score:.6f}, val_pred={va_pred:.6f}, "
+                    f"val_L1={va_ex['mean_l1']:.6f} val_MAE_uw_uns={va_ex['mae_uw_uns']:.4f})"
+                )
+            else:
+                patience_left -= 1
+                if patience_left <= 0:
+                    logger.info(
+                        f"Early stopping (no improvement on early_stop_metric={ct_es_metric!r} for {ct_patience} epochs)."
+                    )
+                    break
+    finally:
+        es_label = {
+            "l1": "val_L1 (weighted, biased)",
+            "mae_uw": "val_MAE_uw_norm (un-weighted, recommended)",
+            "weighted": "val_pred (weighted)",
+        }[ct_es_metric]
+        logger.info(
+            f"Done. Best {es_label}={best_es:.6f} (early_stop={ct_es_metric}, epoch={best_epoch}). "
+            f"Encoder-only file: {ckpt_path}"
+        )
+        mlf.finish(
+            artifact_paths=[ckpt_path] if ckpt_path.is_file() else None,
+            final_metrics={
+                "best/val_es_score": best_es,
+                "best/epoch": float(best_epoch),
+            },
+            final_step=best_epoch if best_epoch > 0 else ct_epochs,
+        )
 
 
 if __name__ == "__main__":

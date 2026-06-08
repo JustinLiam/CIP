@@ -145,6 +145,17 @@ exp:
   # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
   # Must appear in iql_val_worlds.
   iql_val_selection_world: predictor
+  # MLflow (train_ct.py, train_iql_planner.py, eval_iql_planner.py); default on.
+  use_mlflow: true
+  mlflow_experiment: vcip_tumor_one_step
+  # Where training WRITES metrics (not the browser URL). Use file: on the training machine.
+  # Example: file:/home/liam/pythonProject/VCIP-ICML-main/mlruns
+  # http://... is only if you run ``mlflow server`` separately; ``mlflow ui`` is for viewing only.
+  mlflow_uri: http://127.0.0.1:5000
+  mlflow_log_artifacts: true
+  mlflow_combo_id: ""  # optional tag for grid search / pipeline scripts
+  # eval_iql_planner.py: if set, evaluate all horizons in one MLflow run (scheme 3: eval/tau{k}/mae_uns).
+  iql_eval_tau_list: null
   # Horizon-aware IQL: normalize time-to-go; must match iql_dataset_builder / eval_iql_planner
   max_tau: 12.0
   # train_ct.py — standalone CT + WeightNet + Predictor (ctd.md)
@@ -160,12 +171,6 @@ exp:
   ct_num_workers: 4
   ct_weight_hidden: 64
   ct_predictor_hidden: 64
-  # Multi-horizon teacher losses (k=1..K) + optional scheduled sampling on prev_outputs for k>=2; alignment stays k=1 only.
-  ct_multi_k_max: 3
-  ct_multi_eta: 0.5
-  ct_sched_p_start: 0.3
-  ct_sched_p_end: 0.8
-  ct_sched_ramp_epochs: 100
   # train_ct early stopping + best ckpt. Options:
   #   weighted : multi-horizon WeightNet-reweighted val MSE (legacy).
   #   l1       : k=1 WeightNet-reweighted val MSE. BIASED when WeightNet concentrates
