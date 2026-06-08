@@ -29,6 +29,7 @@ from src.data.cip_dataset import CIPDataset, get_dataloader
 from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_actions_to_tanh_policy_space
 from src.models.inference_model import InferenceModel
 from src.planners.iql_planner import IQLPlanner
+from src.utils.em_ckpt import is_em_checkpoint, load_em_for_eval
 from src.utils.inference_ckpt import load_inference_checkpoint
 from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import repeat_static, set_seed, to_float
@@ -209,15 +210,34 @@ def main(args: DictConfig):
     batch_size = int(OmegaConf.select(args, "exp.batch_size_val", default=128))
     dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=batch_size, shuffle=False)
 
-    iql_ckpt = str(OmegaConf.select(args, "exp.iql_inference_ckpt", default=""))
     inference_model = InferenceModel(args).to(device)
-    load_inference_checkpoint(inference_model, iql_ckpt, device)
-    inference_model.eval()
-
+    em_eval_ckpt = str(OmegaConf.select(args, "exp.em_eval_ckpt", default="")).strip()
     planner_path = _resolve_iql_ckpt(args, original_cwd)
-    if not planner_path.exists():
-        raise FileNotFoundError(f"IQL checkpoint not found: {planner_path}. Set exp.iql_eval_ckpt or train first.")
-    planner = IQLPlanner.from_checkpoint(str(planner_path), device=device)
+    em_path = Path(em_eval_ckpt) if em_eval_ckpt else planner_path
+    if em_eval_ckpt and not em_path.is_absolute():
+        em_path = original_cwd / em_path
+
+    use_em = False
+    if em_path.is_file():
+        import torch as _torch
+        _probe = _torch.load(str(em_path), map_location="cpu")
+        use_em = is_em_checkpoint(_probe)
+
+    if use_em:
+        if not em_path.exists():
+            raise FileNotFoundError(f"EM checkpoint not found: {em_path}")
+        logger.info("Loading combined EM checkpoint from %s", em_path)
+        planner = load_em_for_eval(inference_model, str(em_path), device)
+        inference_model.eval()
+    else:
+        iql_ckpt = str(OmegaConf.select(args, "exp.iql_inference_ckpt", default=""))
+        load_inference_checkpoint(inference_model, iql_ckpt, device)
+        inference_model.eval()
+        if not planner_path.exists():
+            raise FileNotFoundError(
+                f"IQL checkpoint not found: {planner_path}. Set exp.iql_eval_ckpt / exp.em_eval_ckpt or train first."
+            )
+        planner = IQLPlanner.from_checkpoint(str(planner_path), device=device)
     max_action = float(planner.cfg.max_action)
     max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
     if max_tau <= 0:

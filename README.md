@@ -28,6 +28,14 @@ conda activate baseline
 pip install -r requirements_ct.txt
 ```
 
+3. prepare the MLFlow enviroment:
+```bash
+mlflow server \
+  --backend-store-uri ./mlruns \
+  --host 0.0.0.0 \
+  --port 5000
+```
+
 ## Running Experiments
 
 To train the CT model:

@@ -139,3 +139,37 @@ def collate_ct_batch(samples: List[Dict]) -> Dict[str, Any]:
     if "H_t_next" in samples[0]:
         out["H_t_next"] = _collate_pad_H(samples, "H_t_next", device_dtype)
     return out
+
+
+class CTEstepDataset(Dataset):
+    """
+    E-step only: (patient, t) history ``H_t`` without outcome labels.
+    Shares the same index as :class:`CTTransitionDataset` but omits ``y_next``.
+    """
+
+    def __init__(self, data: Dict[str, np.ndarray]):
+        self.data = data
+        self.index: List[Tuple[int, int]] = []
+        n = data["current_treatments"].shape[0]
+        min_len = 3
+        for i in range(n):
+            active = data["active_entries"][i]
+            length = int(active.sum())
+            if length < min_len:
+                continue
+            for t in range(1, length - 1):
+                self.index.append((i, t))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, idx: int) -> Dict[str, Dict[str, torch.Tensor]]:
+        i, t = self.index[idx]
+        H = _build_H_slice(self.data, i, t + 1)
+        return {"H_t": H}
+
+
+def collate_ct_estep_batch(samples: List[Dict]) -> Dict[str, Any]:
+    """Collate E-step batches (``H_t`` only)."""
+    device_dtype = samples[0]["H_t"]["prev_treatments"].dtype
+    return {"H_t": _collate_pad_H(samples, "H_t", device_dtype)}

@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +15,10 @@ TensorBatch = List[torch.Tensor]
 EXP_ADV_MAX = 100.0
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
+
+if TYPE_CHECKING:
+    from src.data.iql_raw_transition_dataset import IQLRawBatch
+    from src.models.ct_encoder_weight import CTEncoderWeightModel
 
 
 @dataclass
@@ -36,6 +40,7 @@ class IQLPlannerConfig:
     deterministic_actor: bool = False
     actor_dropout: Optional[float] = None
     max_grad_norm: Optional[float] = None
+    encoder_max_grad_norm: Optional[float] = 1.0
     device: str = "cuda"
 
 
@@ -46,6 +51,18 @@ def soft_update(target: nn.Module, source: nn.Module, tau: float):
 
 def asymmetric_l2_loss(u: torch.Tensor, tau: float) -> torch.Tensor:
     return torch.mean(torch.abs(tau - (u < 0).float()) * u**2)
+
+
+def weighted_asymmetric_l2_loss(u: torch.Tensor, tau: float, w: torch.Tensor) -> torch.Tensor:
+    """Weighted expectile loss; w should be non-negative, mean ~ 1 per batch."""
+    pinball = torch.abs(tau - (u < 0).float()) * u**2
+    denom = w.sum().clamp(min=1e-8)
+    return (w * pinball).sum() / denom
+
+
+def _weighted_mean_sq(err: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    denom = w.sum().clamp(min=1e-8)
+    return (w * err).sum() / denom
 
 
 class Squeeze(nn.Module):
@@ -334,6 +351,139 @@ class IQLPlanner:
             next_v = self.vf(next_observations)
         self._update_q(next_v, observations, actions, rewards, dones, log_dict)
         self._update_policy(adv, observations, actions, log_dict)
+        return log_dict
+
+    def _update_v_weighted(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        w: torch.Tensor,
+        log_dict: Dict[str, float],
+    ) -> torch.Tensor:
+        """V-step with detached states; weighted expectile loss."""
+        with torch.no_grad():
+            q1, q2 = self.qf.both(observations, actions)
+            target_q = torch.min(q1, q2)
+        v = self.vf(observations)
+        adv = target_q - v
+        v_loss = weighted_asymmetric_l2_loss(adv, self.cfg.iql_tau, w)
+        self.v_optimizer.zero_grad(set_to_none=True)
+        v_loss.backward()
+        if self.cfg.max_grad_norm is not None:
+            clip_grad_norm_(self.vf.parameters(), self.cfg.max_grad_norm)
+        self.v_optimizer.step()
+        log_dict["value_loss"] = float(v_loss.item())
+        return adv
+
+    def _update_q_weighted_encoder(
+        self,
+        observations: torch.Tensor,
+        next_observations: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        dones: torch.Tensor,
+        w: torch.Tensor,
+        encoder_model: "CTEncoderWeightModel",
+        encoder_optimizer: torch.optim.Optimizer,
+        log_dict: Dict[str, float],
+    ) -> None:
+        """Q-step: weighted TD loss; gradients flow to Q and encoder (observations has grad)."""
+        with torch.no_grad():
+            next_v = self.vf(next_observations)
+        targets = rewards + (1.0 - dones.float()) * self.cfg.discount * next_v.detach()
+        q1, q2 = self.qf.both(observations, actions)
+        err1 = (q1 - targets) ** 2
+        err2 = (q2 - targets) ** 2
+        q_loss = 0.5 * (_weighted_mean_sq(err1, w) + _weighted_mean_sq(err2, w))
+
+        self.q_optimizer.zero_grad(set_to_none=True)
+        encoder_optimizer.zero_grad(set_to_none=True)
+        q_loss.backward()
+        if self.cfg.max_grad_norm is not None:
+            clip_grad_norm_(self.qf.parameters(), self.cfg.max_grad_norm)
+        enc_clip = getattr(self.cfg, "encoder_max_grad_norm", None)
+        if enc_clip is not None and enc_clip > 0:
+            clip_grad_norm_(encoder_model.encoder_parameters(), max_norm=float(enc_clip))
+        self.q_optimizer.step()
+        encoder_optimizer.step()
+        soft_update(self.q_target, self.qf, self.cfg.tau)
+        log_dict["q_loss"] = float(q_loss.item())
+
+    def _update_policy_weighted(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        adv: torch.Tensor,
+        w: torch.Tensor,
+        log_dict: Dict[str, float],
+    ) -> None:
+        """π-step with detached states; weighted actor loss."""
+        exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
+        policy_out = self.actor(observations)
+        if isinstance(policy_out, torch.distributions.Distribution):
+            bc_losses = -policy_out.log_prob(actions).sum(-1)
+        else:
+            bc_losses = ((policy_out - actions) ** 2).sum(-1)
+        policy_loss = _weighted_mean_sq(exp_adv * bc_losses, w)
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        policy_loss.backward()
+        if self.cfg.max_grad_norm is not None:
+            clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
+        self.actor_optimizer.step()
+        self.actor_lr_schedule.step()
+        log_dict["actor_loss"] = float(policy_loss.item())
+
+    def m_step_weighted(
+        self,
+        batch: "IQLRawBatch",
+        *,
+        encoder_model: "CTEncoderWeightModel",
+        encoder_optimizer: torch.optim.Optimizer,
+        uniform_weights: bool = False,
+    ) -> Dict[str, float]:
+        """
+        M-step on one batch: V → Q → π with WeightNet weights.
+        Only Q-step updates encoder; V/π use detached states.
+        """
+        from src.data.iql_state_builder import build_augmented_state
+
+        self.total_it += 1
+        log_dict: Dict[str, float] = {}
+
+        Z_t, A_t = encoder_model.encode(batch.H_t)
+        Z_next, _ = encoder_model.encode(batch.H_t_next)
+
+        _, w = encoder_model.compute_weights(
+            Z_t, A_t, detach_z=True, uniform=uniform_weights
+        )
+        w = w.detach()
+
+        s_grad = build_augmented_state(
+            Z_t, batch.y_target, batch.delta_t_norm, batch.a_prev_tanh
+        )
+        s_det = s_grad.detach()
+        s_next_det = build_augmented_state(
+            Z_next.detach(),
+            batch.y_target,
+            batch.delta_t_next_norm,
+            batch.action,
+        ).detach()
+
+        adv = self._update_v_weighted(s_det, batch.action, w, log_dict)
+        self._update_q_weighted_encoder(
+            s_grad,
+            s_next_det,
+            batch.action,
+            batch.reward,
+            batch.done,
+            w,
+            encoder_model,
+            encoder_optimizer,
+            log_dict,
+        )
+        self._update_policy_weighted(s_det, batch.action, adv, w, log_dict)
+        log_dict["w_mean"] = float(w.mean().item())
+        log_dict["w_std"] = float(w.std(unbiased=False).item())
         return log_dict
 
     @torch.no_grad()
