@@ -39,7 +39,7 @@ OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 def _alignment_loss(
     Z_t: torch.Tensor,
     A_t: torch.Tensor,
-    w: torch.Tensor,
+    logits_w: torch.Tensor,
     mode: str,
     sinkhorn_blur: float,
 ) -> torch.Tensor:
@@ -48,10 +48,11 @@ def _alignment_loss(
     joint_rep = torch.cat([Z_t, A_t], dim=-1)
     marginal_rep = torch.cat([Z_t, A_t[perm]], dim=-1)
     if mode == "mmd":
+        w = F.softmax(logits_w.reshape(-1), dim=0) * float(B)
         return compute_mmd_weighted(joint_rep, marginal_rep, w)
     if mode == "sinkhorn":
         return compute_weighted_wasserstein_joint_marginal_flat(
-            joint_rep, marginal_rep, w, blur=sinkhorn_blur
+            joint_rep, marginal_rep, logits_w, blur=sinkhorn_blur
         )
     raise ValueError(f"Unknown ct_align_loss: {mode}")
 
@@ -178,8 +179,7 @@ def _run_epoch(
                     optimizer_w.zero_grad(set_to_none=True)
                     za_w_i = torch.cat([Z_t_det, A_t_det], dim=-1)
                     logits_i = model.weight_net(za_w_i)
-                    w_i = F.softmax(logits_i, dim=0) * float(Z_t_det.size(0))
-                    loss_align = _alignment_loss(Z_t_det, A_t_det, w_i, align_mode, blur)
+                    loss_align = _alignment_loss(Z_t_det, A_t_det, logits_i, align_mode, blur)
                     if i == 0:
                         loss_align_pre = loss_align.detach()
                     loss_align.backward()
@@ -216,7 +216,9 @@ def _run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.z_dynamics.parameters(), max_norm=1.0)
                 optimizer_theta.step()
             else:
-                loss_align = _alignment_loss(Z_t, A_t, w, align_mode, blur)
+                za_eval = torch.cat([Z_t.detach(), A_t], dim=-1)
+                logits_eval = model.weight_net(za_eval)
+                loss_align = _alignment_loss(Z_t, A_t, logits_eval, align_mode, blur)
                 loss_align_pre = loss_align.detach()
 
         total_pred += float(loss_theta.detach())

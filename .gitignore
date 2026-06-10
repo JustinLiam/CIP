@@ -19,3 +19,4 @@ mlruns/
 .vscode/
 docs/
 mlartifacts/
+grid_results/

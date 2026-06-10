@@ -47,7 +47,9 @@ def test_e_step_does_not_update_encoder():
     opt_w = torch.optim.Adam(model.weight_net.parameters(), lr=1e-2)
     enc_before = [p.clone() for p in model.encoder_parameters()]
     H = _fake_H(8, 3, device)
-    model.e_step_batch(H, align_mode="mmd", sinkhorn_blur=0.01, k_inner=2, optimizer_w=opt_w)
+    model.e_step_batch(
+        H, align_mode="sinkhorn", sinkhorn_blur=0.01, k_inner=2, optimizer_w=opt_w
+    )
     for p0, p1 in zip(enc_before, model.encoder_parameters()):
         assert torch.allclose(p0, p1), "encoder should be frozen in E-step"
 

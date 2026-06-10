@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Dict
 
 import hydra
 import torch
@@ -23,7 +24,7 @@ from src.evaluation.iql_planner_eval import aggregate_iql_planner_metrics
 from src.models.ct_encoder_weight import CTEncoderWeightModel
 from src.models.inference_model import InferenceModel
 from src.planners.iql_planner import IQLPlanner, IQLPlannerConfig
-from src.training.ct_iql_em_loop import EMTrainConfig, run_e_step_epochs, run_m_step_steps
+from src.training.ct_iql_em_loop import EMTrainConfig, run_e_step_full, run_m_step_steps
 from src.utils.em_ckpt import load_encoder_into_inference, save_em_checkpoint
 from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import repeat_static, set_seed, to_float
@@ -58,14 +59,24 @@ def main(args: DictConfig):
     em_val_every = int(OmegaConf.select(args, "exp.em_val_every", default=5))
     em_warmup = int(OmegaConf.select(args, "exp.em_warmup_outer_iters", default=2))
     em_log_m_every = int(OmegaConf.select(args, "exp.em_log_m_every", default=50))
-    em_e_epochs = max(1, int(OmegaConf.select(args, "exp.em_e_epochs", default=3)))
+    em_e_epochs = max(1, int(OmegaConf.select(args, "exp.em_e_epochs", default=5)))
+    em_e_refresh_every = int(OmegaConf.select(args, "exp.em_e_refresh_every", default=1))
     em_her_refresh_every = int(OmegaConf.select(args, "exp.em_her_refresh_every", default=1))
+    em_her_samples_per_transition = max(
+        1,
+        int(OmegaConf.select(args, "exp.em_her_samples_per_transition", default=1)),
+    )
 
     ct_align = str(OmegaConf.select(args, "exp.ct_align_loss", default="sinkhorn"))
+    if ct_align != "sinkhorn":
+        raise ValueError(f"EM training requires ct_align_loss=sinkhorn, got {ct_align!r}")
     ct_blur = float(OmegaConf.select(args, "exp.ct_sinkhorn_blur", default=0.01))
-    k_inner = max(1, int(OmegaConf.select(args, "exp.ct_k_inner", default=1)))
-    _ct_w_lr = OmegaConf.select(args, "exp.ct_w_lr", default=None)
-    w_lr = float(_ct_w_lr) if _ct_w_lr is not None else float(OmegaConf.select(args, "exp.ct_lr", default=1e-4))
+    _em_e_w_lr = OmegaConf.select(args, "exp.em_e_w_lr", default=None)
+    w_lr = (
+        float(_em_e_w_lr)
+        if _em_e_w_lr is not None
+        else float(OmegaConf.select(args, "exp.ct_w_lr", default=0.1))
+    )
     _ct_w_clip = OmegaConf.select(args, "exp.ct_w_clip", default=1.0)
     w_clip = float(_ct_w_clip) if _ct_w_clip is not None else None
     ct_wd = float(OmegaConf.select(args, "exp.ct_weight_decay", default=1e-5))
@@ -133,6 +144,7 @@ def main(args: DictConfig):
             max_tau=max_tau,
             reward_clip=float(OmegaConf.select(args, "exp.iql_reward_clip", default=3.0)),
             reward_scale=str(OmegaConf.select(args, "exp.iql_reward_scale", default="auto")),
+            samples_per_transition=em_her_samples_per_transition,
             seed=her_seed,
         )
         return IQLRawReplayBuffer(raw, device=device)
@@ -142,28 +154,29 @@ def main(args: DictConfig):
     if em_her_refresh_every <= 0:
         replay = _build_replay(base_seed)
         logger.info(
-            "HER buffer built once (em_her_refresh_every=0) | transitions=%d",
+            "HER buffer built once (em_her_refresh_every=0, samples_per_transition=%d) | transitions=%d",
+            em_her_samples_per_transition,
             replay.size,
         )
 
     ct_loader = DataLoader(
         CTEstepDataset(dataset_collection.train_f.data),
         batch_size=ct_batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=int(OmegaConf.select(args, "exp.ct_num_workers", default=0)),
         collate_fn=collate_ct_estep_batch,
-        drop_last=True,
+        drop_last=False,
     )
 
     em_cfg = EMTrainConfig(
         align_mode=ct_align,
         sinkhorn_blur=ct_blur,
-        k_inner=k_inner,
         w_clip=w_clip,
         m_batch_size=m_batch_size,
         warmup_outer_iters=em_warmup,
         log_m_every=em_log_m_every,
         e_epochs=em_e_epochs,
+        e_batch_size=ct_batch_size,
     )
 
     _ckpt_override = OmegaConf.select(args, "exp.em_ckpt_dir", default=None)
@@ -192,6 +205,12 @@ def main(args: DictConfig):
     inference_model = InferenceModel(args).to(device)
     best_val = float("inf")
     best_outer = 0
+    last_e_metrics: Dict[str, float] = {
+        "align_pre": 0.0,
+        "align_post": 0.0,
+        "w_ess_frac": 1.0,
+        "w_std": 0.0,
+    }
 
     mlf = VCIPMlflowTracker.from_hydra(args, stage="ct_iql_em")
     mlf.start(args)
@@ -202,9 +221,10 @@ def main(args: DictConfig):
                 her_seed = base_seed + outer * 10007
                 replay = _build_replay(her_seed)
                 logger.info(
-                    "HER buffer refresh outer=%d/%d | transitions=%d | seed=%d",
+                    "HER buffer refresh outer=%d/%d | samples_per_transition=%d | transitions=%d | seed=%d",
                     outer,
                     em_outer_iters,
+                    em_her_samples_per_transition,
                     replay.size,
                     her_seed,
                 )
@@ -213,21 +233,42 @@ def main(args: DictConfig):
                     "Replay buffer not initialized; set em_her_refresh_every>0 or refresh at outer=1."
                 )
 
-            e_metrics = run_e_step_epochs(
-                ct_model, ct_loader, optimizer_w, em_cfg, device, outer_iter=outer
-            )
+            if em_e_refresh_every <= 0 or (outer - 1) % em_e_refresh_every == 0:
+                e_seed = base_seed + outer * 10007 + 17
+                e_metrics = run_e_step_full(
+                    ct_model,
+                    ct_loader,
+                    optimizer_w,
+                    em_cfg,
+                    device,
+                    outer_iter=outer,
+                    outer_seed=e_seed,
+                )
+                last_e_metrics = e_metrics
+                logger.info(
+                    "E-step full fit outer=%d | n=%.0f epochs=%d w_lr=%.1e",
+                    outer,
+                    e_metrics.get("n_samples", 0),
+                    em_e_epochs,
+                    w_lr,
+                )
+            else:
+                e_metrics = last_e_metrics
             m_metrics = run_m_step_steps(
                 ct_model, planner, optimizer_enc, replay, em_m_steps, em_cfg, outer_iter=outer
             )
+            m_warmup = " (M-warmup)" if outer <= em_warmup else ""
             logger.info(
-                "EM outer %d/%d | E(x%d): align_pre=%.4f align_post=%.4f w_ess=%.3f | "
-                "M: q=%.4f v=%.4f pi=%.4f | replay=%d",
+                "EM outer %d/%d | E(x%d): align_pre=%.4f align_post=%.4f w_ess=%.3f w_std=%.4f | "
+                "M%s: q=%.4f v=%.4f pi=%.4f | replay=%d",
                 outer,
                 em_outer_iters,
                 em_e_epochs,
                 e_metrics["align_pre"],
                 e_metrics["align_post"],
                 e_metrics["w_ess_frac"],
+                e_metrics.get("w_std", 0.0),
+                m_warmup,
                 m_metrics["q_loss"],
                 m_metrics["value_loss"],
                 m_metrics["actor_loss"],
@@ -238,6 +279,7 @@ def main(args: DictConfig):
                     "e/align_pre": e_metrics["align_pre"],
                     "e/align_post": e_metrics["align_post"],
                     "e/w_ess_frac": e_metrics["w_ess_frac"],
+                    "e/w_std": e_metrics.get("w_std", 0.0),
                     "e/e_epochs": float(em_e_epochs),
                     "m/q_loss": m_metrics["q_loss"],
                     "m/value_loss": m_metrics["value_loss"],

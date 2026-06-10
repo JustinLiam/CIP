@@ -55,14 +55,17 @@ def build_iql_raw_transitions(
     max_tau: float = 12.0,
     reward_clip: float = 3.0,
     reward_scale: str = "auto",
+    samples_per_transition: int = 1,
     seed: Optional[int] = None,
 ) -> List[IQLRawTransition]:
     """
     Same sampling as ``build_iql_transitions_from_ct`` but without encoder;
     stores history dicts for online encoding in M-step.
     """
-    if seed is not None:
-        np.random.seed(seed)
+    samples_per_transition = int(samples_per_transition)
+    if samples_per_transition < 1:
+        raise ValueError("samples_per_transition must be >= 1.")
+    rng = np.random.RandomState(seed) if seed is not None else np.random
 
     n_patients = data["current_treatments"].shape[0]
     if max_patients is not None:
@@ -82,14 +85,9 @@ def build_iql_raw_transitions(
             hi = min(t + int(max_tau), last_idx)
             if hi <= t:
                 continue
-            t_target = int(np.random.randint(low=t + 1, high=hi + 1))
 
             H_t = _build_H_slice(data, i, t + 1)
             H_next = _build_H_slice(data, i, t + 2)
-
-            y_target_np = data["outputs"][i, t_target, :].astype(np.float32)
-            delta_t_norm = max(0.0, float(t_target - t) / max_tau)
-            delta_t_next_norm = max(0.0, float(t_target - t - 1) / max_tau)
 
             a_prev_raw = data["current_treatments"][i, t - 1, :].astype(np.float32)
             if dataset_actions_unit_interval:
@@ -105,39 +103,45 @@ def build_iql_raw_transitions(
 
             y_next = data["outputs"][i, t + 1, :].astype(np.float32)
             y_cur = data["outputs"][i, t, :].astype(np.float32)
-            if reward_type == "negative_outcome_mse":
-                r = -float(np.mean((y_next - y_target_np) ** 2))
-            elif reward_type == "negative_outcome":
-                r = -float(np.mean(np.abs(y_next - y_target_np)))
-            elif reward_type == "progress":
-                d_cur = float(np.mean(np.abs(y_cur - y_target_np)))
-                d_nxt = float(np.mean(np.abs(y_next - y_target_np)))
-                r = d_cur - d_nxt
-            else:
-                r = -float(np.mean(np.abs(y_next - y_target_np)))
-
-            if reward_clip is not None and float(reward_clip) > 0.0:
-                c = float(reward_clip)
-                r = max(-c, min(c, r))
-
             done = 1.0 if (t + 1) >= last_idx else 0.0
 
-            transitions.append(
-                IQLRawTransition(
-                    patient_idx=i,
-                    t=t,
-                    t_target=t_target,
-                    H_t=H_t,
-                    H_t_next=H_next,
-                    action=torch.tensor(a_policy, dtype=torch.float32),
-                    reward=float(r),
-                    done=float(done),
-                    y_target=torch.tensor(y_target_np, dtype=torch.float32),
-                    delta_t_norm=delta_t_norm,
-                    delta_t_next_norm=delta_t_next_norm,
-                    a_prev_tanh=torch.tensor(a_prev_feat, dtype=torch.float32),
+            for _ in range(samples_per_transition):
+                t_target = int(rng.randint(low=t + 1, high=hi + 1))
+                y_target_np = data["outputs"][i, t_target, :].astype(np.float32)
+                delta_t_norm = max(0.0, float(t_target - t) / max_tau)
+                delta_t_next_norm = max(0.0, float(t_target - t - 1) / max_tau)
+
+                if reward_type == "negative_outcome_mse":
+                    r = -float(np.mean((y_next - y_target_np) ** 2))
+                elif reward_type == "negative_outcome":
+                    r = -float(np.mean(np.abs(y_next - y_target_np)))
+                elif reward_type == "progress":
+                    d_cur = float(np.mean(np.abs(y_cur - y_target_np)))
+                    d_nxt = float(np.mean(np.abs(y_next - y_target_np)))
+                    r = d_cur - d_nxt
+                else:
+                    r = -float(np.mean(np.abs(y_next - y_target_np)))
+
+                if reward_clip is not None and float(reward_clip) > 0.0:
+                    c = float(reward_clip)
+                    r = max(-c, min(c, r))
+
+                transitions.append(
+                    IQLRawTransition(
+                        patient_idx=i,
+                        t=t,
+                        t_target=t_target,
+                        H_t=H_t,
+                        H_t_next=H_next,
+                        action=torch.tensor(a_policy, dtype=torch.float32),
+                        reward=float(r),
+                        done=float(done),
+                        y_target=torch.tensor(y_target_np, dtype=torch.float32),
+                        delta_t_norm=delta_t_norm,
+                        delta_t_next_norm=delta_t_next_norm,
+                        a_prev_tanh=torch.tensor(a_prev_feat, dtype=torch.float32),
+                    )
                 )
-            )
 
     if str(reward_scale).lower() == "auto" and transitions:
         rewards = np.array([tr.reward for tr in transitions], dtype=np.float32)
@@ -148,7 +152,9 @@ def build_iql_raw_transitions(
     import logging
 
     logging.getLogger(__name__).info(
-        "Built %d raw IQL transitions (no precomputed states).", len(transitions)
+        "Built %d raw IQL transitions (no precomputed states, samples_per_transition=%d).",
+        len(transitions),
+        samples_per_transition,
     )
     return transitions
 

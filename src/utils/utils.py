@@ -486,13 +486,14 @@ def compute_weighted_wasserstein_geomloss(A, B, wa, wb=None, blur: float = 0.01,
     Aligned with ``CTD-NKO_IJCAI-main/src/models/wass_calculator.compute_weighted_wasserstein_geomloss``.
 
     Weighted Sinkhorn / Wasserstein-type loss between samples ``A`` and ``B`` using ``geomloss``.
-    ``wa`` are softmax-normalized on batch dimension (dim 0); if ``wb`` is omitted, ``B`` uses
-    uniform weights (softmax of ones on dim 0), matching the reference implementation.
+    ``wa`` are **raw logits / scores** before normalization; this function applies exactly one
+    ``F.softmax(..., dim=0)``. If ``wb`` is omitted, ``B`` uses uniform weights (softmax of ones
+    on dim 0), matching the reference implementation.
 
     Args:
         A: ``(n, T, dim)`` joint (or other) features per sequence timestep.
         B: ``(n, T, dim)`` marginal / shuffled counterpart, same shape as ``A``.
-        wa: ``(n, T, 1)`` raw weights (e.g. sigmoid from a weight net); internally ``F.softmax(..., dim=0)``.
+        wa: ``(n, T, 1)`` WeightNet logits (not pre-softmaxed weights).
         wb: optional ``(n, T, 1)``; default uniform over ``n`` at each ``t``.
         blur: Sinkhorn entropic temperature (CTD-NKO uses ``0.01``).
         p: ground cost exponent (CTD-NKO uses ``2``).
@@ -523,7 +524,7 @@ def compute_weighted_wasserstein_geomloss(A, B, wa, wb=None, blur: float = 0.01,
 def compute_weighted_wasserstein_joint_marginal_flat(
     joint_rep: torch.Tensor,
     marginal_rep: torch.Tensor,
-    w_t: torch.Tensor,
+    logits_w: torch.Tensor,
     blur: float = 0.01,
 ) -> torch.Tensor:
     """
@@ -533,6 +534,8 @@ def compute_weighted_wasserstein_joint_marginal_flat(
 
     CTD-NKO builds ``real_samples`` / ``fake_samples`` as ``[n, T, dim]``; this helper is for
     ``train_ct``-style batches where each row is already ``concat([Z_t, A_t], dim=-1)``.
+
+    ``logits_w`` are raw WeightNet outputs; softmax is applied once inside geomloss.
     """
     if joint_rep.shape != marginal_rep.shape:
         raise ValueError(
@@ -540,7 +543,7 @@ def compute_weighted_wasserstein_joint_marginal_flat(
             f"{tuple(joint_rep.shape)} vs {tuple(marginal_rep.shape)}"
         )
     n = joint_rep.size(0)
-    w = w_t.reshape(n, 1, 1).to(device=joint_rep.device, dtype=joint_rep.dtype)
+    w = logits_w.reshape(n, 1, 1).to(device=joint_rep.device, dtype=joint_rep.dtype)
     A = joint_rep.unsqueeze(1)
     B = marginal_rep.unsqueeze(1)
     return compute_weighted_wasserstein_geomloss(A, B, w, blur=blur)

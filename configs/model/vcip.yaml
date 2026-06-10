@@ -110,7 +110,7 @@ exp:
   iql_n_hidden: 2
   # iql_tau: 策略价值函数加权的 expectile 参数，控制“policy value”与“critic value”之间的偏置。具体地，TD3+BC 和 IQL 论文中用于 expectile regression，建议在 0.5~0.9 之间，越大代表更乐观估计。
   iql_tau: 0.5  # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_beta: 3.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
+  iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_discount: 0.99
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005
@@ -145,6 +145,9 @@ exp:
   # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
   # Must appear in iql_val_worlds.
   iql_val_selection_world: predictor
+  # Dump full resolved Hydra config at startup. Train scripts always log config;
+  # eval_iql_planner.py only logs when this is true (default false).
+  log_config: false
   # MLflow (train_ct.py, train_iql_planner.py, eval_iql_planner.py); default on.
   use_mlflow: true
   mlflow_experiment: vcip_tumor_one_step
@@ -171,18 +174,26 @@ exp:
   ct_w_clip: 5.0
   # --- CT+IQL unified EM (train_ct_iql_em.py) ---
   em_outer_iters: 50
-  em_m_steps_per_outer: 200
-  em_encoder_lr: 1.0e-5
+  em_m_steps_per_outer: 1000
+  em_encoder_lr: 5.0e-5
   em_encoder_max_grad_norm: 1.0
-  em_val_every: 5
+  em_val_every: 2
   em_val_metric: mae_uns
-  em_warmup_outer_iters: 2
-  # Full E-step passes over the train loader per outer iter (WeightNet updates).
-  # 3 is a practical default: 50 outer * 3 ≈ 150 E-epochs vs legacy train_ct 200.
-  em_e_epochs: 3
+  # M-step only: uniform w for first N outers; E-step always trains WeightNet.
+  em_warmup_outer_iters: 8
+  # CTD-style full-dataset WeightNet fit per E-step (epoch_w analogue).
+  em_e_epochs: 5
+  # WeightNet LR for full E-step (CTD-NKO uses 0.1 in wass_calculator.train_model).
+  em_e_w_lr: 0.01
+  # Refit WeightNet every N outer iters (1 = every outer); encoder/Q still update each outer.
+  em_e_refresh_every: 1
   # Rebuild HER raw transitions every N outer iters (new t_target / y_target / reward).
   # 1 = refresh every outer; 0 = build once at startup only.
-  em_her_refresh_every: 1
+  em_her_refresh_every: 10
+  # Number of fixed HER targets sampled for each factual (patient, t) transition
+  # whenever a raw replay is built. K>1 increases replay size without changing it
+  # across M-steps when em_her_refresh_every=0.
+  em_her_samples_per_transition: 1
   em_log_m_every: 50
   em_ckpt_dir: null
   em_eval_ckpt: ""

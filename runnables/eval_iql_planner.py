@@ -171,7 +171,8 @@ def _resolve_iql_ckpt(args: DictConfig, original_cwd: Path) -> Path:
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
 def main(args: DictConfig):
     OmegaConf.set_struct(args, False)
-    logger.info("\n" + OmegaConf.to_yaml(args, resolve=True))
+    if bool(OmegaConf.select(args, "exp.log_config", default=False)):
+        logger.info("\n" + OmegaConf.to_yaml(args, resolve=True))
 
     set_seed(args.exp.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
