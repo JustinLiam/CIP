@@ -271,6 +271,14 @@ class VCIPMlflowTracker:
             metrics[f"{prefix}/mae_norm"] = float(wm["mae_norm"])
             metrics[f"{prefix}/mae_uns"] = float(wm["mae_uns"])
             metrics[f"{prefix}/rmse_norm"] = float(wm["rmse_norm"])
+            if wm.get("rmse_uns") is not None:
+                metrics[f"{prefix}/rmse_uns"] = float(wm["rmse_uns"])
+            if wm.get("gift_rmse") is not None:
+                metrics[f"{prefix}/gift_rmse"] = float(wm["gift_rmse"])
+            if wm.get("gift_rmse_percent") is not None:
+                metrics[f"{prefix}/gift_rmse_percent"] = float(wm["gift_rmse_percent"])
+            if wm.get("gift_mae_percent") is not None:
+                metrics[f"{prefix}/gift_mae_percent"] = float(wm["gift_mae_percent"])
             metrics[f"{prefix}/{val_metric_key}"] = float(wm[val_metric_key])
             if w in improved:
                 metrics[f"{prefix}/best_improved"] = 1.0
@@ -336,4 +344,3 @@ class VCIPMlflowTracker:
 
 def _is_finite(x: float) -> bool:
     return x == x and abs(x) != float("inf")
-

@@ -39,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
+GIFT_TUMOR_VOLUME_NORMALIZER = 1150.0
+
 
 def _actions_to_sim_interval(raw: np.ndarray, max_action: float) -> np.ndarray:
     """
@@ -356,6 +358,14 @@ def main(args: DictConfig):
             mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
             mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
             rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
+            gift_tumor_norm_const = float(
+                OmegaConf.select(args, "exp.gift_tumor_volume_normalizer", default=GIFT_TUMOR_VOLUME_NORMALIZER)
+            )
+            if gift_tumor_norm_const <= 0:
+                raise ValueError("exp.gift_tumor_volume_normalizer must be positive.")
+            gift_rmse = rmse_uns
+            gift_rmse_percent = float(rmse_uns / gift_tumor_norm_const * 100.0)
+            gift_mae_percent = float(mae_uns / gift_tumor_norm_const * 100.0)
 
             logger.info("--- Aggregate (same protocol as optimize_interventions_onetime) ---")
             logger.info(f"Split: {split_name}")
@@ -388,12 +398,20 @@ def main(args: DictConfig):
             logger.info(
                 f"MAE normalized: {mae_norm:.6f} | MAE unscaled: {mae_uns:.6f} | RMSE unscaled: {rmse_uns:.6f}"
             )
+            logger.info(
+                f"GIFT-style tumor RMSE unscaled: {gift_rmse:.6f} | "
+                f"GIFT-style tumor RMSE (% of {gift_tumor_norm_const:g}): {gift_rmse_percent:.6f} | "
+                f"GIFT-style tumor MAE (% of {gift_tumor_norm_const:g}): {gift_mae_percent:.6f}"
+            )
 
             per_tau_metrics[tau] = {
                 "mae_norm": mae_norm,
                 "mae_uns": mae_uns,
                 "rmse_uns": rmse_uns,
                 "rmse_norm": rmse_norm,
+                "gift_rmse": gift_rmse,
+                "gift_rmse_percent": gift_rmse_percent,
+                "gift_mae_percent": gift_mae_percent,
                 "rmse_factual_norm": rmse_factual_norm,
                 "mean_batch_rmse_iql": float(np.mean(losses)),
                 "mean_batch_rmse_factual": float(np.mean(losses_2)),

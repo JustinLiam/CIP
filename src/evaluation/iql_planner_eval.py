@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 #   - "predictor": use the learned OutcomePredictor loaded from ct_best_encoder.pt
 #                  (model-based OPE; works on real data too).
 _VALID_WORLDS = ("sim", "predictor")
+GIFT_TUMOR_VOLUME_NORMALIZER = 1150.0
 
 
 def _actions_to_sim_interval(raw: np.ndarray, max_action: float) -> np.ndarray:
@@ -253,6 +254,9 @@ def _compute_world_metrics(
     mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
     mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
     rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
+    gift_rmse = rmse_uns
+    gift_rmse_percent = float(rmse_uns / GIFT_TUMOR_VOLUME_NORMALIZER * 100.0)
+    gift_mae_percent = float(mae_uns / GIFT_TUMOR_VOLUME_NORMALIZER * 100.0)
 
     out: Dict[str, Any] = {
         "mae_norm": mae_norm,
@@ -260,6 +264,9 @@ def _compute_world_metrics(
         "rmse_norm": rmse_norm,
         "rmse_uns": rmse_uns,
         "rmse_norm_x_std": rmse_norm * std,
+        "gift_rmse": gift_rmse,
+        "gift_rmse_percent": gift_rmse_percent,
+        "gift_mae_percent": gift_mae_percent,
         "mean_batch_rmse_plan": float(np.mean(batch_rmse_plan)) if batch_rmse_plan else None,
         "mean_batch_rmse_factual": float(np.mean(batch_rmse_fact)) if batch_rmse_fact else None,
         "rmse_factual_norm": rmse_factual_norm,
