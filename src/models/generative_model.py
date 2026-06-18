@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from geomloss import SamplesLoss
 import torch.distributions as dist
+from omegaconf import OmegaConf
 from src.models.dynamic_model import DynamicParamNetwork
 from torch.distributions import Normal
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
@@ -34,6 +35,9 @@ class GenerativeModel(nn.Module):
             num_heads=4,
             num_layers=self.num_layers,
             dropout=self.dropout,
+            local_conv_layers=int(OmegaConf.select(config, "model.inference.local_conv_layers", default=0)),
+            local_conv_kernel_size=int(OmegaConf.select(config, "model.inference.local_conv_kernel_size", default=6)),
+            local_conv_dilation=int(OmegaConf.select(config, "model.inference.local_conv_dilation", default=1)),
         )
         self.projection_head = ProjectionHead(input_dim=64, hidden_dim=64, output_dim=self.z_dim)
 

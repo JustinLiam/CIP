@@ -111,6 +111,9 @@ class CTDeconfoundModel(nn.Module):
         self.z_dim = int(md["z_dim"])
         dropout = float(_cfg_sel(cfg, "exp.dropout", 0.1))
         num_layers = int(md["inference"]["num_layers"])
+        local_conv_layers = int(_cfg_sel(cfg, "model.inference.local_conv_layers", 0))
+        local_conv_kernel_size = int(_cfg_sel(cfg, "model.inference.local_conv_kernel_size", 6))
+        local_conv_dilation = int(_cfg_sel(cfg, "model.inference.local_conv_dilation", 1))
 
         self.ct_encoder = CTHistoryEncoder(
             x_dim=x_dim,
@@ -121,6 +124,9 @@ class CTDeconfoundModel(nn.Module):
             num_heads=4,
             num_layers=num_layers,
             dropout=dropout,
+            local_conv_layers=local_conv_layers,
+            local_conv_kernel_size=local_conv_kernel_size,
+            local_conv_dilation=local_conv_dilation,
         )
         self.projection = ProjectionHead(input_dim=64, hidden_dim=64, output_dim=self.z_dim)
 

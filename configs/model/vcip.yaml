@@ -18,6 +18,11 @@ model:
     _target_: src.models.inference_model.InferenceModel
     hidden_dim: 16
     num_layers: 2
+    # Local-global CTHistoryEncoder switch. Keep default 0 to preserve current CT
+    # unless an experiment explicitly enables low-layer causal depthwise Conv1d.
+    local_conv_layers: 0
+    local_conv_kernel_size: 6
+    local_conv_dilation: 1
     hiddens_F_mu:
     - 16
     # - 16
