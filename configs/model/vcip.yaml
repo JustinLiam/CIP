@@ -108,8 +108,8 @@ exp:
   iql_dataset_actions_unit_interval: true
   iql_hidden_dim: 256
   iql_n_hidden: 2
-  # iql_tau: 策略价值函数加权的 expectile 参数，控制“policy value”与“critic value”之间的偏置。具体地，TD3+BC 和 IQL 论文中用于 expectile regression，建议在 0.5~0.9 之间，越大代表更乐观估计。
-  iql_tau: 0.5  # revised in April 26, Sunday, by gridsearch in Thinkstation
+  # iql_tau: expectile 参数，决定“policy value”与“critic value”间的权衡。该值越高，表示算法更乐观、与 offline data 的 policy 匹配度更低、具有更强的探索性；越低则更贴近 offline data，探索性更差。一般建议 0.5~0.9 之间（参考 TD3+BC 和 IQL 论文）。
+  iql_tau: 0.7  # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_discount: 0.99
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
@@ -189,7 +189,7 @@ exp:
   em_e_refresh_every: 1
   # Rebuild HER raw transitions every N outer iters (new t_target / y_target / reward).
   # 1 = refresh every outer; 0 = build once at startup only.
-  em_her_refresh_every: 10
+  em_her_refresh_every: 0
   # Number of fixed HER targets sampled for each factual (patient, t) transition
   # whenever a raw replay is built. K>1 increases replay size without changing it
   # across M-steps when em_her_refresh_every=0.

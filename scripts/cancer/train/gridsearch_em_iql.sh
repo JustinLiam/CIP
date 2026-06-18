@@ -8,20 +8,21 @@
 #   exp.iql_qf_lr             - 1e-4, 3e-4, 1e-3
 #   exp.iql_max_grad_norm     - 2.0, 5.0
 #   exp.em_m_steps_per_outer  - 500, 1000, 2000
-#   exp.seed                  - 3, 30, 3030, 30303
+#   exp.seed                  - 2020, 20202, 202020 (override via GRID_SEEDS)
 #
 # Fixed (not swept):
-#   exp.em_her_refresh_every=1
+#   exp.em_her_refresh_every=0
+#   exp.em_her_samples_per_transition=1  (vcip.yaml default)
 #   exp.iql_vf_lr = exp.iql_actor_lr  (tied each combo)
 #
-# Combos per seed: 3*3*3*3*2*3 = 486  |  Total jobs (4 seeds): 1944
+# Combos per seed: 3*3*3*3*2*3 = 486  |  Total jobs (3 seeds): 1458
 #
-# Results: MLflow experiment (default: em_iql_grid)
+# Results: MLflow experiment (default: em_iql_grid_her0)
 #   train stage tag: ct_iql_em | eval stage tag: eval
 #   tags: combo_id, seed, gamma
 #
-# Checkpoints (local per machine):
-#   grid_results/em_iql_grid/gamma_{GAMMA}/ckpts/{tag}/ct_iql_em_best.pt
+# Checkpoints (per machine unless grid_results is on shared NFS):
+#   grid_results/em_iql_grid_her0/gamma_{GAMMA}/ckpts/{tag}/ct_iql_em_best.pt
 #
 # Usage (from repo root):
 #   bash scripts/cancer/train/gridsearch_em_iql.sh [GPU] [GAMMA]
@@ -34,7 +35,7 @@
 #   GRID_QF_LR_LIST="1e-4 3e-4"               - override qf_lr list
 #   GRID_MAX_GRAD_LIST="2.0 5.0"              - override max_grad list
 #   GRID_M_STEPS_LIST="500 1000"              - override m_steps list
-#   GRID_MLFLOW_EXPERIMENT=em_iql_grid        - MLflow experiment name
+#   GRID_MLFLOW_EXPERIMENT=em_iql_grid_her0   - MLflow experiment name
 #   GRID_MLFLOW_URI=http://host:5000          - central tracking server (see MLflow note below)
 #   GRID_WORKER_ID=0 GRID_NUM_WORKERS=6       - shard jobs across cluster workers/GPUs
 #   GRID_SKIP_EVAL=1                          - train only
@@ -68,7 +69,7 @@ GAMMA="${2:-4}"
 
 GRID_WORKER_ID="${GRID_WORKER_ID:-0}"
 GRID_NUM_WORKERS="${GRID_NUM_WORKERS:-1}"
-GRID_MLFLOW_EXPERIMENT="${GRID_MLFLOW_EXPERIMENT:-em_iql_grid}"
+GRID_MLFLOW_EXPERIMENT="${GRID_MLFLOW_EXPERIMENT:-em_iql_grid_her0}"
 GRID_MLFLOW_URI="${GRID_MLFLOW_URI:-}"
 GRID_SKIP_EVAL="${GRID_SKIP_EVAL:-0}"
 GRID_FORCE="${GRID_FORCE:-0}"
@@ -81,7 +82,7 @@ fi
 if [[ -n "${GRID_SEEDS:-}" ]]; then
   read -r -a SEEDS <<< "${GRID_SEEDS}"
 else
-  SEEDS=(3 30 303)
+  SEEDS=(2020 20202 202020)
 fi
 
 if [[ -n "${GRID_BETA_LIST:-}" ]]; then
@@ -168,7 +169,7 @@ encode_m_steps() {
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "${ROOT}"
 
-GRID_ROOT="${ROOT}/grid_results/em_iql_grid/gamma_${GAMMA}"
+GRID_ROOT="${ROOT}/grid_results/em_iql_grid_her0/gamma_${GAMMA}"
 mkdir -p "${GRID_ROOT}/ckpts" "${GRID_ROOT}/logs" "${GRID_ROOT}/done"
 
 MLFLOW_URI_ARGS=()
@@ -231,13 +232,14 @@ for beta in "${BETA_LIST[@]}"; do
               echo "  iql_beta=${beta} iql_tau=${tau}"
               echo "  iql_actor_lr=${actor_lr} iql_qf_lr=${qf_lr} iql_vf_lr=${actor_lr}"
               echo "  iql_max_grad_norm=${max_grad} em_m_steps_per_outer=${m_steps}"
-              echo "  em_her_refresh_every=1 seed=${seed}"
+              echo "  em_her_refresh_every=0 em_her_samples_per_transition=1 seed=${seed}"
 
               train_log="${log_dir}/train.log"
               CUDA_VISIBLE_DEVICES="${GPU}" python runnables/train_ct_iql_em.py \
                 +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${GAMMA}*" \
                 exp.seed="${seed}" dataset.coeff="${GAMMA}" \
-                "exp.em_her_refresh_every=1" \
+                "exp.em_her_refresh_every=0" \
+                "exp.em_her_samples_per_transition=1" \
                 "exp.iql_beta=${beta}" \
                 "exp.iql_tau=${tau}" \
                 "exp.iql_actor_lr=${actor_lr}" \
@@ -268,6 +270,8 @@ for beta in "${BETA_LIST[@]}"; do
                   echo "iql_qf_lr=${qf_lr}"
                   echo "iql_max_grad_norm=${max_grad}"
                   echo "em_m_steps_per_outer=${m_steps}"
+                  echo "em_her_refresh_every=0"
+                  echo "em_her_samples_per_transition=1"
                   echo "em_ckpt=${em_ckpt}"
                   echo "train_log=${train_log}"
                 } > "${done_flag}"
@@ -295,7 +299,8 @@ for beta in "${BETA_LIST[@]}"; do
                 echo "iql_qf_lr=${qf_lr}"
                 echo "iql_max_grad_norm=${max_grad}"
                 echo "em_m_steps_per_outer=${m_steps}"
-                echo "em_her_refresh_every=1"
+                echo "em_her_refresh_every=0"
+                echo "em_her_samples_per_transition=1"
                 echo "em_ckpt=${em_ckpt}"
                 echo "train_log=${train_log}"
                 echo "eval_log=${eval_log}"
