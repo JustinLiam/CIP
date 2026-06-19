@@ -88,8 +88,11 @@ except Exception:
     raise SystemExit(0)
 extra = c.get("extra") or {}
 outer = c.get("outer_iter", extra.get("outer_iter", "NA"))
-metric = extra.get("val_metric", "NA")
-val = extra.get("val_score", extra.get("best_val_mae_uns", extra.get("val_mae_uns", "NA")))
+metric = c.get("val_metric", extra.get("val_metric", "NA"))
+val = c.get(
+    "val_score",
+    extra.get("val_score", extra.get("best_val_mae_uns", extra.get("val_mae_uns", "NA"))),
+)
 def f(v):
     try:
         return f"{float(v):.8g}"
