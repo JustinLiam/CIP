@@ -127,7 +127,7 @@ exp:
   # so successive checkpoints share the same eval protocol.
   iql_val_every: 200
   iql_val_batch_size: null
-  # Metric to minimize for best checkpoint: mae_uns | mae_norm
+  # Metric to minimize for best checkpoint: mae_uns | mae_norm | rmse_uns | rmse_norm
   iql_val_metric: mae_uns
   # Also save final-step weights to iql_planner_last.pt when val is enabled
   iql_val_save_last: true

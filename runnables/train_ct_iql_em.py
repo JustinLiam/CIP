@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
+VAL_METRIC_KEYS = ("mae_uns", "mae_norm", "rmse_uns", "rmse_norm", "gift_rmse", "gift_rmse_percent")
+
 
 def _state_dict_to_cpu(obj):
     if torch.is_tensor(obj):
@@ -194,6 +196,10 @@ def main(args: DictConfig):
     ckpt_path = out_dir / "ct_iql_em_best.pt"
 
     val_metric_key = str(OmegaConf.select(args, "exp.em_val_metric", default="mae_uns")).strip().lower()
+    if val_metric_key not in VAL_METRIC_KEYS:
+        raise ValueError(
+            f"exp.em_val_metric must be one of {VAL_METRIC_KEYS}, got {val_metric_key!r}"
+        )
     val_worlds = tuple(
         str(w).strip()
         for w in OmegaConf.select(args, "exp.em_val_worlds", default=["sim"])

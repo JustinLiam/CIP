@@ -41,6 +41,7 @@ EM_M_STEPS="${EM_M_STEPS:-1000}"
 EM_HER_SAMPLES="${EM_HER_SAMPLES:-1}"
 EM_HER_REFRESH="${EM_HER_REFRESH:-0}"
 EVAL_TAU_LIST="${EVAL_TAU_LIST:-[1,2,3,4,5,6]}"
+VAL_METRIC="${VAL_METRIC:-rmse_uns}"
 GPU_WAIT_MEMORY_MB="${GPU_WAIT_MEMORY_MB:-1000}"
 GPU_WAIT_SECONDS="${GPU_WAIT_SECONDS:-60}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-em_iql_local_global_gift_protocol}"
@@ -55,7 +56,7 @@ mkdir -p "${GRID_ROOT}/logs" "${GRID_ROOT}/ckpts" "${GRID_ROOT}/done"
 
 SUMMARY="${GRID_ROOT}/summary.csv"
 if [[ ! -f "${SUMMARY}" ]]; then
-  echo "combo_id,seed,split,local_conv_layers,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,iql_tau,iql_actor_lr,iql_qf_lr,iql_vf_lr,iql_beta,iql_max_grad_norm,em_m_steps_per_outer,em_her_samples_per_transition,em_her_refresh_every,best_outer,best_val_mae_uns,eval_tau,eval_mae_norm,eval_mae_uns,eval_rmse_norm,eval_rmse_norm_x_std,eval_rmse_uns,gift_rmse,gift_rmse_percent,gift_mae_percent,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
+  echo "combo_id,seed,split,local_conv_layers,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,iql_tau,iql_actor_lr,iql_qf_lr,iql_vf_lr,iql_beta,iql_max_grad_norm,em_m_steps_per_outer,em_her_samples_per_transition,em_her_refresh_every,best_outer,best_val_metric,best_val_score,eval_tau,eval_mae_norm,eval_mae_uns,eval_rmse_norm,eval_rmse_norm_x_std,eval_rmse_uns,gift_rmse,gift_rmse_percent,gift_mae_percent,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
 fi
 
 MLFLOW_URI_ARGS=()
@@ -87,13 +88,14 @@ except Exception:
     raise SystemExit(0)
 extra = c.get("extra") or {}
 outer = c.get("outer_iter", extra.get("outer_iter", "NA"))
-val = extra.get("best_val_mae_uns", extra.get("val_mae_uns", "NA"))
+metric = extra.get("val_metric", "NA")
+val = extra.get("val_score", extra.get("best_val_mae_uns", extra.get("val_mae_uns", "NA")))
 def f(v):
     try:
         return f"{float(v):.8g}"
     except Exception:
         return str(v)
-print(f(outer), f(val))
+print(f(outer), str(metric), f(val))
 PY
 }
 
@@ -102,15 +104,16 @@ append_eval_rows() {
   local seed="$2"
   local split="$3"
   local best_outer="$4"
-  local best_val="$5"
-  local em_ckpt="$6"
-  local train_log="$7"
-  local eval_log="$8"
-  local finished_at="$9"
+  local best_val_metric="$5"
+  local best_val_score="$6"
+  local em_ckpt="$7"
+  local train_log="$8"
+  local eval_log="$9"
+  local finished_at="${10}"
 
   python - "${SUMMARY}" "${combo_id}" "${seed}" "${split}" "${IQL_TAU}" "${IQL_ACTOR_LR}" "${IQL_QF_LR}" "${IQL_VF_LR}" \
     "${IQL_BETA}" "${IQL_MAX_GRAD}" "${EM_M_STEPS}" "${EM_HER_SAMPLES}" "${EM_HER_REFRESH}" \
-    "${best_outer}" "${best_val}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY'
+    "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY'
 import csv
 import os
 import re
@@ -119,7 +122,7 @@ import sys
 (
     summary_path, combo_id, seed, split, iql_tau, actor_lr, qf_lr, vf_lr,
     iql_beta, iql_max_grad, em_m_steps, em_her_samples, em_her_refresh,
-    best_outer, best_val, em_ckpt, train_log, eval_log, finished_at
+    best_outer, best_val_metric, best_val_score, em_ckpt, train_log, eval_log, finished_at
 ) = sys.argv[1:]
 
 def empty_metrics():
@@ -183,7 +186,7 @@ fieldnames = [
     "combo_id", "seed", "split", "local_conv_layers", "dataset_train", "dataset_val", "dataset_test",
     "max_seq_length", "min_seq_length", "iql_tau", "iql_actor_lr", "iql_qf_lr", "iql_vf_lr",
     "iql_beta", "iql_max_grad_norm", "em_m_steps_per_outer", "em_her_samples_per_transition",
-    "em_her_refresh_every", "best_outer", "best_val_mae_uns", "eval_tau", "eval_mae_norm",
+    "em_her_refresh_every", "best_outer", "best_val_metric", "best_val_score", "eval_tau", "eval_mae_norm",
     "eval_mae_uns", "eval_rmse_norm", "eval_rmse_norm_x_std", "eval_rmse_uns", "gift_rmse",
     "gift_rmse_percent", "gift_mae_percent", "em_ckpt", "train_log", "eval_log", "finished_at",
 ]
@@ -210,7 +213,8 @@ with open(summary_path, "a", newline="", encoding="utf-8") as f:
             "em_her_samples_per_transition": em_her_samples,
             "em_her_refresh_every": em_her_refresh,
             "best_outer": best_outer,
-            "best_val_mae_uns": best_val,
+            "best_val_metric": best_val_metric,
+            "best_val_score": best_val_score,
             "em_ckpt": em_ckpt,
             "train_log": train_log,
             "eval_log": eval_log,
@@ -225,7 +229,7 @@ PY
 run_one() {
   local seed="$1"
   local local_layers=1
-  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k"
+  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_val${VAL_METRIC}"
   local tag="${combo_id}_seed${seed}"
   local em_dir="${GRID_ROOT}/ckpts/${tag}"
   local em_ckpt="${em_dir}/ct_iql_em_best.pt"
@@ -252,6 +256,7 @@ run_one() {
   echo "  seed=${seed} gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
   echo "  local_conv_layers=${local_layers}"
   echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
+  echo "  val_metric=${VAL_METRIC}"
 
   wait_for_gpu
   CUDA_VISIBLE_DEVICES="${GPU}" python -u runnables/train_ct_iql_em.py \
@@ -274,6 +279,8 @@ run_one() {
     "exp.iql_vf_lr=${IQL_VF_LR}" \
     "exp.iql_max_grad_norm=${IQL_MAX_GRAD}" \
     "exp.em_m_steps_per_outer=${EM_M_STEPS}" \
+    "exp.em_val_metric=${VAL_METRIC}" \
+    "exp.iql_val_metric=${VAL_METRIC}" \
     "+exp.em_ckpt_dir=${em_dir}" \
     "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
     "exp.mlflow_combo_id=${combo_id}" \
@@ -304,15 +311,15 @@ run_one() {
     "${MLFLOW_URI_ARGS[@]}" \
     2>&1 | tee "${eval_log}"
 
-  local best_outer best_val finished_at split
-  read -r best_outer best_val <<< "$(read_em_metrics "${em_ckpt}")"
+  local best_outer best_val_metric best_val_score finished_at split
+  read -r best_outer best_val_metric best_val_score <<< "$(read_em_metrics "${em_ckpt}")"
   finished_at="$(date -Iseconds)"
   if [[ "${TEST_SPLIT}" == "true" ]]; then
     split="test"
   else
     split="val"
   fi
-  append_eval_rows "${combo_id}" "${seed}" "${split}" "${best_outer}" "${best_val}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}"
+  append_eval_rows "${combo_id}" "${seed}" "${split}" "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}"
 
   {
     echo "finished_at=${finished_at}"

@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
+VAL_METRIC_KEYS = ("mae_uns", "mae_norm", "rmse_uns", "rmse_norm", "gift_rmse", "gift_rmse_percent")
+
 
 def _state_dict_to_cpu(obj):
     if torch.is_tensor(obj):
@@ -175,8 +177,10 @@ def main(args: DictConfig):
 
     iql_val_every = int(OmegaConf.select(args, "exp.iql_val_every", default=0))
     val_metric_key = str(OmegaConf.select(args, "exp.iql_val_metric", default="mae_uns")).strip().lower()
-    if val_metric_key not in ("mae_uns", "mae_norm"):
-        raise ValueError(f"exp.iql_val_metric must be mae_uns or mae_norm, got {val_metric_key!r}")
+    if val_metric_key not in VAL_METRIC_KEYS:
+        raise ValueError(
+            f"exp.iql_val_metric must be one of {VAL_METRIC_KEYS}, got {val_metric_key!r}"
+        )
     val_bs_cfg = OmegaConf.select(args, "exp.iql_val_batch_size", default=None)
     val_bs = int(val_bs_cfg) if val_bs_cfg is not None else int(
         OmegaConf.select(args, "exp.batch_size_val", default=128)
@@ -323,6 +327,9 @@ def main(args: DictConfig):
                         "mae_norm": float(per_world[w]["mae_norm"]),
                         "mae_uns": float(per_world[w]["mae_uns"]),
                         "rmse_norm": float(per_world[w]["rmse_norm"]),
+                        "rmse_uns": float(per_world[w]["rmse_uns"]),
+                        "gift_rmse": float(per_world[w]["gift_rmse"]),
+                        "gift_rmse_percent": float(per_world[w]["gift_rmse_percent"]),
                     }
                     if m_w < best_per_world[w]["metric"]:
                         best_per_world[w]["metric"] = m_w
