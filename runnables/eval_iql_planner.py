@@ -211,7 +211,6 @@ def main(args: DictConfig):
         split_name = "val"
 
     batch_size = int(OmegaConf.select(args, "exp.batch_size_val", default=128))
-    dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=batch_size, shuffle=False)
 
     inference_model = InferenceModel(args).to(device)
     em_eval_ckpt = str(OmegaConf.select(args, "exp.em_eval_ckpt", default="")).strip()
@@ -248,6 +247,7 @@ def main(args: DictConfig):
     autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
     mean_ser, std_ser = dataset_collection.train_scaling_params
     tau_list = _resolve_eval_tau_list(args)
+    original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=max(tau_list)))
 
     mlf = VCIPMlflowTracker.from_hydra(args, stage="eval")
     mlf.tags["eval_split"] = split_name
@@ -257,9 +257,14 @@ def main(args: DictConfig):
     per_tau_metrics: Dict[int, Dict[str, float]] = {}
     try:
         for tau in tau_list:
+            args.exp.tau = int(tau)
+            try:
+                dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=batch_size, shuffle=False)
+            finally:
+                args.exp.tau = original_exp_tau
             logger.info(
                 f"IQL eval autoregressive action rollout: {autoregressive_eval} "
-                f"(tau={tau}, max_tau={max_tau}, split={split_name})"
+                f"(tau={tau}, target_horizon={tau}, max_tau={max_tau}, split={split_name})"
             )
 
             losses = []
@@ -419,6 +424,7 @@ def main(args: DictConfig):
 
         mlf.log_eval_tau_metrics(per_tau_metrics, step=0)
     finally:
+        args.exp.tau = original_exp_tau
         mlf.finish(final_step=0)
 
 

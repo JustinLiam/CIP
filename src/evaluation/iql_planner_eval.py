@@ -9,7 +9,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.distributions import Distribution
 
 from src.data.cip_dataset import CIPDataset, get_dataloader
@@ -331,7 +331,12 @@ def aggregate_iql_planner_metrics(
     mean_ser, std_ser = dataset_collection.train_scaling_params
     scaling_params = dataset_collection.train_scaling_params
 
-    dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=val_batch_size, shuffle=False)
+    original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=tau))
+    args.exp.tau = int(tau)
+    try:
+        dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=val_batch_size, shuffle=False)
+    finally:
+        args.exp.tau = original_exp_tau
 
     collect_series = bool(return_series or debug_panel)
     ture_output_list: list = []
