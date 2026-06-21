@@ -24,6 +24,8 @@ class EMTrainConfig:
     log_m_every: int = 50
     e_epochs: int = 5
     e_batch_size: int = 512
+    encoder_diagnostics: bool = False
+    encoder_diagnostics_every: int = 50
 
 
 def run_e_step_full(
@@ -71,17 +73,35 @@ def run_m_step_steps(
     uniform = outer_iter <= cfg.warmup_outer_iters
     keys = ("value_loss", "q_loss", "actor_loss", "w_mean", "w_std")
     sums = {k: 0.0 for k in keys}
+    counts = {k: 0 for k in keys}
+    diag_every = max(1, int(cfg.encoder_diagnostics_every))
 
     for step in range(1, num_steps + 1):
         batch = replay.sample(cfg.m_batch_size)
+        collect_diag = bool(cfg.encoder_diagnostics) and (
+            step % diag_every == 0 or step == num_steps
+        )
         logs = planner.m_step_weighted(
             batch,
             encoder_model=model,
             encoder_optimizer=encoder_optimizer,
             uniform_weights=uniform,
+            collect_encoder_diagnostics=collect_diag,
         )
-        for k in keys:
-            sums[k] += logs.get(k, 0.0)
+        for k, value in logs.items():
+            if k not in sums:
+                sums[k] = 0.0
+                counts[k] = 0
+            sums[k] += float(value)
+            counts[k] += 1
 
     nb = max(num_steps, 1)
-    return {k: sums[k] / nb for k in keys}
+    out = {}
+    for k, value in sums.items():
+        denom = nb if k in keys else max(counts.get(k, 0), 1)
+        out[k] = value / denom
+    if cfg.encoder_diagnostics:
+        out["enc_diag_collected_steps"] = float(
+            max(counts.get("enc_update_norm/projection", 0), counts.get("enc_grad_norm/projection", 0))
+        )
+    return out

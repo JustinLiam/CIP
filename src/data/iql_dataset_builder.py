@@ -1,4 +1,5 @@
-from typing import Dict, Optional
+import ast
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
@@ -15,6 +16,28 @@ def dataset_actions_to_tanh_policy_space(actions: np.ndarray, max_action: float)
         return actions.astype(np.float32)
     a = np.clip(actions.astype(np.float32), 0.0, max_action)
     return (2.0 * a - max_action).astype(np.float32)
+
+
+def huber_loss_np(error: np.ndarray, delta: float) -> np.ndarray:
+    """Elementwise Huber loss in outcome space."""
+    d = float(delta)
+    if d <= 0:
+        raise ValueError("huber delta must be positive.")
+    abs_error = np.abs(error)
+    return np.where(abs_error <= d, 0.5 * error ** 2, d * (abs_error - 0.5 * d))
+
+
+def horizon_remaining_distance_reward_np(
+    y_next: np.ndarray,
+    y_target: np.ndarray,
+    *,
+    t: int,
+    t_target: int,
+) -> float:
+    """Distance-to-goal reward scaled by remaining horizon after the transition."""
+    h_next = max(int(t_target) - (int(t) + 1), 0)
+    d_next = float(np.sqrt(np.mean((y_next - y_target) ** 2)))
+    return -d_next / np.sqrt(float(h_next + 1))
 
 
 def align_h_t_static_to_history(H_t: Dict) -> Dict:
@@ -37,6 +60,56 @@ def align_h_t_static_to_history(H_t: Dict) -> Dict:
 
 def _to_torch(arr: np.ndarray, device: str) -> torch.Tensor:
     return torch.tensor(arr, dtype=torch.float32, device=device)
+
+
+def _coerce_target_horizons(target_horizons: Optional[Iterable[int]], max_tau: float) -> List[int]:
+    if target_horizons is None:
+        return list(range(1, int(max_tau) + 1))
+    if isinstance(target_horizons, str):
+        raw = target_horizons.strip()
+        if raw.startswith("["):
+            target_horizons = ast.literal_eval(raw)
+        else:
+            target_horizons = [x.strip() for x in raw.split(",") if x.strip()]
+    out = sorted({int(h) for h in target_horizons if int(h) > 0})
+    if not out:
+        raise ValueError("target_horizons must contain at least one positive horizon.")
+    return out
+
+
+def _sample_target_indices(
+    *,
+    t: int,
+    last_idx: int,
+    max_tau: float,
+    samples_per_transition: int,
+    target_sampling: str,
+    target_horizons: Optional[Iterable[int]],
+) -> List[int]:
+    hi = min(t + int(max_tau), last_idx)
+    if hi <= t:
+        return []
+
+    mode = str(target_sampling).strip().lower()
+    if mode in ("random", "random_future", "future"):
+        return [int(np.random.randint(low=t + 1, high=hi + 1)) for _ in range(samples_per_transition)]
+
+    if mode in ("horizon_aligned", "aligned", "fixed_horizon"):
+        horizons = [
+            h
+            for h in _coerce_target_horizons(target_horizons, max_tau)
+            if h <= int(max_tau) and t + h <= last_idx
+        ]
+        if not horizons:
+            return []
+        replace = len(horizons) < samples_per_transition
+        size = samples_per_transition if replace else min(samples_per_transition, len(horizons))
+        chosen = np.random.choice(horizons, size=size, replace=replace)
+        return [t + int(h) for h in sorted(np.asarray(chosen, dtype=np.int64).tolist())]
+
+    raise ValueError(
+        f"Unknown target_sampling={target_sampling!r}; expected 'random_future' or 'horizon_aligned'."
+    )
 
 
 def _static_for_prefix(data: Dict[str, np.ndarray], patient_idx: int, prefix_len: int) -> np.ndarray:
@@ -67,6 +140,11 @@ def build_iql_transitions_from_ct(
     max_tau: float = 12.0,
     reward_clip: float = 1.0,
     reward_scale: str = "none",
+    reward_huber_delta: float = 1.0,
+    samples_per_transition: int = 1,
+    target_sampling: str = "horizon_aligned",
+    target_horizons: Optional[Iterable[int]] = None,
+    horizon_terminal_done: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
     Build offline RL transitions (s, a, r, s', done) from longitudinal dataset.
@@ -84,7 +162,9 @@ def build_iql_transitions_from_ct(
 
     ``reward_type`` selects the per-step scalar:
       * ``"negative_outcome_mse"``  (legacy)      r = -mean((y_{t+1} - y_target)^2)
+      * ``"negative_outcome_huber"`` (Huber)      r = -mean(Huber(y_{t+1} - y_target))
       * ``"negative_outcome"``      (L1)          r = -mean(|y_{t+1} - y_target|)
+      * ``"horizon_remaining"``                   r = -RMSE(y_{t+1}, y_target) / sqrt(h_next + 1)
       * ``"progress"`` (RECOMMENDED, new default) r = |y_t - y_target| - |y_{t+1} - y_target|
         Progress reward. Σ_t r_t telescopes to ``|y_t - y_target| - |y_T - y_target|``, so
         V*(s_t) is the expected *remaining* distance improvement under the policy —
@@ -111,6 +191,7 @@ def build_iql_transitions_from_ct(
 
     if max_tau <= 0:
         raise ValueError("max_tau must be positive for horizon-aware IQL transitions.")
+    samples_per_transition = max(1, int(samples_per_transition))
 
     states, actions, rewards, next_states, dones = [], [], [], [], []
 
@@ -145,26 +226,22 @@ def build_iql_transitions_from_ct(
                 z_t, _, _ = inference_model.ct_hidden_history(H_t)
                 z_vec = z_t.squeeze(0).detach().cpu().numpy()
 
-                # HER: sample future target index t_target with t < t_target <= min(t + max_tau, last_idx)
-                hi = min(t + int(max_tau), last_idx)
-                if hi <= t:
+                target_indices = _sample_target_indices(
+                    t=t,
+                    last_idx=last_idx,
+                    max_tau=max_tau,
+                    samples_per_transition=samples_per_transition,
+                    target_sampling=target_sampling,
+                    target_horizons=target_horizons,
+                )
+                if not target_indices:
                     continue
-                t_target = int(np.random.randint(low=t + 1, high=hi + 1))
-
-                y_target = data["outputs"][i, t_target, :].astype(np.float32)
-                delta_t = float(t_target - t)
-                delta_t_norm = max(0.0, delta_t / max_tau)
-                delta_t_next_norm = max(0.0, (delta_t - 1.0) / max_tau)
 
                 a_prev_raw = data["current_treatments"][i, t - 1, :].astype(np.float32)
                 if dataset_actions_unit_interval:
                     a_prev_feat = dataset_actions_to_tanh_policy_space(a_prev_raw, max_action)
                 else:
                     a_prev_feat = a_prev_raw
-
-                s = np.concatenate(
-                    [z_vec, y_target, np.array([delta_t_norm], dtype=np.float32), a_prev_feat], axis=0
-                )
 
                 a = data["current_treatments"][i, t, :].astype(np.float32)
                 if dataset_actions_unit_interval:
@@ -189,34 +266,56 @@ def build_iql_transitions_from_ct(
 
                 z_next, _, _ = inference_model.ct_hidden_history(H_next)
                 z_next_vec = z_next.squeeze(0).detach().cpu().numpy()
-                # At t+1 the "previous action" feature is a_t (behavior action at t), i.e. this transition's a.
-                s_next = np.concatenate(
-                    [z_next_vec, y_target, np.array([delta_t_next_norm], dtype=np.float32), a], axis=0
-                )
-
-                done = 1.0 if (t + 1) >= last_idx else 0.0
                 y_next = data["outputs"][i, t + 1, :].astype(np.float32)
                 y_cur = data["outputs"][i, t, :].astype(np.float32)
-                # See docstring for the reward design rationale. The default
-                # "progress" signal telescopes so V(s) encodes remaining distance
-                # improvement — directly aligned with long-horizon planning.
-                if reward_type == "negative_outcome_mse":
-                    r = -float(np.mean((y_next - y_target) ** 2))
-                elif reward_type == "negative_outcome":
-                    r = -float(np.mean(np.abs(y_next - y_target)))
-                elif reward_type == "progress":
-                    d_cur = float(np.mean(np.abs(y_cur - y_target)))
-                    d_nxt = float(np.mean(np.abs(y_next - y_target)))
-                    r = d_cur - d_nxt
-                else:
-                    r = -float(np.mean(np.abs(y_next - y_target)))
 
-                if reward_clip is not None and float(reward_clip) > 0.0:
-                    c = float(reward_clip)
-                    if r > c:
-                        r = c
-                    elif r < -c:
-                        r = -c
+                for t_target in target_indices:
+                    y_target = data["outputs"][i, t_target, :].astype(np.float32)
+                    delta_t = float(t_target - t)
+                    delta_t_norm = max(0.0, delta_t / max_tau)
+                    delta_t_next_norm = max(0.0, (delta_t - 1.0) / max_tau)
+
+                    # At t+1 the "previous action" feature is a_t (behavior action at t), i.e. this transition's a.
+                    s_next = np.concatenate(
+                        [z_next_vec, y_target, np.array([delta_t_next_norm], dtype=np.float32), a], axis=0
+                    )
+
+                    done = 1.0 if (t + 1) >= last_idx else 0.0
+                    if horizon_terminal_done and (t + 1) >= t_target:
+                        done = 1.0
+                    # See docstring for the reward design rationale. The default
+                    # "progress" signal telescopes so V(s) encodes remaining distance
+                    # improvement — directly aligned with long-horizon planning.
+                    if reward_type == "negative_outcome_mse":
+                        r = -float(np.mean((y_next - y_target) ** 2))
+                    elif reward_type in ("negative_outcome_huber", "huber", "smooth_l1"):
+                        r = -float(np.mean(huber_loss_np(y_next - y_target, reward_huber_delta)))
+                    elif reward_type == "negative_outcome":
+                        r = -float(np.mean(np.abs(y_next - y_target)))
+                    elif reward_type in ("horizon_remaining", "remaining_distance", "horizon_remaining_distance"):
+                        r = horizon_remaining_distance_reward_np(y_next, y_target, t=t, t_target=t_target)
+                    elif reward_type == "progress":
+                        d_cur = float(np.mean(np.abs(y_cur - y_target)))
+                        d_nxt = float(np.mean(np.abs(y_next - y_target)))
+                        r = d_cur - d_nxt
+                    else:
+                        r = -float(np.mean(np.abs(y_next - y_target)))
+
+                    if reward_clip is not None and float(reward_clip) > 0.0:
+                        c = float(reward_clip)
+                        if r > c:
+                            r = c
+                        elif r < -c:
+                            r = -c
+
+                    s = np.concatenate(
+                        [z_vec, y_target, np.array([delta_t_norm], dtype=np.float32), a_prev_feat], axis=0
+                    )
+                    states.append(s)
+                    actions.append(a)
+                    rewards.append([r])
+                    next_states.append(s_next)
+                    dones.append([done])
                 
 
                 # # 4. 恢复最朴素的密集误差奖励 (逼迫模型给药，消除 33.6 飙升)
@@ -241,13 +340,6 @@ def build_iql_transitions_from_ct(
 
                 # # 5. 取消任何提前终止，严格走完患者的历史
                 # done = 1.0 if (t + 1) >= last_idx else 0.0
-
-                states.append(s)
-                actions.append(a)
-                rewards.append([r])
-                next_states.append(s_next)
-                dones.append([done])
-
     rewards_arr = np.asarray(rewards, dtype=np.float32)
     if str(reward_scale).lower() == "auto":
         r_std = float(rewards_arr.std()) + 1e-8

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sys
+import ast
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,6 +38,20 @@ def _state_dict_to_cpu(obj):
     if isinstance(obj, dict):
         return {k: _state_dict_to_cpu(v) for k, v in obj.items()}
     return obj
+
+
+def _list_from_config(value):
+    if value is None:
+        return None
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.startswith("["):
+            value = ast.literal_eval(raw)
+        else:
+            value = [x.strip() for x in raw.split(",") if x.strip()]
+    return [int(v) for v in value]
 
 
 def _spearman_rho(a: List[float], b: List[float]) -> Optional[float]:
@@ -145,6 +160,11 @@ def main(args: DictConfig):
         max_tau=max_tau,
         reward_clip=float(OmegaConf.select(args, "exp.iql_reward_clip", default=1.0)),
         reward_scale=str(OmegaConf.select(args, "exp.iql_reward_scale", default="none")),
+        reward_huber_delta=float(OmegaConf.select(args, "exp.iql_reward_huber_delta", default=1.0)),
+        samples_per_transition=int(OmegaConf.select(args, "exp.em_her_samples_per_transition", default=1)),
+        target_sampling=str(OmegaConf.select(args, "exp.iql_target_sampling", default="horizon_aligned")),
+        target_horizons=_list_from_config(OmegaConf.select(args, "exp.iql_target_horizons", default=None)),
+        horizon_terminal_done=bool(OmegaConf.select(args, "exp.iql_horizon_terminal_done", default=True)),
     )
     logger.info(f"Built transitions: {len(transitions['states'])}")
 
@@ -160,6 +180,7 @@ def main(args: DictConfig):
         n_hidden=int(OmegaConf.select(args, "exp.iql_n_hidden", default=2)),
         iql_tau=float(OmegaConf.select(args, "exp.iql_tau", default=0.7)),
         beta=float(OmegaConf.select(args, "exp.iql_beta", default=3.0)),
+        adv_max=float(OmegaConf.select(args, "exp.iql_adv_max", default=100.0)),
         discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
         tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
         actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),

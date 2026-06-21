@@ -45,6 +45,7 @@ def _sim_actions_to_tanh_batch(a_sim: torch.Tensor, max_action: float) -> torch.
 
 
 def _iql_augmented_state(
+    planner: IQLPlanner,
     z: torch.Tensor,
     eval_target: torch.Tensor,
     step: int,
@@ -55,7 +56,7 @@ def _iql_augmented_state(
     bsz = z.size(0)
     steps_left = float(eval_tau - step)
     delta = torch.full((bsz, 1), steps_left / max_tau, device=z.device, dtype=z.dtype)
-    return torch.cat([z, eval_target, delta, a_prev_tanh], dim=-1)
+    return planner.build_state(z, eval_target, delta, a_prev_tanh)
 
 
 def _unscaled_cancer_volume_np(y_norm: np.ndarray, mean_ser, std_ser) -> np.ndarray:
@@ -394,7 +395,7 @@ def aggregate_iql_planner_metrics(
                             prev_out = H_work["outputs"][:, -1, :].detach().clone()
                             z_before = z.detach().clone()
                         a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
-                        obs = _iql_augmented_state(z, eval_target, step, tau, max_tau, a_prev_tanh)
+                        obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
                         po = planner.actor(obs)
                         ma = planner.actor.max_action
                         if isinstance(po, Distribution):
@@ -460,8 +461,18 @@ def aggregate_iql_planner_metrics(
                     delta_vec = np.array([delta_scalar], dtype=np.float32)
                     a_rows = []
                     for b in range(bsz):
-                        obs_b = np.concatenate([z_np[b], eval_target_np[b], delta_vec, a_prev_feat[b]], axis=0)
-                        a_rows.append(planner.act(obs_b))
+                        z_b = torch.as_tensor(z_np[b:b + 1], device=device, dtype=torch.float32)
+                        target_b = torch.as_tensor(eval_target_np[b:b + 1], device=device, dtype=torch.float32)
+                        delta_b = torch.as_tensor(delta_vec.reshape(1, 1), device=device, dtype=torch.float32)
+                        a_prev_b = torch.as_tensor(a_prev_feat[b:b + 1], device=device, dtype=torch.float32)
+                        obs_b = planner.build_state(z_b, target_b, delta_b, a_prev_b)
+                        po_b = planner.actor(obs_b)
+                        ma = planner.actor.max_action
+                        if isinstance(po_b, Distribution):
+                            a_b = torch.clamp(ma * po_b.mean, -ma, ma)
+                        else:
+                            a_b = torch.clamp(po_b * ma, -ma, ma)
+                        a_rows.append(a_b.detach().cpu().numpy().reshape(-1))
                     a_raw = np.stack(a_rows, axis=0)
                     a_sim = _actions_to_sim_interval(a_raw, max_action)
                     a_seq = (

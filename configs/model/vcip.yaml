@@ -20,7 +20,7 @@ model:
     num_layers: 2
     # Local-global CTHistoryEncoder switch. Keep default 0 to preserve current CT
     # unless an experiment explicitly enables low-layer causal depthwise Conv1d.
-    local_conv_layers: 0
+    local_conv_layers: 1
     local_conv_kernel_size: 6
     local_conv_dilation: 1
     hiddens_F_mu:
@@ -86,6 +86,7 @@ exp:
   iql_inference_ckpt: ""
   # Reward design for offline RL transitions (see iql_dataset_builder.py docstring).
   #   negative_outcome      : r = -|y_{t+1} - y_target|                (L1, RECOMMENDED)
+  #   negative_outcome_huber: r = -Huber(y_{t+1} - y_target)           (RMSE-oriented, robust)
   #   negative_outcome_mse  : r = -(y_{t+1} - y_target)^2              (L2, heavy-tailed!)
   #   progress              : r = |y_t - y_target| - |y_{t+1} - y_target|
   #     NOTE: "progress" was tried as a long-horizon signal but empirically
@@ -97,6 +98,7 @@ exp:
   #     away from the factual-future y_target → good actions get negative
   #     reward. L1 below does not have this issue.
   iql_reward_type: negative_outcome
+  iql_reward_huber_delta: 1.0
   # Hard-clip |r| to suppress simulator-overflow outliers (raw MSE on cancer_sim
   # γ=4 has min≈-117 even though q99=0). With L1 reward the typical |r| ~ 0.3,
   # outliers |r| ~ 10; clip=3.0 kills the worst 1% without distorting 99% of the
@@ -166,6 +168,14 @@ exp:
   iql_eval_tau_list: null
   # Horizon-aware IQL: normalize time-to-go; must match eval_iql_planner / EM raw transitions
   max_tau: 12.0
+  # Target sampling for goal-conditioned IQL transitions:
+  #   random_future    : legacy HER, sample any future t_target in [t+1, t+max_tau].
+  #   horizon_aligned  : sample only from fixed horizons below, matching eval tau values.
+  iql_target_sampling: horizon_aligned
+  iql_target_horizons: [1, 2, 3, 4, 5, 6]
+  # Finite-horizon Bellman termination: when the next step reaches sampled t_target,
+  # cut bootstrap even if the patient sequence continues.
+  iql_horizon_terminal_done: true
   # --- E-step WeightNet (train_ct_iql_em.py) ---
   # Align P_w(Z,A) toward P(Z)P(A). Legacy train_ct.py can still override these via CLI.
   ct_align_loss: sinkhorn
@@ -184,6 +194,12 @@ exp:
   em_encoder_max_grad_norm: 1.0
   em_val_every: 2
   em_val_metric: mae_uns
+  # Save ct_iql_em_outerXXXX.pt at every validation point for checkpoint-selection
+  # diagnostics. Keep disabled for normal sweeps to avoid large checkpoint folders.
+  em_save_every_eval_checkpoint: false
+  # Save ct_iql_em_outerXXXX.pt after every outer iteration without running validation.
+  # Use this for post-hoc outer-vs-RMSE diagnostics.
+  em_save_every_outer_checkpoint: false
   # M-step only: uniform w for first N outers; E-step always trains WeightNet.
   em_warmup_outer_iters: 8
   # CTD-style full-dataset WeightNet fit per E-step (epoch_w analogue).

@@ -7,6 +7,7 @@ M-step: fix WeightNet; weighted V→Q→π per batch; only Q-step updates encode
 import logging
 import os
 import sys
+import ast
 from pathlib import Path
 from typing import Dict
 
@@ -45,6 +46,20 @@ def _state_dict_to_cpu(obj):
     return obj
 
 
+def _list_from_config(value):
+    if value is None:
+        return None
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.startswith("["):
+            value = ast.literal_eval(raw)
+        else:
+            value = [x.strip() for x in raw.split(",") if x.strip()]
+    return [int(v) for v in value]
+
+
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
 def main(args: DictConfig):
     OmegaConf.set_struct(args, False)
@@ -59,14 +74,42 @@ def main(args: DictConfig):
     em_m_steps = int(OmegaConf.select(args, "exp.em_m_steps_per_outer", default=200))
     em_encoder_lr = float(OmegaConf.select(args, "exp.em_encoder_lr", default=3e-5))
     em_val_every = int(OmegaConf.select(args, "exp.em_val_every", default=5))
+    em_save_every_eval_checkpoint = bool(
+        OmegaConf.select(args, "exp.em_save_every_eval_checkpoint", default=False)
+    )
+    em_save_every_outer_checkpoint = bool(
+        OmegaConf.select(args, "exp.em_save_every_outer_checkpoint", default=False)
+    )
     em_warmup = int(OmegaConf.select(args, "exp.em_warmup_outer_iters", default=2))
     em_log_m_every = int(OmegaConf.select(args, "exp.em_log_m_every", default=50))
     em_e_epochs = max(1, int(OmegaConf.select(args, "exp.em_e_epochs", default=5)))
+    em_encoder_diagnostics = bool(
+        OmegaConf.select(args, "exp.em_encoder_diagnostics", default=False)
+    )
+    em_encoder_diagnostics_every = max(
+        1,
+        int(
+            OmegaConf.select(
+                args,
+                "exp.em_encoder_diagnostics_every",
+                default=em_log_m_every,
+            )
+        ),
+    )
     em_e_refresh_every = int(OmegaConf.select(args, "exp.em_e_refresh_every", default=1))
     em_her_refresh_every = int(OmegaConf.select(args, "exp.em_her_refresh_every", default=1))
     em_her_samples_per_transition = max(
         1,
         int(OmegaConf.select(args, "exp.em_her_samples_per_transition", default=1)),
+    )
+    iql_target_sampling = str(
+        OmegaConf.select(args, "exp.iql_target_sampling", default="horizon_aligned")
+    )
+    iql_target_horizons = _list_from_config(
+        OmegaConf.select(args, "exp.iql_target_horizons", default=None)
+    )
+    iql_horizon_terminal_done = bool(
+        OmegaConf.select(args, "exp.iql_horizon_terminal_done", default=True)
     )
 
     ct_align = str(OmegaConf.select(args, "exp.ct_align_loss", default="sinkhorn"))
@@ -101,6 +144,15 @@ def main(args: DictConfig):
     out_dim = int(args.dataset.output_size)
     act_dim = int(args.dataset.treatment_size)
     state_dim = z_dim + out_dim + 1 + act_dim
+    goal_adapter_enabled = bool(
+        OmegaConf.select(args, "exp.iql_goal_adapter_enabled", default=False)
+    )
+    goal_adapter_hidden_dim = int(
+        OmegaConf.select(args, "exp.iql_goal_adapter_hidden_dim", default=64)
+    )
+    goal_adapter_init_scale = float(
+        OmegaConf.select(args, "exp.iql_goal_adapter_init_scale", default=1e-3)
+    )
 
     max_action = float(OmegaConf.select(args, "exp.iql_max_action", default=1.0))
     max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
@@ -117,6 +169,7 @@ def main(args: DictConfig):
         n_hidden=int(OmegaConf.select(args, "exp.iql_n_hidden", default=2)),
         iql_tau=float(OmegaConf.select(args, "exp.iql_tau", default=0.5)),
         beta=float(OmegaConf.select(args, "exp.iql_beta", default=3.0)),
+        adv_max=float(OmegaConf.select(args, "exp.iql_adv_max", default=100.0)),
         discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
         tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
         actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),
@@ -128,11 +181,28 @@ def main(args: DictConfig):
         max_grad_norm=iql_max_grad,
         encoder_max_grad_norm=enc_max_grad,
         device=device,
+        goal_adapter_enabled=goal_adapter_enabled,
+        z_dim=z_dim,
+        output_dim=out_dim,
+        goal_adapter_hidden_dim=goal_adapter_hidden_dim,
+        goal_adapter_init_scale=goal_adapter_init_scale,
     )
     planner = IQLPlanner(planner_cfg)
+    if goal_adapter_enabled:
+        logger.info(
+            "IQL GoalAdapter enabled | input=[Z_t,y_target,delta] z_dim=%d output_dim=%d hidden=%d init_scale=%.1e",
+            z_dim,
+            out_dim,
+            goal_adapter_hidden_dim,
+            goal_adapter_init_scale,
+        )
 
     optimizer_w = torch.optim.Adam(ct_model.weight_net.parameters(), lr=w_lr, weight_decay=ct_wd)
-    optimizer_enc = torch.optim.Adam(ct_model.encoder_parameters(), lr=em_encoder_lr, weight_decay=ct_wd)
+    optimizer_enc = torch.optim.Adam(
+        list(ct_model.encoder_parameters()) + planner.goal_adapter_parameters(),
+        lr=em_encoder_lr,
+        weight_decay=ct_wd,
+    )
 
     def _build_replay(her_seed: int) -> IQLRawReplayBuffer:
         raw = build_iql_raw_transitions(
@@ -146,7 +216,13 @@ def main(args: DictConfig):
             max_tau=max_tau,
             reward_clip=float(OmegaConf.select(args, "exp.iql_reward_clip", default=3.0)),
             reward_scale=str(OmegaConf.select(args, "exp.iql_reward_scale", default="auto")),
+            reward_huber_delta=float(
+                OmegaConf.select(args, "exp.iql_reward_huber_delta", default=1.0)
+            ),
             samples_per_transition=em_her_samples_per_transition,
+            target_sampling=iql_target_sampling,
+            target_horizons=iql_target_horizons,
+            horizon_terminal_done=iql_horizon_terminal_done,
             seed=her_seed,
         )
         return IQLRawReplayBuffer(raw, device=device)
@@ -159,6 +235,12 @@ def main(args: DictConfig):
             "HER buffer built once (em_her_refresh_every=0, samples_per_transition=%d) | transitions=%d",
             em_her_samples_per_transition,
             replay.size,
+        )
+        logger.info(
+            "HER target sampling | mode=%s horizons=%s horizon_terminal_done=%s",
+            iql_target_sampling,
+            iql_target_horizons,
+            iql_horizon_terminal_done,
         )
 
     ct_loader = DataLoader(
@@ -179,7 +261,14 @@ def main(args: DictConfig):
         log_m_every=em_log_m_every,
         e_epochs=em_e_epochs,
         e_batch_size=ct_batch_size,
+        encoder_diagnostics=em_encoder_diagnostics,
+        encoder_diagnostics_every=em_encoder_diagnostics_every,
     )
+    if em_encoder_diagnostics:
+        logger.info(
+            "Encoder diagnostics enabled | every=%d M-steps | metrics=grad/preclip, grad/postclip, update, update_ratio",
+            em_encoder_diagnostics_every,
+        )
 
     _ckpt_override = OmegaConf.select(args, "exp.em_ckpt_dir", default=None)
     if _ckpt_override:
@@ -205,6 +294,18 @@ def main(args: DictConfig):
         for w in OmegaConf.select(args, "exp.em_val_worlds", default=["sim"])
     )
     eval_tau = int(args.exp.tau)
+    em_val_tau_list = _list_from_config(
+        OmegaConf.select(args, "exp.em_val_tau_list", default=None)
+    )
+    if em_val_tau_list is None:
+        em_val_tau_list = [eval_tau]
+    if len(em_val_tau_list) == 1:
+        selection_metric_key = val_metric_key
+    else:
+        selection_metric_key = (
+            f"mean_{val_metric_key}_tau"
+            + "_".join(str(int(t)) for t in em_val_tau_list)
+        )
     val_bs = int(OmegaConf.select(args, "exp.iql_val_batch_size", default=None) or args.exp.batch_size_val)
     autoreg = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
 
@@ -280,20 +381,60 @@ def main(args: DictConfig):
                 m_metrics["actor_loss"],
                 replay.size,
             )
-            mlf.log_metrics(
-                {
-                    "e/align_pre": e_metrics["align_pre"],
-                    "e/align_post": e_metrics["align_post"],
-                    "e/w_ess_frac": e_metrics["w_ess_frac"],
-                    "e/w_std": e_metrics.get("w_std", 0.0),
-                    "e/e_epochs": float(em_e_epochs),
-                    "m/q_loss": m_metrics["q_loss"],
-                    "m/value_loss": m_metrics["value_loss"],
-                    "m/actor_loss": m_metrics["actor_loss"],
-                    "replay/size": float(replay.size),
-                },
-                step=outer,
-            )
+            if em_encoder_diagnostics:
+                diag_groups = sorted(
+                    k.split("/", 1)[1]
+                    for k in m_metrics
+                    if k.startswith("enc_update_norm/")
+                )
+                for group in diag_groups:
+                    logger.info(
+                        "Encoder diag outer=%d | %s grad=%.3e postclip=%.3e update=%.3e ratio=%.3e",
+                        outer,
+                        group,
+                        m_metrics.get(f"enc_grad_norm/{group}", 0.0),
+                        m_metrics.get(f"enc_grad_norm_postclip/{group}", 0.0),
+                        m_metrics.get(f"enc_update_norm/{group}", 0.0),
+                        m_metrics.get(f"enc_update_ratio/{group}", 0.0),
+                    )
+                logger.info(
+                    "Encoder diag outer=%d | collected_steps=%.0f",
+                    outer,
+                    m_metrics.get("enc_diag_collected_steps", 0.0),
+                )
+            m_log_metrics = {
+                "e/align_pre": e_metrics["align_pre"],
+                "e/align_post": e_metrics["align_post"],
+                "e/w_ess_frac": e_metrics["w_ess_frac"],
+                "e/w_std": e_metrics.get("w_std", 0.0),
+                "e/e_epochs": float(em_e_epochs),
+                "m/q_loss": m_metrics["q_loss"],
+                "m/value_loss": m_metrics["value_loss"],
+                "m/actor_loss": m_metrics["actor_loss"],
+                "replay/size": float(replay.size),
+            }
+            for key, value in m_metrics.items():
+                if key.startswith("enc_"):
+                    m_log_metrics[f"m/{key}"] = float(value)
+            mlf.log_metrics(m_log_metrics, step=outer)
+            if em_save_every_outer_checkpoint:
+                save_em_checkpoint(
+                    out_dir / f"ct_iql_em_outer{outer:04d}.pt",
+                    ct_model=ct_model,
+                    planner=planner,
+                    outer_iter=outer,
+                    config_yaml=OmegaConf.to_yaml(args, resolve=True),
+                    extra={
+                        "checkpoint_type": "outer",
+                        "m_q_loss": m_metrics["q_loss"],
+                        "m_value_loss": m_metrics["value_loss"],
+                        "m_actor_loss": m_metrics["actor_loss"],
+                        "e_align_pre": e_metrics["align_pre"],
+                        "e_align_post": e_metrics["align_post"],
+                        "e_w_ess_frac": e_metrics["w_ess_frac"],
+                        "e_w_std": e_metrics.get("w_std", 0.0),
+                    },
+                )
 
             if em_val_every > 0 and (outer % em_val_every == 0 or outer == em_outer_iters):
                 em_state = {
@@ -304,33 +445,66 @@ def main(args: DictConfig):
                 load_encoder_into_inference(inference_model, em_state)
                 inference_model.eval()
                 planner.actor.eval()
-                metrics = aggregate_iql_planner_metrics(
-                    planner,
-                    inference_model,
-                    dataset_collection,
-                    dataset_collection.val_f,
-                    args,
-                    device=device,
-                    tau=eval_tau,
-                    max_tau=max_tau,
-                    autoregressive_eval=autoreg,
-                    val_batch_size=val_bs,
-                    log_batches=False,
-                    worlds=val_worlds,
-                )
-                per_world = metrics.get("per_world", {val_worlds[0]: metrics})
                 sel_world = str(
                     OmegaConf.select(args, "exp.em_val_selection_world", default=val_worlds[0])
                 )
-                val_score = float(per_world[sel_world][val_metric_key])
-                logger.info(
-                    "EM val outer=%d %s=%.6f (%s)",
-                    outer,
-                    val_metric_key,
-                    val_score,
-                    sel_world,
-                )
-                mlf.log_metrics({f"val/{sel_world}/{val_metric_key}": val_score}, step=outer)
+                val_scores = []
+                val_log_metrics = {}
+                for tau_i in em_val_tau_list:
+                    metrics = aggregate_iql_planner_metrics(
+                        planner,
+                        inference_model,
+                        dataset_collection,
+                        dataset_collection.val_f,
+                        args,
+                        device=device,
+                        tau=int(tau_i),
+                        max_tau=max_tau,
+                        autoregressive_eval=autoreg,
+                        val_batch_size=val_bs,
+                        log_batches=False,
+                        worlds=val_worlds,
+                    )
+                    per_world = metrics.get("per_world", {val_worlds[0]: metrics})
+                    tau_score = float(per_world[sel_world][val_metric_key])
+                    val_scores.append(tau_score)
+                    val_log_metrics[f"val/{sel_world}/tau{int(tau_i)}/{val_metric_key}"] = tau_score
+                val_score = float(sum(val_scores) / len(val_scores))
+                if len(em_val_tau_list) == 1:
+                    logger.info(
+                        "EM val outer=%d %s=%.6f (%s, tau=%d)",
+                        outer,
+                        selection_metric_key,
+                        val_score,
+                        sel_world,
+                        int(em_val_tau_list[0]),
+                    )
+                    val_log_metrics[f"val/{sel_world}/{val_metric_key}"] = val_score
+                else:
+                    logger.info(
+                        "EM val outer=%d %s=%.6f (%s, taus=%s)",
+                        outer,
+                        selection_metric_key,
+                        val_score,
+                        sel_world,
+                        em_val_tau_list,
+                    )
+                    val_log_metrics[f"val/{sel_world}/{selection_metric_key}"] = val_score
+                mlf.log_metrics(val_log_metrics, step=outer)
+                if em_save_every_eval_checkpoint:
+                    save_em_checkpoint(
+                        out_dir / f"ct_iql_em_outer{outer:04d}.pt",
+                        ct_model=ct_model,
+                        planner=planner,
+                        outer_iter=outer,
+                        config_yaml=OmegaConf.to_yaml(args, resolve=True),
+                        extra={
+                            "val_score": val_score,
+                            "val_metric": selection_metric_key,
+                            "val_metric_base": val_metric_key,
+                            "val_tau_list": em_val_tau_list,
+                        },
+                    )
                 if val_score < best_val:
                     best_val = val_score
                     best_outer = outer
@@ -340,7 +514,12 @@ def main(args: DictConfig):
                         planner=planner,
                         outer_iter=outer,
                         config_yaml=OmegaConf.to_yaml(args, resolve=True),
-                        extra={"val_score": val_score, "val_metric": val_metric_key},
+                        extra={
+                            "val_score": val_score,
+                            "val_metric": selection_metric_key,
+                            "val_metric_base": val_metric_key,
+                            "val_tau_list": em_val_tau_list,
+                        },
                     )
                     logger.info("Saved best EM checkpoint to %s", ckpt_path)
 
@@ -356,7 +535,7 @@ def main(args: DictConfig):
         logger.info(
             "EM training done. best_outer=%d best_%s=%.6f ckpt=%s",
             best_outer,
-            val_metric_key,
+            selection_metric_key,
             best_val,
             ckpt_path,
         )
@@ -364,7 +543,7 @@ def main(args: DictConfig):
             artifact_paths=[ckpt_path] if ckpt_path.is_file() else None,
             final_metrics={
                 "best/outer_iter": float(best_outer),
-                f"best/val_{val_metric_key}": best_val,
+                f"best/val_{selection_metric_key}": best_val,
             },
             final_step=best_outer if best_outer > 0 else em_outer_iters,
         )

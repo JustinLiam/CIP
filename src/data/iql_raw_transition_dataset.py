@@ -3,15 +3,71 @@ Raw IQL transitions for EM training: store H_t / H_{t+1} without precomputed sta
 """
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from src.data.ct_transition_dataset import _build_H_slice, _collate_pad_H
-from src.data.iql_dataset_builder import dataset_actions_to_tanh_policy_space
+from src.data.iql_dataset_builder import (
+    dataset_actions_to_tanh_policy_space,
+    horizon_remaining_distance_reward_np,
+    huber_loss_np,
+)
+
+
+def _coerce_target_horizons(target_horizons: Optional[Iterable[int]], max_tau: float) -> List[int]:
+    if target_horizons is None:
+        return list(range(1, int(max_tau) + 1))
+    if isinstance(target_horizons, str):
+        raw = target_horizons.strip()
+        if raw.startswith("["):
+            target_horizons = ast.literal_eval(raw)
+        else:
+            target_horizons = [x.strip() for x in raw.split(",") if x.strip()]
+    out = sorted({int(h) for h in target_horizons if int(h) > 0})
+    if not out:
+        raise ValueError("target_horizons must contain at least one positive horizon.")
+    return out
+
+
+def _sample_target_indices(
+    *,
+    t: int,
+    last_idx: int,
+    max_tau: float,
+    samples_per_transition: int,
+    rng: np.random.RandomState,
+    target_sampling: str,
+    target_horizons: Optional[Iterable[int]],
+) -> List[int]:
+    hi = min(t + int(max_tau), last_idx)
+    if hi <= t:
+        return []
+
+    mode = str(target_sampling).strip().lower()
+    if mode in ("random", "random_future", "future"):
+        return [int(rng.randint(low=t + 1, high=hi + 1)) for _ in range(samples_per_transition)]
+
+    if mode in ("horizon_aligned", "aligned", "fixed_horizon"):
+        horizons = [
+            h
+            for h in _coerce_target_horizons(target_horizons, max_tau)
+            if h <= int(max_tau) and t + h <= last_idx
+        ]
+        if not horizons:
+            return []
+        replace = len(horizons) < samples_per_transition
+        size = samples_per_transition if replace else min(samples_per_transition, len(horizons))
+        chosen = rng.choice(horizons, size=size, replace=replace)
+        return [t + int(h) for h in sorted(np.asarray(chosen, dtype=np.int64).tolist())]
+
+    raise ValueError(
+        f"Unknown target_sampling={target_sampling!r}; expected 'random_future' or 'horizon_aligned'."
+    )
 
 
 @dataclass
@@ -55,7 +111,11 @@ def build_iql_raw_transitions(
     max_tau: float = 12.0,
     reward_clip: float = 3.0,
     reward_scale: str = "auto",
+    reward_huber_delta: float = 1.0,
     samples_per_transition: int = 1,
+    target_sampling: str = "horizon_aligned",
+    target_horizons: Optional[Iterable[int]] = None,
+    horizon_terminal_done: bool = True,
     seed: Optional[int] = None,
 ) -> List[IQLRawTransition]:
     """
@@ -82,8 +142,16 @@ def build_iql_raw_transitions(
         last_idx = length - 1
 
         for t in range(1, length - 1):
-            hi = min(t + int(max_tau), last_idx)
-            if hi <= t:
+            target_indices = _sample_target_indices(
+                t=t,
+                last_idx=last_idx,
+                max_tau=max_tau,
+                samples_per_transition=samples_per_transition,
+                rng=rng,
+                target_sampling=target_sampling,
+                target_horizons=target_horizons,
+            )
+            if not target_indices:
                 continue
 
             H_t = _build_H_slice(data, i, t + 1)
@@ -103,18 +171,28 @@ def build_iql_raw_transitions(
 
             y_next = data["outputs"][i, t + 1, :].astype(np.float32)
             y_cur = data["outputs"][i, t, :].astype(np.float32)
-            done = 1.0 if (t + 1) >= last_idx else 0.0
 
-            for _ in range(samples_per_transition):
-                t_target = int(rng.randint(low=t + 1, high=hi + 1))
+            for t_target in target_indices:
                 y_target_np = data["outputs"][i, t_target, :].astype(np.float32)
                 delta_t_norm = max(0.0, float(t_target - t) / max_tau)
                 delta_t_next_norm = max(0.0, float(t_target - t - 1) / max_tau)
+                done = 1.0 if (t + 1) >= last_idx else 0.0
+                if horizon_terminal_done and (t + 1) >= t_target:
+                    done = 1.0
 
                 if reward_type == "negative_outcome_mse":
                     r = -float(np.mean((y_next - y_target_np) ** 2))
+                elif reward_type in ("negative_outcome_huber", "huber", "smooth_l1"):
+                    r = -float(np.mean(huber_loss_np(y_next - y_target_np, reward_huber_delta)))
                 elif reward_type == "negative_outcome":
                     r = -float(np.mean(np.abs(y_next - y_target_np)))
+                elif reward_type in ("horizon_remaining", "remaining_distance", "horizon_remaining_distance"):
+                    r = horizon_remaining_distance_reward_np(
+                        y_next,
+                        y_target_np,
+                        t=t,
+                        t_target=t_target,
+                    )
                 elif reward_type == "progress":
                     d_cur = float(np.mean(np.abs(y_cur - y_target_np)))
                     d_nxt = float(np.mean(np.abs(y_next - y_target_np)))
@@ -152,9 +230,15 @@ def build_iql_raw_transitions(
     import logging
 
     logging.getLogger(__name__).info(
-        "Built %d raw IQL transitions (no precomputed states, samples_per_transition=%d).",
+        "Built %d raw IQL transitions (no precomputed states, samples_per_transition=%d, "
+        "target_sampling=%s, target_horizons=%s, horizon_terminal_done=%s).",
         len(transitions),
         samples_per_transition,
+        target_sampling,
+        _coerce_target_horizons(target_horizons, max_tau)
+        if str(target_sampling).strip().lower() in ("horizon_aligned", "aligned", "fixed_horizon")
+        else None,
+        horizon_terminal_done,
     )
     return transitions
 

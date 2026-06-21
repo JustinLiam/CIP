@@ -64,6 +64,12 @@ def load_em_planner(em_obj: Dict[str, Any], device: str) -> IQLPlanner:
     cfg_dict["device"] = device
     cfg_dict.setdefault("max_grad_norm", None)
     cfg_dict.setdefault("encoder_max_grad_norm", 1.0)
+    cfg_dict.setdefault("adv_max", 100.0)
+    cfg_dict.setdefault("goal_adapter_enabled", False)
+    cfg_dict.setdefault("z_dim", None)
+    cfg_dict.setdefault("output_dim", None)
+    cfg_dict.setdefault("goal_adapter_hidden_dim", 64)
+    cfg_dict.setdefault("goal_adapter_init_scale", 1e-3)
     planner = IQLPlanner(IQLPlannerConfig(**cfg_dict))
     planner.load_eval_weights(iql_state)
     planner.actor.eval()

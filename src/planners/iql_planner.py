@@ -31,6 +31,7 @@ class IQLPlannerConfig:
     n_hidden: int = 2
     iql_tau: float = 0.7
     beta: float = 3.0
+    adv_max: float = EXP_ADV_MAX
     discount: float = 0.99
     tau: float = 0.005
     actor_lr: float = 3e-4
@@ -42,6 +43,11 @@ class IQLPlannerConfig:
     max_grad_norm: Optional[float] = None
     encoder_max_grad_norm: Optional[float] = 1.0
     device: str = "cuda"
+    goal_adapter_enabled: bool = False
+    z_dim: Optional[int] = None
+    output_dim: Optional[int] = None
+    goal_adapter_hidden_dim: int = 64
+    goal_adapter_init_scale: float = 1e-3
 
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
@@ -63,6 +69,46 @@ def weighted_asymmetric_l2_loss(u: torch.Tensor, tau: float, w: torch.Tensor) ->
 def _weighted_mean_sq(err: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     denom = w.sum().clamp(min=1e-8)
     return (w * err).sum() / denom
+
+
+def _tensor_l2_norm(values: List[torch.Tensor]) -> float:
+    if not values:
+        return 0.0
+    total = torch.zeros((), device=values[0].device)
+    for value in values:
+        total = total + value.detach().pow(2).sum()
+    return float(torch.sqrt(total).item())
+
+
+def _encoder_diagnostic_groups(
+    encoder_model: "CTEncoderWeightModel",
+    planner: Optional["IQLPlanner"] = None,
+) -> List[Tuple[str, List[Tuple[str, torch.nn.Parameter]]]]:
+    groups: List[Tuple[str, List[Tuple[str, torch.nn.Parameter]]]] = []
+    for child_name, module in encoder_model.ct_encoder.named_children():
+        params = [
+            (f"ct_encoder.{child_name}.{name}", param)
+            for name, param in module.named_parameters(recurse=True)
+            if param.requires_grad
+        ]
+        if params:
+            groups.append((f"ct_encoder.{child_name}", params))
+    projection_params = [
+        (f"projection.{name}", param)
+        for name, param in encoder_model.projection.named_parameters(recurse=True)
+        if param.requires_grad
+    ]
+    if projection_params:
+        groups.append(("projection", projection_params))
+    if planner is not None and planner.goal_adapter is not None:
+        adapter_params = [
+            (f"goal_adapter.{name}", param)
+            for name, param in planner.goal_adapter.named_parameters(recurse=True)
+            if param.requires_grad
+        ]
+        if adapter_params:
+            groups.append(("goal_adapter", adapter_params))
+    return groups
 
 
 class Squeeze(nn.Module):
@@ -99,6 +145,30 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class GoalAdapter(nn.Module):
+    """Residual goal-conditioned adapter: [z_t, y_target, delta] -> z_t^g."""
+
+    def __init__(self, z_dim: int, output_dim: int, hidden_dim: int = 64, init_scale: float = 1e-3):
+        super().__init__()
+        self.z_dim = int(z_dim)
+        self.output_dim = int(output_dim)
+        self.net = nn.Sequential(
+            nn.Linear(self.z_dim + self.output_dim + 1, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, self.z_dim),
+        )
+        final = self.net[-1]
+        nn.init.normal_(final.weight, mean=0.0, std=float(init_scale))
+        nn.init.zeros_(final.bias)
+
+    def forward(self, z_t: torch.Tensor, y_target: torch.Tensor, delta_t_norm: torch.Tensor) -> torch.Tensor:
+        if delta_t_norm.dim() == 1:
+            delta_t_norm = delta_t_norm.unsqueeze(-1)
+        adapter_in = torch.cat([z_t, y_target, delta_t_norm], dim=-1)
+        return z_t + self.net(adapter_in)
 
 
 class GaussianPolicy(nn.Module):
@@ -222,6 +292,16 @@ class TransitionReplayBuffer:
 class IQLPlanner:
     def __init__(self, cfg: IQLPlannerConfig):
         self.cfg = cfg
+        self.goal_adapter: Optional[GoalAdapter] = None
+        if bool(cfg.goal_adapter_enabled):
+            if cfg.z_dim is None or cfg.output_dim is None:
+                raise ValueError("goal_adapter_enabled=True requires cfg.z_dim and cfg.output_dim.")
+            self.goal_adapter = GoalAdapter(
+                z_dim=int(cfg.z_dim),
+                output_dim=int(cfg.output_dim),
+                hidden_dim=int(cfg.goal_adapter_hidden_dim),
+                init_scale=float(cfg.goal_adapter_init_scale),
+            ).to(cfg.device)
         actor_cls = DeterministicPolicy if cfg.deterministic_actor else GaussianPolicy
         self.actor = actor_cls(
             state_dim=cfg.state_dim,
@@ -240,6 +320,28 @@ class IQLPlanner:
         self.v_optimizer = torch.optim.Adam(self.vf.parameters(), lr=cfg.vf_lr)
         self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, cfg.max_steps)
         self.total_it = 0
+
+    def goal_adapter_parameters(self) -> List[nn.Parameter]:
+        if self.goal_adapter is None:
+            return []
+        return list(self.goal_adapter.parameters())
+
+    def representation_parameters(self, encoder_model: "CTEncoderWeightModel") -> List[nn.Parameter]:
+        return list(encoder_model.encoder_parameters()) + self.goal_adapter_parameters()
+
+    def build_state(
+        self,
+        z_t: torch.Tensor,
+        y_target: torch.Tensor,
+        delta_t_norm: torch.Tensor,
+        a_prev_tanh: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build IQL state, replacing only the z component with goal-conditioned z when enabled."""
+        if delta_t_norm.dim() == 1:
+            delta_t_norm = delta_t_norm.unsqueeze(-1)
+        if self.goal_adapter is not None:
+            z_t = self.goal_adapter(z_t, y_target, delta_t_norm)
+        return torch.cat([z_t, y_target, delta_t_norm, a_prev_tanh], dim=-1)
 
     def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
         """
@@ -318,14 +420,14 @@ class IQLPlanner:
         - Q(s, a): 评估在状态 s 下采取动作 a 的期望回报（即 critic 网络输出，通常为 Q-function）。
         - V(s): 评估在状态 s 下最佳动作的平均回报（即 value 网络输出，通常为 V-function）。
         - advantage（优势）：adv = Q(s, a) - V(s)，衡量了实际动作 a 相比当前策略最优动作的优势。
-        - exp_adv: 对 advantage 进行 exp(beta * adv) 放缩，并做裁剪（最大为 EXP_ADV_MAX）。
+        - exp_adv: 对 advantage 进行 exp(beta * adv) 放缩，并做裁剪（最大为 cfg.adv_max）。
         - actor 的输出如果是概率分布，则行为克隆损失为 -log_prob(actions) 求和；如果为确定性输出，则为均方差损失。
         - 最终 policy loss = mean(exp_adv * bc_loss)
         - 使用 actor_optimizer 对 policy loss 优化并更新 actor。
 
         换句话说，policy loss 是将“advantage”作为权重，对行为克隆损失做加权平均，从而鼓励策略在优势大（Q(s, a) > V(s)）的状态-动作对上尽量去模仿数据分布。
         """
-        exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
+        exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
         if isinstance(policy_out, torch.distributions.Distribution):
             bc_losses = -policy_out.log_prob(actions).sum(-1)
@@ -339,6 +441,8 @@ class IQLPlanner:
         self.actor_optimizer.step()
         self.actor_lr_schedule.step()
         log_dict["actor_loss"] = float(policy_loss.item())
+        log_dict["actor_exp_adv_mean"] = float(exp_adv.mean().item())
+        log_dict["actor_exp_adv_max"] = float(exp_adv.max().item())
 
     def train_step(self, batch: TensorBatch) -> Dict[str, float]:
         self.total_it += 1
@@ -386,6 +490,7 @@ class IQLPlanner:
         encoder_model: "CTEncoderWeightModel",
         encoder_optimizer: torch.optim.Optimizer,
         log_dict: Dict[str, float],
+        collect_encoder_diagnostics: bool = False,
     ) -> None:
         """Q-step: weighted TD loss; gradients flow to Q and encoder (observations has grad)."""
         with torch.no_grad():
@@ -399,13 +504,50 @@ class IQLPlanner:
         self.q_optimizer.zero_grad(set_to_none=True)
         encoder_optimizer.zero_grad(set_to_none=True)
         q_loss.backward()
+        diag_groups = (
+            _encoder_diagnostic_groups(encoder_model, self)
+            if collect_encoder_diagnostics
+            else []
+        )
+        diag_before = {}
+        if diag_groups:
+            for group_name, params in diag_groups:
+                param_tensors = [param for _, param in params]
+                grad_tensors = [
+                    param.grad
+                    for _, param in params
+                    if param.grad is not None
+                ]
+                log_dict[f"enc_grad_norm/{group_name}"] = _tensor_l2_norm(grad_tensors)
+                log_dict[f"enc_param_norm/{group_name}"] = _tensor_l2_norm(param_tensors)
+                for param_name, param in params:
+                    diag_before[param_name] = param.detach().clone()
         if self.cfg.max_grad_norm is not None:
             clip_grad_norm_(self.qf.parameters(), self.cfg.max_grad_norm)
         enc_clip = getattr(self.cfg, "encoder_max_grad_norm", None)
         if enc_clip is not None and enc_clip > 0:
-            clip_grad_norm_(encoder_model.encoder_parameters(), max_norm=float(enc_clip))
+            clip_grad_norm_(self.representation_parameters(encoder_model), max_norm=float(enc_clip))
+        if diag_groups:
+            for group_name, params in diag_groups:
+                grad_tensors = [
+                    param.grad
+                    for _, param in params
+                    if param.grad is not None
+                ]
+                log_dict[f"enc_grad_norm_postclip/{group_name}"] = _tensor_l2_norm(grad_tensors)
         self.q_optimizer.step()
         encoder_optimizer.step()
+        if diag_groups:
+            for group_name, params in diag_groups:
+                updates = [
+                    param.detach() - diag_before[param_name]
+                    for param_name, param in params
+                    if param_name in diag_before
+                ]
+                update_norm = _tensor_l2_norm(updates)
+                param_norm = max(log_dict[f"enc_param_norm/{group_name}"], 1e-12)
+                log_dict[f"enc_update_norm/{group_name}"] = update_norm
+                log_dict[f"enc_update_ratio/{group_name}"] = update_norm / param_norm
         soft_update(self.q_target, self.qf, self.cfg.tau)
         log_dict["q_loss"] = float(q_loss.item())
 
@@ -418,7 +560,7 @@ class IQLPlanner:
         log_dict: Dict[str, float],
     ) -> None:
         """π-step with detached states; weighted actor loss."""
-        exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=EXP_ADV_MAX)
+        exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
         if isinstance(policy_out, torch.distributions.Distribution):
             bc_losses = -policy_out.log_prob(actions).sum(-1)
@@ -432,6 +574,8 @@ class IQLPlanner:
         self.actor_optimizer.step()
         self.actor_lr_schedule.step()
         log_dict["actor_loss"] = float(policy_loss.item())
+        log_dict["actor_exp_adv_mean"] = float(exp_adv.mean().item())
+        log_dict["actor_exp_adv_max"] = float(exp_adv.max().item())
 
     def m_step_weighted(
         self,
@@ -440,13 +584,12 @@ class IQLPlanner:
         encoder_model: "CTEncoderWeightModel",
         encoder_optimizer: torch.optim.Optimizer,
         uniform_weights: bool = False,
+        collect_encoder_diagnostics: bool = False,
     ) -> Dict[str, float]:
         """
         M-step on one batch: V → Q → π with WeightNet weights.
         Only Q-step updates encoder; V/π use detached states.
         """
-        from src.data.iql_state_builder import build_augmented_state
-
         self.total_it += 1
         log_dict: Dict[str, float] = {}
 
@@ -458,16 +601,17 @@ class IQLPlanner:
         )
         w = w.detach()
 
-        s_grad = build_augmented_state(
+        s_grad = self.build_state(
             Z_t, batch.y_target, batch.delta_t_norm, batch.a_prev_tanh
         )
         s_det = s_grad.detach()
-        s_next_det = build_augmented_state(
-            Z_next.detach(),
-            batch.y_target,
-            batch.delta_t_next_norm,
-            batch.action,
-        ).detach()
+        with torch.no_grad():
+            s_next_det = self.build_state(
+                Z_next.detach(),
+                batch.y_target,
+                batch.delta_t_next_norm,
+                batch.action,
+            ).detach()
 
         adv = self._update_v_weighted(s_det, batch.action, w, log_dict)
         self._update_q_weighted_encoder(
@@ -480,6 +624,7 @@ class IQLPlanner:
             encoder_model,
             encoder_optimizer,
             log_dict,
+            collect_encoder_diagnostics=collect_encoder_diagnostics,
         )
         self._update_policy_weighted(s_det, batch.action, adv, w, log_dict)
         log_dict["w_mean"] = float(w.mean().item())
@@ -491,7 +636,7 @@ class IQLPlanner:
         return self.actor.act(state, device=self.cfg.device)
 
     def state_dict(self) -> Dict:
-        return {
+        out = {
             "actor": self.actor.state_dict(),
             "qf": self.qf.state_dict(),
             "q_target": self.q_target.state_dict(),
@@ -503,6 +648,9 @@ class IQLPlanner:
             "total_it": self.total_it,
             "cfg": self.cfg.__dict__,
         }
+        if self.goal_adapter is not None:
+            out["goal_adapter"] = self.goal_adapter.state_dict()
+        return out
 
     def load_eval_weights(self, state: Dict) -> None:
         """Load networks for evaluation (ignores optimizers / schedulers)."""
@@ -510,6 +658,10 @@ class IQLPlanner:
         self.qf.load_state_dict(state["qf"])
         self.q_target.load_state_dict(state["q_target"])
         self.vf.load_state_dict(state["vf"])
+        if self.goal_adapter is not None:
+            if "goal_adapter" not in state:
+                raise ValueError("Checkpoint is missing goal_adapter weights.")
+            self.goal_adapter.load_state_dict(state["goal_adapter"])
         self.total_it = int(state.get("total_it", 0))
 
     @classmethod
@@ -518,6 +670,13 @@ class IQLPlanner:
         cfg_dict = dict(state["cfg"])
         cfg_dict["device"] = device
         cfg_dict.setdefault("max_grad_norm", None)
+        cfg_dict.setdefault("encoder_max_grad_norm", 1.0)
+        cfg_dict.setdefault("adv_max", EXP_ADV_MAX)
+        cfg_dict.setdefault("goal_adapter_enabled", False)
+        cfg_dict.setdefault("z_dim", None)
+        cfg_dict.setdefault("output_dim", None)
+        cfg_dict.setdefault("goal_adapter_hidden_dim", 64)
+        cfg_dict.setdefault("goal_adapter_init_scale", 1e-3)
         cfg = IQLPlannerConfig(**cfg_dict)
         planner = cls(cfg)
         planner.load_eval_weights(state)

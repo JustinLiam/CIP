@@ -14,6 +14,7 @@
 #
 # Usage from repo root:
 #   MAX_TAU=6 bash scripts/cancer/train/run_em_iql_local_global_gift_protocol_maxtau.sh [GPU] [GAMMA]
+#   MAX_TAU=12 bash scripts/cancer/train/run_em_iql_local_global_gift_protocol_maxtau.sh [GPU] [GAMMA]
 
 set -euo pipefail
 
@@ -37,12 +38,21 @@ IQL_ACTOR_LR="${IQL_ACTOR_LR:-3e-4}"
 IQL_QF_LR="${IQL_QF_LR:-3e-4}"
 IQL_VF_LR="${IQL_VF_LR:-${IQL_ACTOR_LR}}"
 IQL_MAX_GRAD="${IQL_MAX_GRAD:-5.0}"
+IQL_REWARD_TYPE="${IQL_REWARD_TYPE:-negative_outcome}"
+IQL_REWARD_HUBER_DELTA="${IQL_REWARD_HUBER_DELTA:-1.0}"
+IQL_ADV_MAX="${IQL_ADV_MAX:-100}"
 EM_M_STEPS="${EM_M_STEPS:-1000}"
 EM_HER_SAMPLES="${EM_HER_SAMPLES:-1}"
 EM_HER_REFRESH="${EM_HER_REFRESH:-0}"
+EM_SAVE_EVAL_CKPTS="${EM_SAVE_EVAL_CKPTS:-false}"
+EM_ENCODER_DIAGNOSTICS="${EM_ENCODER_DIAGNOSTICS:-false}"
+EM_ENCODER_DIAGNOSTICS_EVERY="${EM_ENCODER_DIAGNOSTICS_EVERY:-50}"
+IQL_GOAL_ADAPTER="${IQL_GOAL_ADAPTER:-false}"
+IQL_GOAL_ADAPTER_HIDDEN="${IQL_GOAL_ADAPTER_HIDDEN:-64}"
+IQL_GOAL_ADAPTER_INIT_SCALE="${IQL_GOAL_ADAPTER_INIT_SCALE:-1e-3}"
 EVAL_TAU_LIST="${EVAL_TAU_LIST:-[1,2,3,4,5,6]}"
 VAL_METRIC="${VAL_METRIC:-mae_uns}"
-MAX_TAU="${MAX_TAU:-6}"
+MAX_TAU="${MAX_TAU:-12}"
 GPU_WAIT_MEMORY_MB="${GPU_WAIT_MEMORY_MB:-1000}"
 GPU_WAIT_SECONDS="${GPU_WAIT_SECONDS:-60}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-em_iql_local_global_gift_protocol_maxtau}"
@@ -233,7 +243,25 @@ PY
 run_one() {
   local seed="$1"
   local local_layers=1
-  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_val${VAL_METRIC}_maxtau${MAX_TAU}"
+  local reward_id="${IQL_REWARD_TYPE//[^A-Za-z0-9]/}"
+  local beta_id="${IQL_BETA//./p}"
+  beta_id="${beta_id//-/m}"
+  beta_id="${beta_id//+/p}"
+  beta_id="${beta_id//[^A-Za-z0-9pm]/}"
+  local adv_id="${IQL_ADV_MAX//./p}"
+  adv_id="${adv_id//-/m}"
+  adv_id="${adv_id//+/p}"
+  adv_id="${adv_id//[^A-Za-z0-9pm]/}"
+  if [[ "${IQL_REWARD_TYPE}" == "negative_outcome_huber" || "${IQL_REWARD_TYPE}" == "huber" || "${IQL_REWARD_TYPE}" == "smooth_l1" ]]; then
+    reward_id="${reward_id}_d${IQL_REWARD_HUBER_DELTA//[^A-Za-z0-9]/}"
+  fi
+  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_val${VAL_METRIC}_${reward_id}_maxtau${MAX_TAU}"
+  if [[ "${EM_ENCODER_DIAGNOSTICS}" == "true" ]]; then
+    combo_id="${combo_id}_encdiag${EM_ENCODER_DIAGNOSTICS_EVERY}"
+  fi
+  if [[ "${IQL_GOAL_ADAPTER}" == "true" ]]; then
+    combo_id="${combo_id}_goaladapter"
+  fi
   local tag="${combo_id}_seed${seed}"
   local em_dir="${GRID_ROOT}/ckpts/${tag}"
   local em_ckpt="${em_dir}/ct_iql_em_best.pt"
@@ -262,6 +290,8 @@ run_one() {
   echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
   echo "  val_metric=${VAL_METRIC}"
   echo "  max_tau=${MAX_TAU}"
+  echo "  goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
+  echo "  encoder_diagnostics=${EM_ENCODER_DIAGNOSTICS} every=${EM_ENCODER_DIAGNOSTICS_EVERY}"
 
   wait_for_gpu
   CUDA_VISIBLE_DEVICES="${GPU}" python -u runnables/train_ct_iql_em.py \
@@ -276,8 +306,12 @@ run_one() {
     "model.inference.local_conv_layers=${local_layers}" \
     "exp.em_her_refresh_every=${EM_HER_REFRESH}" \
     "exp.em_her_samples_per_transition=${EM_HER_SAMPLES}" \
+    "exp.em_save_every_eval_checkpoint=${EM_SAVE_EVAL_CKPTS}" \
     "exp.ct_num_workers=0" \
+    "exp.iql_reward_type=${IQL_REWARD_TYPE}" \
+    "exp.iql_reward_huber_delta=${IQL_REWARD_HUBER_DELTA}" \
     "exp.iql_beta=${IQL_BETA}" \
+    "+exp.iql_adv_max=${IQL_ADV_MAX}" \
     "exp.iql_tau=${IQL_TAU}" \
     "exp.iql_actor_lr=${IQL_ACTOR_LR}" \
     "exp.iql_qf_lr=${IQL_QF_LR}" \
@@ -285,6 +319,11 @@ run_one() {
     "exp.iql_max_grad_norm=${IQL_MAX_GRAD}" \
     "exp.em_m_steps_per_outer=${EM_M_STEPS}" \
     "exp.max_tau=${MAX_TAU}" \
+    "+exp.em_encoder_diagnostics=${EM_ENCODER_DIAGNOSTICS}" \
+    "+exp.em_encoder_diagnostics_every=${EM_ENCODER_DIAGNOSTICS_EVERY}" \
+    "+exp.iql_goal_adapter_enabled=${IQL_GOAL_ADAPTER}" \
+    "+exp.iql_goal_adapter_hidden_dim=${IQL_GOAL_ADAPTER_HIDDEN}" \
+    "+exp.iql_goal_adapter_init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}" \
     "exp.em_val_metric=${VAL_METRIC}" \
     "exp.iql_val_metric=${VAL_METRIC}" \
     "+exp.em_ckpt_dir=${em_dir}" \
@@ -339,6 +378,8 @@ run_one() {
     echo "dataset_test=200"
     echo "max_seq_length=40"
     echo "min_seq_length=40"
+    echo "iql_beta=${IQL_BETA}"
+    echo "iql_adv_max=${IQL_ADV_MAX}"
     echo "em_ckpt=${em_ckpt}"
     echo "train_log=${train_log}"
     echo "eval_log=${eval_log}"
@@ -351,7 +392,7 @@ echo "[gift-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
 echo "[gift-protocol] seeds=(${SEEDS[*]})"
 echo "[gift-protocol] data train/val/test=1000/200/200 max_seq_length=40"
 echo "[gift-protocol] iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
-echo "[gift-protocol] beta=${IQL_BETA} grad=${IQL_MAX_GRAD} m_steps=${EM_M_STEPS} eval_tau_list=${EVAL_TAU_LIST}"
+echo "[gift-protocol] beta=${IQL_BETA} adv_max=${IQL_ADV_MAX} grad=${IQL_MAX_GRAD} m_steps=${EM_M_STEPS} eval_tau_list=${EVAL_TAU_LIST}"
 echo "[gift-protocol] max_tau=${MAX_TAU} val_metric=${VAL_METRIC}"
 echo "[gift-protocol] grid_root=${GRID_ROOT}"
 
