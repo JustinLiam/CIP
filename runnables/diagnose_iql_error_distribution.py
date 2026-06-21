@@ -34,6 +34,7 @@ from eval_iql_planner import (  # noqa: E402
 from src.data.cip_dataset import CIPDataset, get_dataloader  # noqa: E402
 from src.data.iql_dataset_builder import align_h_t_static_to_history  # noqa: E402
 from src.models.inference_model import InferenceModel  # noqa: E402
+from src.models.sequence_utils import gather_last_valid  # noqa: E402
 from src.planners.iql_planner import IQLPlanner  # noqa: E402
 from src.utils.em_ckpt import is_em_checkpoint, load_em_for_eval  # noqa: E402
 from src.utils.inference_ckpt import load_inference_checkpoint  # noqa: E402
@@ -184,7 +185,9 @@ def main(args: DictConfig) -> None:
                     if autoregressive_eval:
                         eval_target = targets["outputs"][:, -1, :]
                         H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
-                        a_prev_sim = H_work["current_treatments"][:, -1, :].clone()
+                        a_prev_sim = gather_last_valid(
+                            H_work["current_treatments"], H_work.get("active_entries")
+                        ).clone()
                         planned = []
                         for step in range(tau):
                             H_work = align_h_t_static_to_history(H_work)

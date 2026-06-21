@@ -144,20 +144,25 @@ class Attention(nn.Module):
 
         scores = scores / math.sqrt(d_k)
 
-        neg_inf = torch.finfo(scores.dtype).min
+        valid_mask = torch.ones_like(scores, dtype=torch.bool)
 
         if mask is not None:
             if mask.dtype != torch.bool:
-                scores = scores.masked_fill(mask == 0, neg_inf)
+                valid_mask = valid_mask & (mask != 0)
             else:
-                scores = scores.masked_fill(~mask, neg_inf)
+                valid_mask = valid_mask & mask
 
         if one_direction:
             lq, lk = query.size(2), key.size(2)
             causal = torch.tril(torch.ones((lq, lk), device=device, dtype=torch.bool))
-            scores = scores.masked_fill(~causal.view(1, 1, lq, lk), neg_inf)
+            valid_mask = valid_mask & causal.view(1, 1, lq, lk)
 
+        neg_inf = torch.finfo(scores.dtype).min
+        row_has_valid = valid_mask.any(dim=-1, keepdim=True)
+        scores = scores.masked_fill(~valid_mask, neg_inf)
+        scores = torch.where(row_has_valid, scores, torch.zeros_like(scores))
         p_attn = F.softmax(scores, dim=-1)
+        p_attn = p_attn.masked_fill(~valid_mask, 0.0)
 
         if dropout is not None:
             p_attn = dropout(p_attn)
@@ -233,9 +238,12 @@ class TransformerEncoderBlock(nn.Module):
 
     def forward(self, x, active_entries):
         self_att_mask = active_entries.repeat(1, 1, active_entries.size(1)).unsqueeze(1)
+        active = active_entries.to(device=x.device, dtype=x.dtype)
+        x = x * active
         x = self.self_attention(x, x, x, self_att_mask, True)
+        x = x * active
         x = self.feed_forward(x)
-        return x
+        return x * active
 
 
 class TransformerDecoderBlock(nn.Module):
@@ -255,11 +263,15 @@ class TransformerDecoderBlock(nn.Module):
     def forward(self, x, encoder_x, active_entries, active_encoder_br):
         self_att_mask = active_entries.repeat(1, 1, active_entries.size(1)).unsqueeze(1)
         cross_att_mask = (active_encoder_br.unsqueeze(1) * active_entries).unsqueeze(1)
+        active = active_entries.to(device=x.device, dtype=x.dtype)
 
+        x = x * active
         x = self.self_attention(x, x, x, self_att_mask, True)
+        x = x * active
         x = self.cross_attention(x, encoder_x, encoder_x, cross_att_mask, False)
+        x = x * active
         x = self.feed_forward(x)
-        return x
+        return x * active
 
 
 class TransformerMultiInputBlock(nn.Module):
@@ -326,41 +338,55 @@ class TransformerMultiInputBlock(nn.Module):
         else:
             x_t, x_o, x_v = x_tov
 
+        mask_ot = active_entries_treat_outcomes.to(device=x_t.device, dtype=x_t.dtype)
+        x_t = x_t * mask_ot
+        x_o = x_o * mask_ot
         self_att_mask_ot = active_entries_treat_outcomes.repeat(1, 1, x_t.size(1)).unsqueeze(1)
         cross_att_mask_ot = cross_att_mask_to = self_att_mask_ot
 
         x_t_ = self.self_attention_t(x_t, x_t, x_t, self_att_mask_ot, True)
+        x_t_ = x_t_ * mask_ot
         x_to_ = self.cross_attention_to(x_t_, x_o, x_o, cross_att_mask_ot, True) if not self.disable_cross_attention \
             and self.isolate_subnetwork != 't' and self.isolate_subnetwork != 'o' else x_t_
+        x_to_ = x_to_ * mask_ot
 
         x_o_ = self.self_attention_o(x_o, x_o, x_o, self_att_mask_ot, True)
+        x_o_ = x_o_ * mask_ot
         x_ot_ = self.cross_attention_ot(x_o_, x_t, x_t, cross_att_mask_to, True) if not self.disable_cross_attention \
             and self.isolate_subnetwork != 'o' and self.isolate_subnetwork != 't' else x_o_
+        x_ot_ = x_ot_ * mask_ot
 
         if self.n_inputs == 2:
-            out_t = self.feed_forwards[0](x_to_ + x_s)
-            out_o = self.feed_forwards[1](x_ot_ + x_s)
+            out_t = self.feed_forwards[0](x_to_ + x_s) * mask_ot
+            out_o = self.feed_forwards[1](x_ot_ + x_s) * mask_ot
 
             return out_t, out_o
 
         else:
+            mask_v = active_entries_vitals.to(device=x_v.device, dtype=x_v.dtype)
+            x_v = x_v * mask_v
             self_att_mask_v = active_entries_vitals.repeat(1, 1, x_v.size(1)).unsqueeze(1)
             cross_att_mask_ot_v = (active_entries_vitals.squeeze(-1).unsqueeze(1) * active_entries_treat_outcomes).unsqueeze(1)
             cross_att_mask_v_ot = (active_entries_treat_outcomes.squeeze(-1).unsqueeze(1) * active_entries_vitals).unsqueeze(1)
 
             x_tv_ = self.cross_attention_tv(x_t_, x_v, x_v, cross_att_mask_ot_v, True) if not self.disable_cross_attention \
                 and self.isolate_subnetwork != 't' and self.isolate_subnetwork != 'v' else 0.0
+            x_tv_ = x_tv_ * mask_ot if torch.is_tensor(x_tv_) else x_tv_
             x_ov_ = self.cross_attention_ov(x_o_, x_v, x_v, cross_att_mask_ot_v, True) if not self.disable_cross_attention \
                 and self.isolate_subnetwork != 'o' and self.isolate_subnetwork != 'v' else 0.0
+            x_ov_ = x_ov_ * mask_ot if torch.is_tensor(x_ov_) else x_ov_
 
             x_v_ = self.self_attention_v(x_v, x_v, x_v, self_att_mask_v, True)
+            x_v_ = x_v_ * mask_v
             x_vt_ = self.cross_attention_vt(x_v_, x_t, x_t, cross_att_mask_v_ot, True) if not self.disable_cross_attention \
                 and self.isolate_subnetwork != 'v' and self.isolate_subnetwork != 't' else x_v_
+            x_vt_ = x_vt_ * mask_v
             x_vo_ = self.cross_attention_vo(x_v_, x_o, x_o, cross_att_mask_v_ot, True) if not self.disable_cross_attention \
                 and self.isolate_subnetwork != 'v' and self.isolate_subnetwork != 'o' else 0.0
+            x_vo_ = x_vo_ * mask_v if torch.is_tensor(x_vo_) else x_vo_
 
-            out_t = self.feed_forwards[0](x_to_ + x_tv_ + x_s)
-            out_o = self.feed_forwards[1](x_ot_ + x_ov_ + x_s)
-            out_v = self.feed_forwards[2](x_vt_ + x_vo_ + x_s)
+            out_t = self.feed_forwards[0](x_to_ + x_tv_ + x_s) * mask_ot
+            out_o = self.feed_forwards[1](x_ot_ + x_ov_ + x_s) * mask_ot
+            out_v = self.feed_forwards[2](x_vt_ + x_vo_ + x_s) * mask_v
 
             return out_t, out_o, out_v

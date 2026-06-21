@@ -174,7 +174,7 @@ class GoalAdapter(nn.Module):
 class GaussianPolicy(nn.Module):
     """
     Tanh output in (-1, 1), then scaled to [-max_action, max_action].
-    For dataset actions in [0, max_action], use ``dataset_actions_to_tanh_policy_space`` in the transition builder.
+    For dataset/simulator actions in [0, 1], use ``dataset_actions_to_tanh_policy_space`` in the transition builder.
     """
 
     def __init__(
@@ -343,6 +343,13 @@ class IQLPlanner:
             z_t = self.goal_adapter(z_t, y_target, delta_t_norm)
         return torch.cat([z_t, y_target, delta_t_norm, a_prev_tanh], dim=-1)
 
+    def _actor_bc_targets(self, actions: torch.Tensor) -> torch.Tensor:
+        """Normalize policy-space actions to the actor network's tanh output space."""
+        max_action = float(self.cfg.max_action)
+        if max_action > 0.0:
+            return torch.clamp(actions / max_action, -1.0, 1.0)
+        return actions
+
     def _update_v(self, observations, actions, log_dict) -> torch.Tensor:
         """
         value loss（v_loss）的含义和计算方式如下：
@@ -429,10 +436,11 @@ class IQLPlanner:
         """
         exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
+        target_actions = self._actor_bc_targets(actions)
         if isinstance(policy_out, torch.distributions.Distribution):
-            bc_losses = -policy_out.log_prob(actions).sum(-1)
+            bc_losses = -policy_out.log_prob(target_actions).sum(-1)
         else:
-            bc_losses = ((policy_out - actions) ** 2).sum(-1)
+            bc_losses = ((policy_out - target_actions) ** 2).sum(-1)
         policy_loss = torch.mean(exp_adv * bc_losses)
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
@@ -562,10 +570,11 @@ class IQLPlanner:
         """π-step with detached states; weighted actor loss."""
         exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
+        target_actions = self._actor_bc_targets(actions)
         if isinstance(policy_out, torch.distributions.Distribution):
-            bc_losses = -policy_out.log_prob(actions).sum(-1)
+            bc_losses = -policy_out.log_prob(target_actions).sum(-1)
         else:
-            bc_losses = ((policy_out - actions) ** 2).sum(-1)
+            bc_losses = ((policy_out - target_actions) ** 2).sum(-1)
         policy_loss = _weighted_mean_sq(exp_adv * bc_losses, w)
         self.actor_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()

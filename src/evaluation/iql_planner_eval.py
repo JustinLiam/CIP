@@ -15,6 +15,7 @@ from torch.distributions import Distribution
 from src.data.cip_dataset import CIPDataset, get_dataloader
 from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_actions_to_tanh_policy_space
 from src.models.inference_model import InferenceModel
+from src.models.sequence_utils import gather_last_valid
 from src.planners.iql_planner import IQLPlanner
 
 logger = logging.getLogger(__name__)
@@ -40,8 +41,8 @@ def _policy_to_sim_interval_torch(raw: torch.Tensor, max_action: float) -> torch
 def _sim_actions_to_tanh_batch(a_sim: torch.Tensor, max_action: float) -> torch.Tensor:
     if max_action <= 0:
         return a_sim
-    a = torch.clamp(a_sim, 0.0, max_action)
-    return 2.0 * a - max_action
+    a = torch.clamp(a_sim, 0.0, 1.0)
+    return (2.0 * a - 1.0) * float(max_action)
 
 
 def _iql_augmented_state(
@@ -110,8 +111,9 @@ def _extend_h_work_after_one_step(
     y_ch = y_col.unsqueeze(-1)
     y_uns = y_col * float(std_ser["cancer_volume"]) + float(mean_ser["cancer_volume"])
 
-    last_curr = H["current_treatments"][:, -1:, :].clone()
-    last_out = H["outputs"][:, -1:, :].clone()
+    active = H.get("active_entries")
+    last_curr = gather_last_valid(H["current_treatments"], active).unsqueeze(1).clone()
+    last_out = gather_last_valid(H["outputs"], active).unsqueeze(1).clone()
 
     H["prev_treatments"] = torch.cat([H["prev_treatments"], last_curr], dim=1)
     H["current_treatments"] = torch.cat([H["current_treatments"], a_sim.unsqueeze(1)], dim=1)
@@ -168,9 +170,10 @@ def _rollout_one_step_y(
         return torch.as_tensor(y_np, device=device, dtype=torch.float32)
     if world == "predictor":
         if not getattr(inference_model, "_outcome_predictor_loaded", False):
-            logger.warning(
+            raise RuntimeError(
                 "predictor-world rollout requested but outcome_predictor weights were "
-                "not loaded; results reflect random-initialized predictor."
+                "not loaded. Use a checkpoint containing 'outcome_predictor' or remove "
+                "'predictor' from the requested worlds."
             )
         z, _, _ = inference_model.ct_hidden_history(H_work)
         za = torch.cat([z, a_sim], dim=-1)
@@ -381,7 +384,9 @@ def aggregate_iql_planner_metrics(
                 if autoregressive_eval:
                     eval_target = targets["outputs"][:, -1, :]
                     H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
-                    a_prev_sim = H_work["current_treatments"][:, -1, :].clone()
+                    a_prev_sim = gather_last_valid(
+                        H_work["current_treatments"], H_work.get("active_entries")
+                    ).clone()
                     planned = []
                     history_checks = []
                     for step in range(tau):
@@ -392,7 +397,9 @@ def aggregate_iql_planner_metrics(
                         z_before = None
                         if world_debug is not None and len(history_checks) < 2:
                             pre_len = int(H_work["outputs"].size(1))
-                            prev_out = H_work["outputs"][:, -1, :].detach().clone()
+                            prev_out = gather_last_valid(
+                                H_work["outputs"], H_work.get("active_entries")
+                            ).detach().clone()
                             z_before = z.detach().clone()
                         a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
                         obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
@@ -454,7 +461,9 @@ def aggregate_iql_planner_metrics(
                     z, _, _ = inference_model.ct_hidden_history(H_t)
                     z_np = z.detach().cpu().numpy()
                     eval_target_np = targets["outputs"][:, -1, :].detach().cpu().numpy()
-                    a_prev_raw = H_t["current_treatments"][:, -1, :].detach().cpu().numpy()
+                    a_prev_raw = gather_last_valid(
+                        H_t["current_treatments"], H_t.get("active_entries")
+                    ).detach().cpu().numpy()
                     a_prev_feat = dataset_actions_to_tanh_policy_space(a_prev_raw, max_action)
                     bsz = z_np.shape[0]
                     delta_scalar = float(tau - 0) / max_tau

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
+from src.models.sequence_utils import gather_last_valid, last_valid_mask
 
 
 def _cfg_sel(cfg, key: str, default):
@@ -160,8 +161,8 @@ class CTDeconfoundModel(nn.Module):
             static_features=static,
         )
         Z_seq = self.projection(ct_rep)
-        Z_t = Z_seq[:, -1, :]
-        A_t = H_t["current_treatments"][:, -1, :]
+        Z_t = gather_last_valid(Z_seq, active)
+        A_t = gather_last_valid(H_t["current_treatments"], active)
         return Z_t, A_t
 
     def forward(self, H_t: Dict[str, torch.Tensor], y_next: torch.Tensor):
@@ -194,7 +195,7 @@ class CTDeconfoundModel(nn.Module):
         y_hat = self.predictor(za_for_y)
         se = (y_hat - y_next).pow(2).mean(dim=-1)
         # 提取当前时间步的 active 掩码 [B]
-        active_t = H_t["active_entries"][:, -1, 0]
+        active_t = last_valid_mask(H_t["active_entries"])
         # Weighted (WeightNet-reweighted) M-step loss — original behaviour.
         #
         # 为什么需要 weighted 和 unweighted 两个 loss（loss_pred_w, loss_pred_anchor）？
@@ -255,7 +256,7 @@ class CTDeconfoundModel(nn.Module):
         za = torch.cat([Z_t, A_t], dim=-1)
         y_hat = self.predictor(za)
         se = (y_hat - y_target).pow(2).mean(dim=-1)
-        active_t = H_t["active_entries"][:, -1, 0]
+        active_t = last_valid_mask(H_t["active_entries"])
         loss_w = (w_fixed * se * active_t).sum() / (active_t.sum() + 1e-8)
         loss_anchor = (se * active_t).sum() / (active_t.sum() + 1e-8)
         return loss_w, y_hat, loss_anchor

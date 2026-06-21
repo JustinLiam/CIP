@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 
 from src.models.ct_deconfound import WeightNet, build_covariate_x
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
+from src.models.sequence_utils import gather_last_valid, last_valid_mask
 from src.utils.utils import (
     compute_mmd_weighted,
     compute_weighted_wasserstein_joint_marginal_flat,
@@ -137,8 +138,8 @@ class CTEncoderWeightModel(nn.Module):
             static_features=static,
         )
         Z_seq = self.projection(ct_rep)
-        Z_t = Z_seq[:, -1, :]
-        A_t = H_t["current_treatments"][:, -1, :]
+        Z_t = gather_last_valid(Z_seq, active)
+        A_t = gather_last_valid(H_t["current_treatments"], active)
         return Z_t, A_t
 
     def compute_weights(
@@ -177,7 +178,7 @@ class CTEncoderWeightModel(nn.Module):
         for batch in loader:
             H_t = {k: v.to(device) for k, v in batch["H_t"].items()}
             Z_t, A_t = self.encode(H_t)
-            active_t = H_t["active_entries"][:, -1, 0]
+            active_t = last_valid_mask(H_t["active_entries"])
             z_parts.append(Z_t.detach())
             a_parts.append(A_t)
             act_parts.append(active_t)
@@ -227,9 +228,21 @@ class CTEncoderWeightModel(nn.Module):
             raise ValueError(f"EM E-step supports sinkhorn only, got {align_mode!r}")
 
         Z_det, A_all, active_all = self._encode_full_dataset(loader, device)
+        n_total = Z_det.size(0)
+        valid = active_all > 0.5
+        Z_det = Z_det[valid]
+        A_all = A_all[valid]
+        active_all = active_all[valid]
         n = Z_det.size(0)
         if n == 0:
-            return {"align_pre": 0.0, "align_post": 0.0, "w_ess_frac": 1.0, "w_std": 0.0, "n_samples": 0.0}
+            return {
+                "align_pre": 0.0,
+                "align_post": 0.0,
+                "w_ess_frac": 1.0,
+                "w_std": 0.0,
+                "n_samples": 0.0,
+                "n_samples_total": float(n_total),
+            }
 
         # Generator device must match ``device=`` in randperm (cuda tensors need cuda generator).
         gen = torch.Generator(device=Z_det.device)
@@ -286,6 +299,7 @@ class CTEncoderWeightModel(nn.Module):
             "w_ess_frac": w_ess,
             "w_std": w_std,
             "n_samples": float(n),
+            "n_samples_total": float(n_total),
         }
 
     def e_step_batch(
@@ -302,7 +316,7 @@ class CTEncoderWeightModel(nn.Module):
         with torch.no_grad():
             Z_t, A_t = self.encode(H_t)
         Z_det = Z_t.detach()
-        active_t = H_t["active_entries"][:, -1, 0]
+        active_t = last_valid_mask(H_t["active_entries"])
 
         loss_align_pre = None
         for i in range(max(1, int(k_inner))):

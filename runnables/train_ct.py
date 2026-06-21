@@ -21,6 +21,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.ct_transition_dataset import CTTransitionDataset, collate_ct_batch, _covariate_stream_dim
 from src.models.ct_deconfound import CTDeconfoundModel
+from src.models.sequence_utils import last_valid_mask
 from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import (
     compute_mmd_weighted,
@@ -118,7 +119,7 @@ def _run_epoch(
         # Batch-level "is this sample active at the query step" mask, matching
         # CTDeconfoundModel.forward's active_t used in loss_pred. Shape (B,);
         # no .squeeze() so that B=1 edge case still yields a 1-D mask.
-        active_t_mask = (H_t["active_entries"][:, -1, 0].detach() > 0.5)
+        active_t_mask = (last_valid_mask(H_t["active_entries"]).detach() > 0.5)
 
         with torch.set_grad_enabled(train):
             loss_pred1_w, Z_t, A_t, w, _, y_hat1, loss_pred1_anchor = model(H_t, y_next)
@@ -199,7 +200,7 @@ def _run_epoch(
                 za_sync = torch.cat([Z_t.detach(), A_t], dim=-1)
                 logits_sync = model.weight_net(za_sync)
                 w_sync = F.softmax(logits_sync, dim=0) * float(Z_t.size(0))
-                active_t_m = H_t["active_entries"][:, -1, 0]
+                active_t_m = last_valid_mask(H_t["active_entries"])
                 se1 = (y_hat1 - y_next).pow(2).mean(dim=-1)
                 loss_pred1_w_m = (w_sync.detach() * se1 * active_t_m).sum() / (active_t_m.sum() + 1e-8)
                 loss_pred1_m = (1.0 - a_blend) * loss_pred1_w_m + a_blend * loss_pred1_anchor

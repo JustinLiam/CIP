@@ -6,6 +6,7 @@ from src.data.ct_transition_dataset import _covariate_stream_dim
 from src.models.ct_deconfound import OutcomePredictor, build_covariate_x
 from src.models.dynamic_model import DynamicParamNetwork
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
+from src.models.sequence_utils import gather_last_valid
 
 
 def _expand_static_time_dim(H_t: dict, seq_len: int) -> dict:
@@ -186,7 +187,7 @@ class InferenceModel(nn.Module):
         #  计算事实结果的辅助预测损失 (Factual Outcome Prediction Loss)，强制要求编码器提取出的潜状态 Z_t 必须包含足够的信息，能够准确预测出当前患者的真实医疗指标 Y_t
         y_hat = self.predict_y_history_net(torch.cat((Z_t, treatments), dim=-1))
         loss = nn.MSELoss()(y_hat, H_t['outputs'])
-        return Z_t[:, -1, :], loss
+        return gather_last_valid(Z_t, H_t.get('active_entries', None)), loss
 
     def ct_hidden_history(self, H_t):
 
@@ -219,7 +220,7 @@ class InferenceModel(nn.Module):
         loss_hy = nn.MSELoss()(y_hat, H_t['outputs'])
 
         # 5. 只取历史序列的最后一步作为当前时刻推演的起点 s_t
-        Z_s_i = Z_t[:, -1, :]
+        Z_s_i = gather_last_valid(Z_t, H_t.get('active_entries', None))
 
         # ================= 新增的去交杂部分 =================
         # 4. 对比学习 Loss (参考 CoCo) 或 对抗 Loss (参考 CT) TODO 后续在这里实现 CoCo 对比损失或对抗损失

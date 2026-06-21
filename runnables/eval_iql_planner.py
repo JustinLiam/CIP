@@ -28,6 +28,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data.cip_dataset import CIPDataset, get_dataloader
 from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_actions_to_tanh_policy_space
 from src.models.inference_model import InferenceModel
+from src.models.sequence_utils import gather_last_valid
 from src.planners.iql_planner import IQLPlanner
 from src.utils.em_ckpt import is_em_checkpoint, load_em_for_eval
 from src.utils.inference_ckpt import load_inference_checkpoint
@@ -45,7 +46,7 @@ GIFT_TUMOR_VOLUME_NORMALIZER = 1150.0
 def _actions_to_sim_interval(raw: np.ndarray, max_action: float) -> np.ndarray:
     """
     Inverse of ``dataset_actions_to_tanh_policy_space``: map Tanh policy output in
-    [-max_action, max_action] to simulator treatment interval [0, max_action] (typically [0, 1]).
+    [-max_action, max_action] to simulator treatment interval [0, 1].
     """
     denom = 2.0 * max_action if max_action > 0 else 1.0
     return np.clip((raw + max_action) / denom, 0.0, 1.0).astype(np.float32)
@@ -61,8 +62,8 @@ def _sim_actions_to_tanh_batch(a_sim: torch.Tensor, max_action: float) -> torch.
     """Match ``dataset_actions_to_tanh_policy_space`` for batched simulator actions [B, A]."""
     if max_action <= 0:
         return a_sim
-    a = torch.clamp(a_sim, 0.0, max_action)
-    return 2.0 * a - max_action
+    a = torch.clamp(a_sim, 0.0, 1.0)
+    return (2.0 * a - 1.0) * float(max_action)
 
 
 def _iql_augmented_state(
@@ -116,8 +117,9 @@ def _extend_h_work_after_one_step(
     y_ch = y_col.unsqueeze(-1)  # [B, 1, 1] for outputs
     y_uns = _unscaled_cancer_volume(y_col, mean_ser, std_ser)
 
-    last_curr = H["current_treatments"][:, -1:, :].clone()
-    last_out = H["outputs"][:, -1:, :].clone()
+    active = H.get("active_entries")
+    last_curr = gather_last_valid(H["current_treatments"], active).unsqueeze(1).clone()
+    last_out = gather_last_valid(H["outputs"], active).unsqueeze(1).clone()
 
     H["prev_treatments"] = torch.cat([H["prev_treatments"], last_curr], dim=1)
     H["current_treatments"] = torch.cat([H["current_treatments"], a_sim.unsqueeze(1)], dim=1)
@@ -286,7 +288,9 @@ def main(args: DictConfig):
                     if autoregressive_eval:
                         eval_target = targets["outputs"][:, -1, :]
                         H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
-                        a_prev_sim = H_work["current_treatments"][:, -1, :].clone()
+                        a_prev_sim = gather_last_valid(
+                            H_work["current_treatments"], H_work.get("active_entries")
+                        ).clone()
                         planned = []
                         for step in range(tau):
                             H_work = align_h_t_static_to_history(H_work)
@@ -316,7 +320,9 @@ def main(args: DictConfig):
                         z, _, _ = inference_model.ct_hidden_history(H_t)
                         z_np = z.detach().cpu().numpy()
                         eval_target_np = targets["outputs"][:, -1, :].detach().cpu().numpy()
-                        a_prev_raw = H_t["current_treatments"][:, -1, :].detach().cpu().numpy()
+                        a_prev_raw = gather_last_valid(
+                            H_t["current_treatments"], H_t.get("active_entries")
+                        ).detach().cpu().numpy()
                         a_prev_feat = dataset_actions_to_tanh_policy_space(a_prev_raw, max_action)
                         bsz = z_np.shape[0]
                         delta_scalar = float(tau - 0) / max_tau

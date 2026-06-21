@@ -6,6 +6,7 @@ from src.models.utils_transformer import (
     RelativePositionalEncoding,
     TransformerMultiInputBlock,
 )
+from src.models.sequence_utils import active_time_mask
 
 
 class LocalConvMultiInputBlock(nn.Module):
@@ -197,16 +198,17 @@ class CTHistoryEncoder(nn.Module):
         batch_size, seq_len, _ = x.size()
         if active_entries is None:
             active_entries = torch.ones(batch_size, seq_len, 1, device=x.device, dtype=x.dtype)
+        active_mask = active_time_mask(active_entries, x)
 
         # 与 CT 一致：三个子网络输入分别映射后在每层 block 中做 self/cross attention
-        x_t = self.a_enc(a)  # treatment stream
-        x_o = self.y_enc(y)  # outcome stream
-        x_v = self.x_enc(x)  # covariate stream
+        x_t = self.a_enc(a) * active_mask  # treatment stream
+        x_o = self.y_enc(y) * active_mask  # outcome stream
+        x_v = self.x_enc(x) * active_mask  # covariate stream
 
         if self.self_positional_encoding is not None:
-            x_t = x_t + self.self_positional_encoding(x_t)
-            x_o = x_o + self.self_positional_encoding(x_o)
-            x_v = x_v + self.self_positional_encoding(x_v)
+            x_t = (x_t + self.self_positional_encoding(x_t)) * active_mask
+            x_o = (x_o + self.self_positional_encoding(x_o)) * active_mask
+            x_v = (x_v + self.self_positional_encoding(x_v)) * active_mask
 
         # 与 CT 一致：静态通道作为逐层偏置项注入
         if self.static_input_transformation is not None and static_features is not None:
@@ -223,6 +225,7 @@ class CTHistoryEncoder(nn.Module):
                 active_entries_treat_outcomes=active_entries,
                 active_entries_vitals=active_entries,
             )
+            x_t, x_o, x_v = x_t * active_mask, x_o * active_mask, x_v * active_mask
 
         for block in self.transformer_blocks:
             x_t, x_o, x_v = block(
@@ -231,10 +234,11 @@ class CTHistoryEncoder(nn.Module):
                 active_entries_treat_outcomes=active_entries,
                 active_entries_vitals=active_entries,
             )
+            x_t, x_o, x_v = x_t * active_mask, x_o * active_mask, x_v * active_mask
 
         # 与 CT 三分支聚合方式一致（等权平均）
         final_rep = (x_t + x_o + x_v) / 3.0
-        return final_rep
+        return final_rep * active_mask
 
 class ProjectionHead(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):

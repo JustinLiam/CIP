@@ -27,6 +27,11 @@ from src.models.inference_model import InferenceModel
 from src.planners.iql_planner import IQLPlanner, IQLPlannerConfig
 from src.training.ct_iql_em_loop import EMTrainConfig, run_e_step_full, run_m_step_steps
 from src.utils.em_ckpt import load_encoder_into_inference, save_em_checkpoint
+from src.utils.em_config import (
+    empty_replay_error as _empty_replay_error,
+    selection_world_from_config as _selection_world_from_config,
+    worlds_from_config as _worlds_from_config,
+)
 from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import repeat_static, set_seed, to_float
 
@@ -139,6 +144,16 @@ def main(args: DictConfig):
     ds_dict = OmegaConf.to_container(args["dataset"], resolve=True)
     x_dim = _covariate_stream_dim(ds_dict)
     ct_model = CTEncoderWeightModel(args, x_dim).to(device)
+    logger.info(
+        "CTHistoryEncoder layers | local=%d global=%d total=%d",
+        int(getattr(ct_model.ct_encoder, "local_conv_layers", 0)),
+        int(getattr(ct_model.ct_encoder, "global_attention_layers", 0)),
+        int(getattr(ct_model.ct_encoder, "num_layers", 0)),
+    )
+    if int(getattr(ct_model.ct_encoder, "local_conv_layers", 0)) <= 0:
+        logger.warning("local_conv_layers <= 0: local-global encoder is effectively all global attention.")
+    if int(getattr(ct_model.ct_encoder, "global_attention_layers", 0)) <= 0:
+        logger.warning("global_attention_layers <= 0: local-global encoder has no global attention layer.")
 
     z_dim = int(args.model.z_dim)
     out_dim = int(args.dataset.output_size)
@@ -205,10 +220,11 @@ def main(args: DictConfig):
     )
 
     def _build_replay(her_seed: int) -> IQLRawReplayBuffer:
+        max_patients = OmegaConf.select(args, "exp.iql_max_patients", default=None)
         raw = build_iql_raw_transitions(
             data=dataset_collection.train_f.data,
             reward_type=str(OmegaConf.select(args, "exp.iql_reward_type", default="progress")),
-            max_patients=OmegaConf.select(args, "exp.iql_max_patients", default=None),
+            max_patients=max_patients,
             max_action=max_action,
             dataset_actions_unit_interval=bool(
                 OmegaConf.select(args, "exp.iql_dataset_actions_unit_interval", default=True)
@@ -225,6 +241,17 @@ def main(args: DictConfig):
             horizon_terminal_done=iql_horizon_terminal_done,
             seed=her_seed,
         )
+        if not raw:
+            raise ValueError(
+                _empty_replay_error(
+                    dataset_collection.train_f.data,
+                    max_patients=max_patients,
+                    target_sampling=iql_target_sampling,
+                    target_horizons=iql_target_horizons,
+                    max_tau=max_tau,
+                    samples_per_transition=em_her_samples_per_transition,
+                )
+            )
         return IQLRawReplayBuffer(raw, device=device)
 
     base_seed = int(args.exp.seed)
@@ -289,10 +316,16 @@ def main(args: DictConfig):
         raise ValueError(
             f"exp.em_val_metric must be one of {VAL_METRIC_KEYS}, got {val_metric_key!r}"
         )
-    val_worlds = tuple(
-        str(w).strip()
-        for w in OmegaConf.select(args, "exp.em_val_worlds", default=["sim"])
+    val_worlds = _worlds_from_config(OmegaConf.select(args, "exp.em_val_worlds", default=["sim"]))
+    sel_world = _selection_world_from_config(
+        OmegaConf.select(args, "exp.em_val_selection_world", default=None),
+        val_worlds,
     )
+    if "predictor" in val_worlds:
+        raise ValueError(
+            "End-to-end EM checkpoints do not train/load outcome_predictor; remove 'predictor' "
+            "from exp.em_val_worlds or add predictor training before using predictor-world validation."
+        )
     eval_tau = int(args.exp.tau)
     em_val_tau_list = _list_from_config(
         OmegaConf.select(args, "exp.em_val_tau_list", default=None)
@@ -353,9 +386,10 @@ def main(args: DictConfig):
                 )
                 last_e_metrics = e_metrics
                 logger.info(
-                    "E-step full fit outer=%d | n=%.0f epochs=%d w_lr=%.1e",
+                    "E-step full fit outer=%d | n_active=%.0f n_total=%.0f epochs=%d w_lr=%.1e",
                     outer,
                     e_metrics.get("n_samples", 0),
+                    e_metrics.get("n_samples_total", e_metrics.get("n_samples", 0)),
                     em_e_epochs,
                     w_lr,
                 )
@@ -408,6 +442,8 @@ def main(args: DictConfig):
                 "e/w_ess_frac": e_metrics["w_ess_frac"],
                 "e/w_std": e_metrics.get("w_std", 0.0),
                 "e/e_epochs": float(em_e_epochs),
+                "e/n_samples": e_metrics.get("n_samples", 0.0),
+                "e/n_samples_total": e_metrics.get("n_samples_total", e_metrics.get("n_samples", 0.0)),
                 "m/q_loss": m_metrics["q_loss"],
                 "m/value_loss": m_metrics["value_loss"],
                 "m/actor_loss": m_metrics["actor_loss"],
@@ -445,9 +481,6 @@ def main(args: DictConfig):
                 load_encoder_into_inference(inference_model, em_state)
                 inference_model.eval()
                 planner.actor.eval()
-                sel_world = str(
-                    OmegaConf.select(args, "exp.em_val_selection_world", default=val_worlds[0])
-                )
                 val_scores = []
                 val_log_metrics = {}
                 for tau_i in em_val_tau_list:

@@ -284,6 +284,8 @@ class IQLRawReplayBuffer:
         self.size = len(transitions)
 
     def sample(self, batch_size: int) -> IQLRawBatch:
+        if self.size <= 0:
+            raise ValueError("Cannot sample from an empty IQLRawReplayBuffer.")
         idx = np.random.randint(0, self.size, size=batch_size)
         batch = collate_iql_raw_batch([self.transitions[i] for i in idx])
         return _batch_to_device(batch, self.device)

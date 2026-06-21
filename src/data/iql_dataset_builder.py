@@ -7,15 +7,16 @@ import torch
 
 def dataset_actions_to_tanh_policy_space(actions: np.ndarray, max_action: float) -> np.ndarray:
     """
-    Map factual treatments in [0, max_action] (e.g. cancer chemo/radio in [0, 1]) to the same
-    range as GaussianPolicy / DeterministicPolicy: tanh then * max_action -> [-max_action, max_action].
+    Map simulator/data treatments in [0, 1] to the bounded policy-action range
+    used by GaussianPolicy / DeterministicPolicy after tanh scaling:
+    [-max_action, max_action].
 
     Inverse of eval mapping: (a_policy + max_action) / (2 * max_action) -> sim [0, 1].
     """
     if max_action <= 0:
         return actions.astype(np.float32)
-    a = np.clip(actions.astype(np.float32), 0.0, max_action)
-    return (2.0 * a - max_action).astype(np.float32)
+    a = np.clip(actions.astype(np.float32), 0.0, 1.0)
+    return ((2.0 * a - 1.0) * float(max_action)).astype(np.float32)
 
 
 def huber_loss_np(error: np.ndarray, delta: float) -> np.ndarray:
@@ -153,7 +154,7 @@ def build_iql_transitions_from_ct(
     Next state uses ``a_t`` (the same vector as the transition action a) as the previous-action
     channel at time t+1.
 
-    If ``dataset_actions_unit_interval``, actions from data in [0, max_action] are mapped to
+    If ``dataset_actions_unit_interval``, actions from data/simulator space [0, 1] are mapped to
     [-max_action, max_action] to match Tanh-bounded IQL policies.
 
     ``max_tau`` scales time-to-go; must match evaluation (``exp.max_tau``).
