@@ -291,6 +291,33 @@ def test_td3bc_actor_update_updates_actor_without_q_grad_accumulation():
     assert changed
 
 
+def test_bc_actor_update_uses_behavior_cloning_without_advantage_weights():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+            actor_update="bc",
+        )
+    )
+    obs = torch.randn(8, 5)
+    actions = torch.clamp(torch.randn(8, 2), -1.0, 1.0)
+    adv = torch.randn(8)
+    before = [p.detach().clone() for p in planner.actor.parameters()]
+    logs = {}
+    planner._update_policy(adv, obs, actions, logs)
+    assert logs["actor_update_bc"] == 1.0
+    assert logs["actor_bc_loss"] >= 0.0
+    assert "actor_exp_adv_mean" not in logs
+    assert "actor_td3bc_q_term" not in logs
+    changed = any((a.detach() - b).abs().sum() > 0 for a, b in zip(planner.actor.parameters(), before))
+    assert changed
+
+
 def test_awr_td3bc_actor_update_keeps_adv_weights_and_q_gradient():
     planner = IQLPlanner(
         IQLPlannerConfig(

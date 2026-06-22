@@ -389,9 +389,9 @@ class IQLPlanner:
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
         self.q_optimizer = torch.optim.Adam(self.qf.parameters(), lr=cfg.qf_lr)
         actor_update = str(cfg.actor_update).strip().lower()
-        if actor_update not in ("awr", "td3bc", "awr_td3bc"):
+        if actor_update not in ("awr", "bc", "td3bc", "awr_td3bc"):
             raise ValueError(
-                f"Unknown actor_update={cfg.actor_update!r}; expected 'awr', 'td3bc', or 'awr_td3bc'."
+                f"Unknown actor_update={cfg.actor_update!r}; expected 'awr', 'bc', 'td3bc', or 'awr_td3bc'."
             )
         self.cfg.actor_update = actor_update
 
@@ -508,6 +508,11 @@ class IQLPlanner:
             return policy_out.mean
         return policy_out
 
+    def _policy_bc_losses(self, policy_out, target_actions: torch.Tensor) -> torch.Tensor:
+        if isinstance(policy_out, torch.distributions.Distribution):
+            return -policy_out.log_prob(target_actions).sum(-1)
+        return ((policy_out - target_actions) ** 2).sum(-1)
+
     def _td3bc_q_weight(self, q_values: torch.Tensor) -> torch.Tensor:
         alpha = float(self.cfg.td3bc_q_alpha)
         denom = q_values.detach().abs().mean().clamp(min=1e-6)
@@ -587,6 +592,30 @@ class IQLPlanner:
         log_dict["actor_td3bc_bc_loss"] = float(bc_term.detach().item())
         log_dict["actor_td3bc_q_coef"] = float(q_coef.detach().item())
 
+    def _update_policy_bc(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        log_dict: Dict[str, float],
+        w: Optional[torch.Tensor] = None,
+    ) -> None:
+        policy_out = self.actor(observations)
+        target_actions = self._actor_bc_targets(actions)
+        bc_losses = self._policy_bc_losses(policy_out, target_actions)
+        if w is None:
+            policy_loss = bc_losses.mean()
+        else:
+            policy_loss = _weighted_mean(bc_losses, w)
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        policy_loss.backward()
+        if self.cfg.max_grad_norm is not None:
+            clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
+        self.actor_optimizer.step()
+        self.actor_lr_schedule.step()
+        log_dict["actor_loss"] = float(policy_loss.item())
+        log_dict["actor_update_bc"] = 1.0
+        log_dict["actor_bc_loss"] = float(policy_loss.detach().item())
+
     def _update_policy_awr_td3bc(
         self,
         adv: torch.Tensor,
@@ -602,10 +631,7 @@ class IQLPlanner:
         try:
             policy_out = self.actor(observations)
             target_actions = self._actor_bc_targets(actions)
-            if isinstance(policy_out, torch.distributions.Distribution):
-                bc_losses = -policy_out.log_prob(target_actions).sum(-1)
-            else:
-                bc_losses = ((policy_out - target_actions) ** 2).sum(-1)
+            bc_losses = self._policy_bc_losses(policy_out, target_actions)
             awr_losses = exp_adv * bc_losses
 
             pi_tanh = self._actor_output_tanh(policy_out)
@@ -655,16 +681,16 @@ class IQLPlanner:
         if self.cfg.actor_update == "td3bc":
             self._update_policy_td3bc(observations, actions, log_dict)
             return
+        if self.cfg.actor_update == "bc":
+            self._update_policy_bc(observations, actions, log_dict)
+            return
         if self.cfg.actor_update == "awr_td3bc":
             self._update_policy_awr_td3bc(adv, observations, actions, log_dict)
             return
         exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
         target_actions = self._actor_bc_targets(actions)
-        if isinstance(policy_out, torch.distributions.Distribution):
-            bc_losses = -policy_out.log_prob(target_actions).sum(-1)
-        else:
-            bc_losses = ((policy_out - target_actions) ** 2).sum(-1)
+        bc_losses = self._policy_bc_losses(policy_out, target_actions)
         policy_loss = torch.mean(exp_adv * bc_losses)
         self.actor_optimizer.zero_grad()
         policy_loss.backward()
@@ -800,16 +826,16 @@ class IQLPlanner:
         if self.cfg.actor_update == "td3bc":
             self._update_policy_td3bc(observations, actions, log_dict, w=w)
             return
+        if self.cfg.actor_update == "bc":
+            self._update_policy_bc(observations, actions, log_dict, w=w)
+            return
         if self.cfg.actor_update == "awr_td3bc":
             self._update_policy_awr_td3bc(adv, observations, actions, log_dict, w=w)
             return
         exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
         target_actions = self._actor_bc_targets(actions)
-        if isinstance(policy_out, torch.distributions.Distribution):
-            bc_losses = -policy_out.log_prob(target_actions).sum(-1)
-        else:
-            bc_losses = ((policy_out - target_actions) ** 2).sum(-1)
+        bc_losses = self._policy_bc_losses(policy_out, target_actions)
         policy_loss = _weighted_mean(exp_adv * bc_losses, w)
         self.actor_optimizer.zero_grad(set_to_none=True)
         policy_loss.backward()

@@ -119,7 +119,8 @@ exp:
   iql_tau: 0.7  # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_weight_max: 10.0
-  # Actor extraction update: awr keeps IQL/AWR; td3bc uses Q-gradient + BC;
+  # Actor extraction update: awr keeps IQL/AWR; bc uses pure behavior cloning;
+  # td3bc uses Q-gradient + BC;
   # awr_td3bc keeps advantage-weighted AWR BC and adds a weak Q-gradient term.
   iql_actor_update: awr
   iql_td3bc_q_alpha: 2.5
