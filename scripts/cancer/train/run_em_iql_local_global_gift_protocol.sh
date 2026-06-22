@@ -41,6 +41,9 @@ IQL_REWARD_TYPE="${IQL_REWARD_TYPE:-negative_outcome}"
 IQL_REWARD_HUBER_DELTA="${IQL_REWARD_HUBER_DELTA:-1.0}"
 IQL_ADV_MAX="${IQL_ADV_MAX:-100}"
 IQL_WEIGHT_MAX="${IQL_WEIGHT_MAX:-10.0}"
+IQL_ACTOR_UPDATE="${IQL_ACTOR_UPDATE:-awr}"
+IQL_TD3BC_Q_ALPHA="${IQL_TD3BC_Q_ALPHA:-2.5}"
+IQL_TD3BC_BC_ALPHA="${IQL_TD3BC_BC_ALPHA:-1.0}"
 EM_OUTER_ITERS="${EM_OUTER_ITERS:-50}"
 EM_M_STEPS="${EM_M_STEPS:-1000}"
 EM_ENCODER_LR="${EM_ENCODER_LR:-5e-5}"
@@ -277,7 +280,16 @@ run_one() {
   if [[ "${IQL_REWARD_TYPE}" == "negative_outcome_huber" || "${IQL_REWARD_TYPE}" == "huber" || "${IQL_REWARD_TYPE}" == "smooth_l1" ]]; then
     reward_id="${reward_id}_d${IQL_REWARD_HUBER_DELTA//[^A-Za-z0-9]/}"
   fi
-  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_w${wmax_id}_enc${enc_lr_id}_eg${enc_grad_id}_val${VAL_METRIC}_${sampling_id}_${reward_id}_her${EM_HER_SAMPLES}"
+  local actor_id="${IQL_ACTOR_UPDATE//[^A-Za-z0-9]/}"
+  local qalpha_id="${IQL_TD3BC_Q_ALPHA//./p}"
+  qalpha_id="${qalpha_id//-/m}"
+  qalpha_id="${qalpha_id//+/p}"
+  qalpha_id="${qalpha_id//[^A-Za-z0-9pm]/}"
+  local bcalpha_id="${IQL_TD3BC_BC_ALPHA//./p}"
+  bcalpha_id="${bcalpha_id//-/m}"
+  bcalpha_id="${bcalpha_id//+/p}"
+  bcalpha_id="${bcalpha_id//[^A-Za-z0-9pm]/}"
+  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_w${wmax_id}_actor${actor_id}_qa${qalpha_id}_bc${bcalpha_id}_enc${enc_lr_id}_eg${enc_grad_id}_val${VAL_METRIC}_${sampling_id}_${reward_id}_her${EM_HER_SAMPLES}"
   if [[ "${EM_ENCODER_DIAGNOSTICS}" == "true" ]]; then
     combo_id="${combo_id}_encdiag${EM_ENCODER_DIAGNOSTICS_EVERY}"
   fi
@@ -311,6 +323,7 @@ run_one() {
   echo "  local_conv_layers=${local_layers}"
   echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
   echo "  iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} iql_weight_max=${IQL_WEIGHT_MAX}"
+  echo "  iql_actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
   echo "  val_metric=${VAL_METRIC}"
   echo "  em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} em_m_steps=${EM_M_STEPS} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS}"
   echo "  goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
@@ -341,6 +354,9 @@ run_one() {
     "exp.iql_beta=${IQL_BETA}" \
     "+exp.iql_adv_max=${IQL_ADV_MAX}" \
     "exp.iql_weight_max=${IQL_WEIGHT_MAX}" \
+    "exp.iql_actor_update=${IQL_ACTOR_UPDATE}" \
+    "exp.iql_td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA}" \
+    "exp.iql_td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}" \
     "exp.iql_tau=${IQL_TAU}" \
     "exp.iql_actor_lr=${IQL_ACTOR_LR}" \
     "exp.iql_qf_lr=${IQL_QF_LR}" \
@@ -417,6 +433,9 @@ run_one() {
     echo "iql_beta=${IQL_BETA}"
     echo "iql_adv_max=${IQL_ADV_MAX}"
     echo "iql_weight_max=${IQL_WEIGHT_MAX}"
+    echo "iql_actor_update=${IQL_ACTOR_UPDATE}"
+    echo "iql_td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA}"
+    echo "iql_td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
     echo "em_ckpt=${em_ckpt}"
     echo "train_log=${train_log}"
     echo "eval_log=${eval_log}"
@@ -429,7 +448,7 @@ echo "[gift-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
 echo "[gift-protocol] seeds=(${SEEDS[*]})"
 echo "[gift-protocol] data train/val/test=1000/200/200 max_seq_length=40"
 echo "[gift-protocol] iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
-echo "[gift-protocol] beta=${IQL_BETA} adv_max=${IQL_ADV_MAX} weight_max=${IQL_WEIGHT_MAX} grad=${IQL_MAX_GRAD} outer_iters=${EM_OUTER_ITERS} m_steps=${EM_M_STEPS} em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS} val_every=${EM_VAL_EVERY} eval_tau_list=${EVAL_TAU_LIST}"
+echo "[gift-protocol] beta=${IQL_BETA} adv_max=${IQL_ADV_MAX} weight_max=${IQL_WEIGHT_MAX} actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA} grad=${IQL_MAX_GRAD} outer_iters=${EM_OUTER_ITERS} m_steps=${EM_M_STEPS} em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS} val_every=${EM_VAL_EVERY} eval_tau_list=${EVAL_TAU_LIST}"
 echo "[gift-protocol] save_outer_ckpts=${EM_SAVE_OUTER_CKPTS} save_eval_ckpts=${EM_SAVE_EVAL_CKPTS}"
 echo "[gift-protocol] goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
 echo "[gift-protocol] target_sampling=${IQL_TARGET_SAMPLING} target_horizons=${IQL_TARGET_HORIZONS} horizon_terminal_done=${IQL_HORIZON_TERMINAL_DONE} her_samples=${EM_HER_SAMPLES}"
