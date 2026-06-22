@@ -184,6 +184,9 @@ def main(args: DictConfig):
         beta=float(OmegaConf.select(args, "exp.iql_beta", default=3.0)),
         adv_max=float(OmegaConf.select(args, "exp.iql_adv_max", default=100.0)),
         weight_max=iql_weight_max,
+        actor_update=str(OmegaConf.select(args, "exp.iql_actor_update", default="awr")),
+        td3bc_q_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_q_alpha", default=2.5)),
+        td3bc_bc_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_bc_alpha", default=1.0)),
         discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
         tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
         actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),
@@ -230,6 +233,10 @@ def main(args: DictConfig):
             f"exp.iql_val_selection_world={selection_world!r} must be one of exp.iql_val_worlds={val_worlds}"
         )
     debug_panel_enabled = bool(OmegaConf.select(args, "exp.iql_debug_panel", default=False))
+    val_action_diag = bool(OmegaConf.select(args, "exp.iql_val_action_diagnostics", default=False))
+    val_action_grid_points = int(OmegaConf.select(args, "exp.iql_val_action_grid_points", default=11))
+    val_action_diag_max_batches = OmegaConf.select(args, "exp.iql_val_action_diag_max_batches", default=2)
+    val_action_diag_max_batches = None if val_action_diag_max_batches is None else int(val_action_diag_max_batches)
 
     # Default save dir: iql_models/seed_${s}/gamma_${g}/. Override via exp.iql_save_dir
     # so grid search / parallel workers don't clobber the canonical file used by
@@ -339,6 +346,9 @@ def main(args: DictConfig):
                         log_batches=False,
                         worlds=val_worlds,
                         debug_panel=debug_panel_enabled,
+                        action_diagnostics=val_action_diag,
+                        action_grid_points=val_action_grid_points,
+                        action_diag_max_batches=val_action_diag_max_batches,
                     )
 
                 per_world = metrics.get("per_world", {val_worlds[0]: metrics})
@@ -355,6 +365,8 @@ def main(args: DictConfig):
                         "gift_rmse": float(per_world[w]["gift_rmse"]),
                         "gift_rmse_percent": float(per_world[w]["gift_rmse_percent"]),
                     }
+                    if "action_diagnostics" in per_world[w]:
+                        trace_entry[w]["action_diagnostics"] = per_world[w]["action_diagnostics"]
                     if m_w < best_per_world[w]["metric"]:
                         best_per_world[w]["metric"] = m_w
                         best_per_world[w]["state"] = _state_dict_to_cpu(planner.state_dict())

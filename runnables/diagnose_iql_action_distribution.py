@@ -1,36 +1,36 @@
 """
-Diagnose IQL planned actions against factual target actions under the eval rollout.
+Diagnose action shift for CT+IQL EM checkpoints.
 
-This script mirrors eval_iql_planner.py's autoregressive action generation, but
-records action-space statistics instead of outcome RMSE.
+The script is diagnostic-only. It does not participate in training/evaluation
+unless invoked directly. It reports validation/test rollout action summaries,
+Q(s,a) grid preferences, simulator best-action proxy, and replay-level
+advantage/weight/action correlations.
 """
+from __future__ import annotations
+
+import copy
 import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import hydra
 import numpy as np
 import torch
 from hydra.utils import get_original_cwd, instantiate
 from omegaconf import DictConfig, OmegaConf
-from torch.distributions import Distribution
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from runnables.eval_iql_planner import (  # noqa: E402
-    _extend_h_work_after_one_step,
-    _iql_augmented_state,
-    _policy_to_sim_interval_torch,
-    _sim_actions_to_tanh_batch,
-)
-from src.data.cip_dataset import CIPDataset, get_dataloader  # noqa: E402
-from src.data.iql_dataset_builder import align_h_t_static_to_history  # noqa: E402
+from src.data.ct_transition_dataset import _covariate_stream_dim  # noqa: E402
+from src.data.iql_raw_transition_dataset import IQLRawReplayBuffer, build_iql_raw_transitions  # noqa: E402
+from src.evaluation.iql_planner_eval import aggregate_iql_planner_metrics  # noqa: E402
+from src.models.ct_encoder_weight import CTEncoderWeightModel  # noqa: E402
 from src.models.inference_model import InferenceModel  # noqa: E402
-from src.models.sequence_utils import gather_last_valid  # noqa: E402
-from src.utils.em_ckpt import load_em_for_eval  # noqa: E402
+from src.planners.iql_planner import _cap_renormalize_weights  # noqa: E402
+from src.utils.em_ckpt import load_em_ct_model, load_em_for_eval  # noqa: E402
 from src.utils.utils import repeat_static, set_seed, to_float  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -39,42 +39,96 @@ logger = logging.getLogger(__name__)
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
 
-def _resolve_eval_tau_list(args: DictConfig) -> List[int]:
-    raw = OmegaConf.select(args, "exp.iql_eval_tau_list", default=None)
-    if raw is not None:
-        if isinstance(raw, str):
-            raw = raw.strip()
-            if raw.startswith("["):
-                raw = raw.strip("[]").split(",")
-            else:
-                raw = raw.split(",")
-        taus = [int(t) for t in list(raw) if str(t).strip()]
-        if taus:
-            return taus
-    return [int(args.exp.tau)]
+def _coerce_int_list(raw: Any, default: Optional[Iterable[int]] = None) -> List[int]:
+    if raw is None:
+        return list(default or [])
+    if OmegaConf.is_config(raw):
+        raw = OmegaConf.to_container(raw, resolve=True)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return list(default or [])
+        if text.startswith("[") and text.endswith("]"):
+            text = text[1:-1]
+        raw = [x.strip() for x in text.split(",") if x.strip()]
+    return [int(x) for x in raw]
+
+
+def _resolve_tau_list(args: DictConfig) -> List[int]:
+    raw = OmegaConf.select(args, "exp.action_diag_tau_list", default=None)
+    if raw is None:
+        raw = OmegaConf.select(args, "exp.iql_eval_tau_list", default=None)
+    taus = _coerce_int_list(raw, default=[1, 2, 3, 4, 5, 6])
+    return taus or [1, 2, 3, 4, 5, 6]
 
 
 def _stats(x: np.ndarray) -> Dict[str, float]:
-    x = np.asarray(x, dtype=np.float64)
+    arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return {}
     return {
-        "mean": float(np.mean(x)),
-        "std": float(np.std(x)),
-        "min": float(np.min(x)),
-        "p05": float(np.percentile(x, 5)),
-        "p50": float(np.percentile(x, 50)),
-        "p95": float(np.percentile(x, 95)),
-        "max": float(np.max(x)),
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "p05": float(np.percentile(arr, 5)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(arr.max()),
     }
 
 
-@hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
-def main(args: DictConfig):
-    OmegaConf.set_struct(args, False)
-    set_seed(int(args.exp.seed))
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    original_cwd = Path(get_original_cwd())
-    args["exp"]["processed_data_dir"] = os.path.join(str(original_cwd), args["exp"]["processed_data_dir"])
+def _rankdata(x: np.ndarray) -> np.ndarray:
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(len(x), dtype=np.float64)
+    return ranks
 
+
+def _corr(x: np.ndarray, y: np.ndarray, *, spearman: bool = False) -> Optional[float]:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if x.size < 2 or float(np.std(x)) <= 1e-12 or float(np.std(y)) <= 1e-12:
+        return None
+    if spearman:
+        x = _rankdata(x)
+        y = _rankdata(y)
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _quantile_bins(action_mean: np.ndarray, values: Dict[str, np.ndarray], n_bins: int = 5) -> List[Dict[str, Any]]:
+    action_mean = np.asarray(action_mean, dtype=np.float64).reshape(-1)
+    qs = np.quantile(action_mean, np.linspace(0.0, 1.0, n_bins + 1))
+    out = []
+    for i in range(n_bins):
+        lo, hi = qs[i], qs[i + 1]
+        if i == n_bins - 1:
+            mask = (action_mean >= lo) & (action_mean <= hi)
+        else:
+            mask = (action_mean >= lo) & (action_mean < hi)
+        row: Dict[str, Any] = {
+            "bin": i,
+            "lo": float(lo),
+            "hi": float(hi),
+            "n": int(mask.sum()),
+            "action_mean": float(action_mean[mask].mean()) if mask.any() else None,
+        }
+        for key, arr in values.items():
+            arr = np.asarray(arr, dtype=np.float64).reshape(-1)
+            row[f"{key}_mean"] = float(arr[mask].mean()) if mask.any() else None
+            row[f"{key}_std"] = float(arr[mask].std()) if mask.any() else None
+        out.append(row)
+    return out
+
+
+def _policy_to_sim_np(action_policy: np.ndarray, max_action: float) -> np.ndarray:
+    if max_action <= 0:
+        return action_policy.astype(np.float32)
+    return np.clip((action_policy + max_action) / (2.0 * max_action), 0.0, 1.0).astype(np.float32)
+
+
+def _prepare_dataset(args: DictConfig):
     dataset_collection = instantiate(args.dataset, _recursive_=True)
     dataset_collection.process_data_multi()
     dataset_collection = to_float(dataset_collection)
@@ -82,125 +136,175 @@ def main(args: DictConfig):
         dims = len(dataset_collection.train_f.data["static_features"].shape)
         if dims == 2:
             dataset_collection = repeat_static(dataset_collection)
+    return dataset_collection
 
-    if bool(OmegaConf.select(args, "exp.test", default=False)):
-        data = dataset_collection.test_f.data
-        fold = dataset_collection.test_f
-        split_name = "test"
-    else:
-        data = dataset_collection.val_f.data
-        fold = dataset_collection.val_f
-        split_name = "val"
 
-    em_eval_ckpt = str(OmegaConf.select(args, "exp.em_eval_ckpt", default="")).strip()
-    if not em_eval_ckpt:
-        raise ValueError("Set exp.em_eval_ckpt to an EM checkpoint.")
-    em_path = Path(em_eval_ckpt)
-    if not em_path.is_absolute():
-        em_path = original_cwd / em_path
-    if not em_path.is_file():
-        raise FileNotFoundError(f"EM checkpoint not found: {em_path}")
+def _resolve_ckpt(args: DictConfig, original_cwd: Path, seed: int) -> Path:
+    raw = str(OmegaConf.select(args, "exp.em_eval_ckpt", default="")).strip()
+    if not raw:
+        raise ValueError("Set exp.em_eval_ckpt to an EM checkpoint path or a template containing {seed}.")
+    raw = raw.format(seed=seed)
+    path = Path(raw)
+    if not path.is_absolute():
+        path = original_cwd / path
+    if not path.is_file():
+        raise FileNotFoundError(f"EM checkpoint not found for seed {seed}: {path}")
+    return path
 
-    inference_model = InferenceModel(args).to(device)
-    planner = load_em_for_eval(inference_model, str(em_path), device)
-    inference_model.eval()
+
+def _replay_diagnostics(args: DictConfig, dataset_collection, ckpt_path: Path, planner, device: str) -> Dict[str, Any]:
     max_action = float(planner.cfg.max_action)
     max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
-    mean_ser, std_ser = dataset_collection.train_scaling_params
-    tau_list = _resolve_eval_tau_list(args)
-    batch_size = int(OmegaConf.select(args, "exp.batch_size_val", default=128))
-    max_batches = OmegaConf.select(args, "exp.action_diag_max_batches", default=None)
-    max_batches = None if max_batches is None else int(max_batches)
-    original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=max(tau_list)))
+    max_patients = OmegaConf.select(args, "exp.action_diag_replay_max_patients", default=256)
+    max_patients = None if max_patients is None else int(max_patients)
+    sample_n = int(OmegaConf.select(args, "exp.action_diag_replay_samples", default=4096))
 
-    results = {
-        "checkpoint": str(em_path),
-        "split": split_name,
-        "seed": int(args.exp.seed),
-        "max_action": max_action,
-        "taus": {},
+    raw = build_iql_raw_transitions(
+        dataset_collection.train_f.data,
+        reward_type=str(OmegaConf.select(args, "exp.iql_reward_type", default="negative_outcome")),
+        max_patients=max_patients,
+        max_action=max_action,
+        dataset_actions_unit_interval=bool(OmegaConf.select(args, "exp.iql_dataset_actions_unit_interval", default=True)),
+        max_tau=max_tau,
+        reward_clip=float(OmegaConf.select(args, "exp.iql_reward_clip", default=3.0)),
+        reward_scale=str(OmegaConf.select(args, "exp.iql_reward_scale", default="auto")),
+        reward_huber_delta=float(OmegaConf.select(args, "exp.iql_reward_huber_delta", default=1.0)),
+        samples_per_transition=int(OmegaConf.select(args, "exp.em_her_samples_per_transition", default=1)),
+        target_sampling=str(OmegaConf.select(args, "exp.iql_target_sampling", default="horizon_aligned")),
+        target_horizons=OmegaConf.select(args, "exp.iql_target_horizons", default=None),
+        horizon_terminal_done=bool(OmegaConf.select(args, "exp.iql_horizon_terminal_done", default=True)),
+        seed=int(args.exp.seed) + 9109,
+    )
+    if not raw:
+        return {"n_transitions": 0}
+
+    ds_dict = OmegaConf.to_container(args["dataset"], resolve=True)
+    ct_model = CTEncoderWeightModel(args, _covariate_stream_dim(ds_dict)).to(device)
+    load_em_ct_model(ct_model, str(ckpt_path), device)
+    ct_model.eval()
+    replay = IQLRawReplayBuffer(raw, device=device)
+    batch = replay.sample(min(sample_n, replay.size))
+
+    with torch.no_grad():
+        z_t, a_t = ct_model.encode(batch.H_t)
+        _, w_raw = ct_model.compute_weights(z_t, a_t, detach_z=True, uniform=False)
+        w = _cap_renormalize_weights(w_raw.detach(), planner.cfg.weight_max)
+        states = planner.build_state(z_t, batch.y_target, batch.delta_t_norm, batch.a_prev_tanh)
+        q = planner.qf(states, batch.action)
+        v = planner.vf(states)
+        adv = q - v
+        exp_adv = torch.exp(float(planner.cfg.beta) * adv).clamp(max=float(planner.cfg.adv_max))
+
+    action_sim = _policy_to_sim_np(batch.action.detach().cpu().numpy(), max_action)
+    action_mean = action_sim.mean(axis=1)
+    arrays = {
+        "adv": adv.detach().cpu().numpy(),
+        "exp_adv": exp_adv.detach().cpu().numpy(),
+        "w_raw": w_raw.detach().cpu().numpy(),
+        "w": w.detach().cpu().numpy(),
+        "reward": batch.reward.detach().cpu().numpy(),
+    }
+    correlations = {}
+    for key, arr in arrays.items():
+        correlations[f"action_{key}_pearson"] = _corr(action_mean, arr)
+        correlations[f"action_{key}_spearman"] = _corr(action_mean, arr, spearman=True)
+
+    return {
+        "n_transitions": int(replay.size),
+        "n_sampled": int(action_mean.shape[0]),
+        "action": _stats(action_mean),
+        "adv": _stats(arrays["adv"]),
+        "exp_adv": _stats(arrays["exp_adv"]),
+        "w_raw": _stats(arrays["w_raw"]),
+        "w": _stats(arrays["w"]),
+        "reward": _stats(arrays["reward"]),
+        "correlations": correlations,
+        "action_quantile_bins": _quantile_bins(action_mean, arrays),
     }
 
+
+def _run_one_seed(args: DictConfig, seed: int, original_cwd: Path) -> Dict[str, Any]:
+    args = copy.deepcopy(args)
+    args.exp.seed = int(seed)
+    set_seed(int(seed))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dataset_collection = _prepare_dataset(args)
+    ckpt_path = _resolve_ckpt(args, original_cwd, seed)
+
+    inference_model = InferenceModel(args).to(device)
+    planner = load_em_for_eval(inference_model, str(ckpt_path), device)
+    inference_model.eval()
+    planner.actor.eval()
+
+    split_name = "test" if bool(OmegaConf.select(args, "exp.test", default=False)) else "val"
+    fold = dataset_collection.test_f if split_name == "test" else dataset_collection.val_f
+    tau_list = _resolve_tau_list(args)
+    grid_points = int(OmegaConf.select(args, "exp.action_diag_grid_points", default=OmegaConf.select(args, "exp.iql_val_action_grid_points", default=11)))
+    max_batches = OmegaConf.select(
+        args,
+        "exp.action_diag_max_batches",
+        default=OmegaConf.select(args, "exp.iql_val_action_diag_max_batches", default=2),
+    )
+    max_batches = None if max_batches is None else int(max_batches)
+    val_bs = int(OmegaConf.select(args, "exp.batch_size_val", default=128))
+    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
+    autoreg = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
+
+    per_tau = {}
     for tau in tau_list:
-        args.exp.tau = int(tau)
-        try:
-            dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=batch_size, shuffle=False)
-        finally:
-            args.exp.tau = original_exp_tau
-
-        planned_chunks = []
-        factual_chunks = []
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(dataloader):
-                if max_batches is not None and batch_idx >= max_batches:
-                    break
-                H_t, targets = batch
-                H_t = align_h_t_static_to_history(H_t)
-                for key in H_t:
-                    H_t[key] = H_t[key].to(device)
-                for key in targets:
-                    targets[key] = targets[key].to(device)
-
-                eval_target = targets["outputs"][:, -1, :]
-                H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
-                a_prev_sim = gather_last_valid(
-                    H_work["current_treatments"], H_work.get("active_entries")
-                ).clone()
-                planned = []
-                for step in range(tau):
-                    H_work = align_h_t_static_to_history(H_work)
-                    z, _, _ = inference_model.ct_hidden_history(H_work)
-                    a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
-                    obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
-                    policy_out = planner.actor(obs)
-                    actor_max = planner.actor.max_action
-                    if isinstance(policy_out, Distribution):
-                        a_raw = torch.clamp(actor_max * policy_out.mean, -actor_max, actor_max)
-                    else:
-                        a_raw = torch.clamp(policy_out * actor_max, -actor_max, actor_max)
-                    a_sim = _policy_to_sim_interval_torch(a_raw, max_action)
-                    planned.append(a_sim)
-                    y_np = fold.simulate_output_after_actions(
-                        H_work,
-                        a_sim.unsqueeze(1),
-                        dataset_collection.train_scaling_params,
-                    )
-                    y_norm = torch.as_tensor(y_np, device=device, dtype=torch.float32)
-                    _extend_h_work_after_one_step(H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device))
-                    a_prev_sim = a_sim
-
-                planned_seq = torch.stack(planned, dim=1).detach().cpu().numpy()
-                factual_seq = targets["current_treatments"].detach().cpu().numpy()
-                planned_chunks.append(planned_seq)
-                factual_chunks.append(factual_seq)
-
-        planned_arr = np.concatenate(planned_chunks, axis=0)
-        factual_arr = np.concatenate(factual_chunks, axis=0)
-        diff = planned_arr - factual_arr
-        tau_result = {
-            "action_rmse": float(np.sqrt(np.mean(diff ** 2))),
-            "action_mae": float(np.mean(np.abs(diff))),
-            "planned": _stats(planned_arr),
-            "factual": _stats(factual_arr),
-            "diff": _stats(diff),
-            "steps": [],
+        metrics = aggregate_iql_planner_metrics(
+            planner,
+            inference_model,
+            dataset_collection,
+            fold,
+            args,
+            device=device,
+            tau=int(tau),
+            max_tau=max_tau,
+            autoregressive_eval=autoreg,
+            val_batch_size=val_bs,
+            worlds=("sim",),
+            action_diagnostics=True,
+            action_grid_points=grid_points,
+            action_diag_max_batches=max_batches,
+        )
+        per_tau[str(tau)] = {
+            "mae_uns": float(metrics["mae_uns"]),
+            "rmse_uns": float(metrics["rmse_uns"]),
+            "action_diagnostics": metrics.get("action_diagnostics", {}),
         }
-        for step in range(tau):
-            step_diff = diff[:, step, :]
-            tau_result["steps"].append(
-                {
-                    "step": step + 1,
-                    "rmse": float(np.sqrt(np.mean(step_diff ** 2))),
-                    "mae": float(np.mean(np.abs(step_diff))),
-                    "planned": _stats(planned_arr[:, step, :]),
-                    "factual": _stats(factual_arr[:, step, :]),
-                    "diff": _stats(step_diff),
-                }
-            )
-        results["taus"][str(tau)] = tau_result
 
-    out_path = str(OmegaConf.select(args, "exp.action_diag_out", default=""))
+    return {
+        "seed": int(seed),
+        "split": split_name,
+        "checkpoint": str(ckpt_path),
+        "max_action": float(planner.cfg.max_action),
+        "actor_update": str(planner.cfg.actor_update),
+        "tau": per_tau,
+        "replay_diagnostics": _replay_diagnostics(args, dataset_collection, ckpt_path, planner, device),
+    }
+
+
+@hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
+def main(args: DictConfig):
+    OmegaConf.set_struct(args, False)
+    original_cwd = Path(get_original_cwd())
+    args["exp"]["processed_data_dir"] = os.path.join(str(original_cwd), args["exp"]["processed_data_dir"])
+
+    seeds = _coerce_int_list(OmegaConf.select(args, "exp.action_diag_seeds", default=None), default=[20, 202, 2020])
+    results = {
+        "diagnostic": "ct_iql_action_shift",
+        "seeds": seeds,
+        "tau_list": _resolve_tau_list(args),
+        "note": "Diagnostic only; do not use test split to select hyperparameters.",
+        "results": [],
+    }
+    for seed in seeds:
+        logger.info("Running action diagnostics for seed=%s", seed)
+        results["results"].append(_run_one_seed(args, int(seed), original_cwd))
+
     text = json.dumps(results, indent=2, sort_keys=True)
+    out_path = str(OmegaConf.select(args, "exp.action_diag_out", default="")).strip()
     if out_path:
         p = Path(out_path)
         if not p.is_absolute():

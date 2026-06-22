@@ -280,6 +280,19 @@ class VCIPMlflowTracker:
             if wm.get("gift_mae_percent") is not None:
                 metrics[f"{prefix}/gift_mae_percent"] = float(wm["gift_mae_percent"])
             metrics[f"{prefix}/{val_metric_key}"] = float(wm[val_metric_key])
+            action_diag = wm.get("action_diagnostics", {})
+            for key in (
+                "planned_mean",
+                "factual_mean",
+                "q_argmax_mean",
+                "sim_best_proxy_mean",
+                "planned_minus_factual_mean",
+                "planned_minus_q_argmax_mean",
+                "planned_minus_sim_best_proxy_mean",
+                "q_slope_mean",
+            ):
+                if action_diag.get(key) is not None:
+                    metrics[f"{prefix}/action/{key}"] = float(action_diag[key])
             if w in improved:
                 metrics[f"{prefix}/best_improved"] = 1.0
         self.log_metrics(metrics, step=step)

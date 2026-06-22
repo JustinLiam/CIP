@@ -223,6 +223,175 @@ def _simulate_a_seq_final_y(
     raise ValueError(f"unknown world: {world!r}; expected one of {_VALID_WORLDS}")
 
 
+def _stats_np(x: np.ndarray) -> Dict[str, float]:
+    arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return {}
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "min": float(arr.min()),
+        "p05": float(np.percentile(arr, 5)),
+        "p50": float(np.percentile(arr, 50)),
+        "p95": float(np.percentile(arr, 95)),
+        "max": float(arr.max()),
+    }
+
+
+def _make_action_grid(action_dim: int, grid_points: int, device: str, dtype: torch.dtype) -> torch.Tensor:
+    points = max(2, int(grid_points))
+    vals = torch.linspace(0.0, 1.0, points, device=device, dtype=dtype)
+    grids = torch.cartesian_prod(*([vals] * int(action_dim)))
+    return grids.contiguous()
+
+
+@torch.no_grad()
+def _q_grid_action_diagnostics(
+    planner: IQLPlanner,
+    obs: torch.Tensor,
+    action_grid_sim: torch.Tensor,
+    max_action: float,
+) -> Dict[str, np.ndarray]:
+    bsz = obs.size(0)
+    grid_n = action_grid_sim.size(0)
+    action_grid_policy = _sim_actions_to_tanh_batch(action_grid_sim, max_action)
+    q_chunks = []
+    chunk = 4096
+    for start in range(0, grid_n, chunk):
+        end = min(start + chunk, grid_n)
+        g = end - start
+        obs_rep = obs.unsqueeze(1).expand(bsz, g, obs.size(-1)).reshape(bsz * g, obs.size(-1))
+        act_rep = action_grid_policy[start:end].unsqueeze(0).expand(bsz, g, action_grid_policy.size(-1)).reshape(bsz * g, action_grid_policy.size(-1))
+        q_chunks.append(planner.qf(obs_rep, act_rep).view(bsz, g).detach())
+    q_grid = torch.cat(q_chunks, dim=1)
+    best_idx = torch.argmax(q_grid, dim=1)
+    q_argmax = action_grid_sim[best_idx]
+    grid_mean = action_grid_sim.mean(dim=1).view(1, -1)
+    x = grid_mean - grid_mean.mean(dim=1, keepdim=True)
+    y = q_grid - q_grid.mean(dim=1, keepdim=True)
+    denom = (x * x).sum(dim=1).clamp(min=1e-8)
+    slope = (x * y).sum(dim=1) / denom
+    return {
+        "q_argmax": q_argmax.detach().cpu().numpy(),
+        "q_slope": slope.detach().cpu().numpy(),
+        "q_best": q_grid.max(dim=1).values.detach().cpu().numpy(),
+    }
+
+
+@torch.no_grad()
+def _sim_best_action_proxy(
+    H_t: Dict[str, torch.Tensor],
+    target: torch.Tensor,
+    action_grid_sim: torch.Tensor,
+    *,
+    tau: int,
+    fold,
+    scaling_params,
+    inference_model: InferenceModel,
+    device: str,
+    mean_ser,
+    std_ser,
+) -> np.ndarray:
+    bsz = target.size(0)
+    errors = []
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    target_np = target.detach().cpu().numpy()
+    try:
+        for cand in action_grid_sim:
+            np.random.set_state(np_state)
+            torch.set_rng_state(torch_state)
+            a_seq = cand.view(1, 1, -1).expand(bsz, int(tau), cand.numel()).contiguous()
+            y = _simulate_a_seq_final_y(
+                "sim", H_t, a_seq,
+                fold=fold, scaling_params=scaling_params,
+                inference_model=inference_model, device=device,
+                mean_ser=mean_ser, std_ser=std_ser,
+            )
+            err = np.sqrt(np.mean((y - target_np) ** 2, axis=1))
+            errors.append(err)
+    finally:
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+    err_grid = np.stack(errors, axis=1)
+    best_idx = np.argmin(err_grid, axis=1)
+    return action_grid_sim.detach().cpu().numpy()[best_idx]
+
+
+def _append_action_diag(acc: Dict[str, list], key: str, value: np.ndarray) -> None:
+    acc.setdefault(key, []).append(np.asarray(value, dtype=np.float32))
+
+
+def _finalize_action_diagnostics(acc: Dict[str, list]) -> Dict[str, Any]:
+    if not acc or not acc.get("planned"):
+        return {}
+    planned = np.concatenate(acc["planned"], axis=0)
+    factual = np.concatenate(acc["factual"], axis=0)
+    planned_flat = planned.reshape(-1, planned.shape[-1])
+    factual_flat = factual.reshape(-1, factual.shape[-1])
+    diff_flat = planned_flat - factual_flat
+    out: Dict[str, Any] = {
+        "planned_mean": float(planned_flat.mean()),
+        "factual_mean": float(factual_flat.mean()),
+        "planned_minus_factual_mean": float(planned_flat.mean() - factual_flat.mean()),
+        "action_rmse": float(np.sqrt(np.mean(diff_flat ** 2))),
+        "action_mae": float(np.mean(np.abs(diff_flat))),
+        "planned": _stats_np(planned_flat),
+        "factual": _stats_np(factual_flat),
+        "planned_minus_factual": _stats_np(diff_flat),
+    }
+    if acc.get("q_argmax"):
+        q_argmax = np.concatenate(acc["q_argmax"], axis=0)
+        out["q_argmax_mean"] = float(q_argmax.mean())
+        out["planned_minus_q_argmax_mean"] = float(planned[:, 0, :].mean() - q_argmax.mean())
+        out["q_argmax"] = _stats_np(q_argmax)
+    if acc.get("q_slope"):
+        q_slope = np.concatenate(acc["q_slope"], axis=0)
+        out["q_slope_mean"] = float(q_slope.mean())
+        out["q_slope"] = _stats_np(q_slope)
+    if acc.get("sim_best_proxy"):
+        sim_best = np.concatenate(acc["sim_best_proxy"], axis=0)
+        out["sim_best_proxy_mean"] = float(sim_best.mean())
+        out["planned_minus_sim_best_proxy_mean"] = float(planned[:, 0, :].mean() - sim_best.mean())
+        out["sim_best_proxy"] = _stats_np(sim_best)
+    return out
+
+
+@torch.no_grad()
+def _collect_batch_action_diagnostics(
+    planner: IQLPlanner,
+    inference_model: InferenceModel,
+    H_t: Dict[str, torch.Tensor],
+    targets: Dict[str, torch.Tensor],
+    first_obs: torch.Tensor,
+    a_seq: torch.Tensor,
+    *,
+    world: str,
+    tau: int,
+    fold,
+    scaling_params,
+    action_grid_sim: torch.Tensor,
+    max_action: float,
+    device: str,
+    mean_ser,
+    std_ser,
+) -> Dict[str, np.ndarray]:
+    out: Dict[str, np.ndarray] = {
+        "planned": a_seq.detach().cpu().numpy(),
+        "factual": targets["current_treatments"].detach().cpu().numpy(),
+    }
+    q_diag = _q_grid_action_diagnostics(planner, first_obs, action_grid_sim, max_action)
+    out.update(q_diag)
+    if world == "sim":
+        out["sim_best_proxy"] = _sim_best_action_proxy(
+            H_t, targets["outputs"][:, -1, :], action_grid_sim,
+            tau=tau, fold=fold, scaling_params=scaling_params,
+            inference_model=inference_model, device=device,
+            mean_ser=mean_ser, std_ser=std_ser,
+        )
+    return out
+
+
 def _compute_world_metrics(
     output_after_actions_list: list,
     ture_output_list: list,
@@ -303,6 +472,9 @@ def aggregate_iql_planner_metrics(
     include_factual_traj_rmse: bool = False,
     worlds: tuple = ("sim",),
     debug_panel: bool = False,
+    action_diagnostics: bool = False,
+    action_grid_points: int = 11,
+    action_diag_max_batches: int | None = None,
 ) -> Dict[str, Any]:
     """
     Full pass over ``fold``'s dataloader; returns global MAE/RMSE (normalized and unscaled tumor volume).
@@ -348,6 +520,13 @@ def aggregate_iql_planner_metrics(
     per_world_fact: Dict[str, list] = {w: [] for w in worlds} if include_factual_traj_rmse else {w: [] for w in worlds}
     per_world_batch_rmse_plan: Dict[str, list] = {w: [] for w in worlds}
     per_world_batch_rmse_fact: Dict[str, list] = {w: [] for w in worlds}
+    per_world_action_diag: Dict[str, Dict[str, list]] = {w: {} for w in worlds}
+    per_world_action_diag_batches: Dict[str, int] = {w: 0 for w in worlds}
+    action_grid_sim = None
+    if action_diagnostics:
+        action_grid_sim = _make_action_grid(
+            int(planner.cfg.action_dim), int(action_grid_points), device, torch.float32
+        )
     debug_payload: Dict[str, Any] | None = None
     if debug_panel:
         debug_payload = {
@@ -389,6 +568,7 @@ def aggregate_iql_planner_metrics(
                     ).clone()
                     planned = []
                     history_checks = []
+                    first_obs = None
                     for step in range(tau):
                         H_work = align_h_t_static_to_history(H_work)
                         z, _, _ = inference_model.ct_hidden_history(H_work)
@@ -403,6 +583,8 @@ def aggregate_iql_planner_metrics(
                             z_before = z.detach().clone()
                         a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
                         obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
+                        if step == 0:
+                            first_obs = obs.detach()
                         po = planner.actor(obs)
                         ma = planner.actor.max_action
                         if isinstance(po, Distribution):
@@ -452,6 +634,8 @@ def aggregate_iql_planner_metrics(
                             })
                         a_prev_sim = a_sim
                     a_seq = torch.stack(planned, dim=1).contiguous()
+                    if first_obs is None:
+                        raise RuntimeError("action diagnostics expected a first observation but rollout produced none.")
                     if world_debug is not None:
                         world_debug["history_checks"] = history_checks
                         world_debug["history_updates_ok"] = bool(
@@ -468,6 +652,9 @@ def aggregate_iql_planner_metrics(
                     bsz = z_np.shape[0]
                     delta_scalar = float(tau - 0) / max_tau
                     delta_vec = np.array([delta_scalar], dtype=np.float32)
+                    delta_full = torch.full((bsz, 1), delta_scalar, device=device, dtype=torch.float32)
+                    a_prev_full = torch.as_tensor(a_prev_feat, device=device, dtype=torch.float32)
+                    first_obs = planner.build_state(z, targets["outputs"][:, -1, :], delta_full, a_prev_full).detach()
                     a_rows = []
                     for b in range(bsz):
                         z_b = torch.as_tensor(z_np[b:b + 1], device=device, dtype=torch.float32)
@@ -493,6 +680,20 @@ def aggregate_iql_planner_metrics(
                     if world_debug is not None:
                         world_debug["history_checks"] = []
                         world_debug["history_updates_ok"] = True
+
+                if action_diagnostics and action_grid_sim is not None:
+                    max_diag_batches = action_diag_max_batches
+                    can_collect = max_diag_batches is None or per_world_action_diag_batches[world] < int(max_diag_batches)
+                    if can_collect:
+                        batch_diag = _collect_batch_action_diagnostics(
+                            planner, inference_model, H_t, targets, first_obs, a_seq,
+                            world=world, tau=tau, fold=fold, scaling_params=scaling_params,
+                            action_grid_sim=action_grid_sim, max_action=max_action, device=device,
+                            mean_ser=mean_ser, std_ser=std_ser,
+                        )
+                        for key, value in batch_diag.items():
+                            _append_action_diag(per_world_action_diag[world], key, value)
+                        per_world_action_diag_batches[world] += 1
 
                 if world_debug is not None:
                     a_seq_np = a_seq.detach().cpu().numpy()
@@ -555,6 +756,10 @@ def aggregate_iql_planner_metrics(
             batch_rmse_fact=per_world_batch_rmse_fact[world] if include_factual_traj_rmse else None,
             return_series=collect_series,
         )
+        if action_diagnostics:
+            action_diag = _finalize_action_diagnostics(per_world_action_diag[world])
+            if action_diag:
+                per_world_metrics[world]["action_diagnostics"] = action_diag
 
     primary = worlds[0]
     out: Dict[str, Any] = dict(per_world_metrics[primary])

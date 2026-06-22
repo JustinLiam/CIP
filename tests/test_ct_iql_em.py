@@ -13,6 +13,7 @@ from src.data.iql_raw_transition_dataset import (
     IQLRawReplayBuffer,
     build_iql_raw_transitions,
 )
+from src.evaluation.iql_planner_eval import _make_action_grid, _q_grid_action_diagnostics
 from src.models.ct_deconfound import CTDeconfoundModel
 from src.models.ct_encoder_weight import CTEncoderWeightModel
 from src.models.ct_history_encoder import CTHistoryEncoder
@@ -237,6 +238,77 @@ def test_e_step_does_not_update_encoder():
     for p0, p1 in zip(enc_before, model.encoder_parameters()):
         assert torch.allclose(p0, p1), "encoder should be frozen in E-step"
 
+
+
+def test_actor_update_default_awr_path_logs_adv_weights():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+        )
+    )
+    obs = torch.randn(6, 5)
+    actions = torch.clamp(torch.randn(6, 2), -1.0, 1.0)
+    adv = torch.randn(6)
+    logs = {}
+    planner._update_policy(adv, obs, actions, logs)
+    assert logs["actor_loss"] >= 0.0
+    assert "actor_exp_adv_mean" in logs
+    assert "actor_td3bc_q_term" not in logs
+
+
+def test_td3bc_actor_update_updates_actor_without_q_grad_accumulation():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+            actor_update="td3bc",
+        )
+    )
+    obs = torch.randn(8, 5)
+    actions = torch.clamp(torch.randn(8, 2), -1.0, 1.0)
+    adv = torch.randn(8)
+    for p in planner.qf.parameters():
+        p.grad = None
+    before = [p.detach().clone() for p in planner.actor.parameters()]
+    logs = {}
+    planner._update_policy(adv, obs, actions, logs)
+    assert logs["actor_update_td3bc"] == 1.0
+    assert logs["actor_td3bc_q_coef"] > 0.0
+    assert all(p.grad is None for p in planner.qf.parameters())
+    assert all(p.requires_grad for p in planner.qf.parameters())
+    changed = any((a.detach() - b).abs().sum() > 0 for a, b in zip(planner.actor.parameters(), before))
+    assert changed
+
+
+def test_q_grid_action_diagnostics_returns_argmax_and_slope():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+        )
+    )
+    obs = torch.randn(4, 5)
+    grid = _make_action_grid(action_dim=2, grid_points=3, device="cpu", dtype=torch.float32)
+    diag = _q_grid_action_diagnostics(planner, obs, grid, max_action=1.0)
+    assert diag["q_argmax"].shape == (4, 2)
+    assert diag["q_slope"].shape == (4,)
+    assert np.isfinite(diag["q_argmax"]).all()
 
 def test_m_step_encoder_grad_only_on_q_step():
     device = "cpu"

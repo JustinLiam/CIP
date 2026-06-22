@@ -33,6 +33,9 @@ class IQLPlannerConfig:
     beta: float = 3.0
     adv_max: float = EXP_ADV_MAX
     weight_max: Optional[float] = 10.0
+    actor_update: str = "awr"
+    td3bc_q_alpha: float = 2.5
+    td3bc_bc_alpha: float = 1.0
     discount: float = 0.99
     tau: float = 0.005
     actor_lr: float = 3e-4
@@ -378,6 +381,11 @@ class IQLPlanner:
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
         self.q_optimizer = torch.optim.Adam(self.qf.parameters(), lr=cfg.qf_lr)
+        actor_update = str(cfg.actor_update).strip().lower()
+        if actor_update not in ("awr", "td3bc"):
+            raise ValueError(f"Unknown actor_update={cfg.actor_update!r}; expected 'awr' or 'td3bc'.")
+        self.cfg.actor_update = actor_update
+
         self.v_optimizer = torch.optim.Adam(self.vf.parameters(), lr=cfg.vf_lr)
         self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, cfg.max_steps)
         self.total_it = 0
@@ -481,6 +489,59 @@ class IQLPlanner:
         soft_update(self.q_target, self.qf, self.cfg.tau)
         log_dict["q_loss"] = float(q_loss.item())
 
+    def _actor_output_tanh(self, policy_out) -> torch.Tensor:
+        if isinstance(policy_out, torch.distributions.Distribution):
+            return policy_out.mean
+        return policy_out
+
+    def _td3bc_q_weight(self, q_values: torch.Tensor) -> torch.Tensor:
+        alpha = float(self.cfg.td3bc_q_alpha)
+        denom = q_values.detach().abs().mean().clamp(min=1e-6)
+        return q_values.new_tensor(alpha) / denom
+
+    def _update_policy_td3bc(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        log_dict: Dict[str, float],
+        w: Optional[torch.Tensor] = None,
+    ) -> None:
+        was_requires_grad = [p.requires_grad for p in self.qf.parameters()]
+        for p in self.qf.parameters():
+            p.requires_grad_(False)
+        try:
+            policy_out = self.actor(observations)
+            pi_tanh = self._actor_output_tanh(policy_out)
+            max_action = float(self.cfg.max_action)
+            pi_action = torch.clamp(pi_tanh * max_action, -max_action, max_action)
+            q_pi = self.qf(observations, pi_action)
+            q_coef = self._td3bc_q_weight(q_pi)
+            target_actions = self._actor_bc_targets(actions)
+            bc_losses = ((pi_tanh - target_actions) ** 2).sum(-1)
+            if w is None:
+                q_term = q_pi.mean()
+                bc_term = bc_losses.mean()
+            else:
+                denom = w.sum().clamp(min=1e-8)
+                q_term = (w * q_pi).sum() / denom
+                bc_term = (w * bc_losses).sum() / denom
+            policy_loss = -q_coef * q_term + float(self.cfg.td3bc_bc_alpha) * bc_term
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            policy_loss.backward()
+            if self.cfg.max_grad_norm is not None:
+                clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
+            self.actor_optimizer.step()
+            self.actor_lr_schedule.step()
+        finally:
+            for param, req in zip(self.qf.parameters(), was_requires_grad):
+                param.requires_grad_(req)
+
+        log_dict["actor_loss"] = float(policy_loss.item())
+        log_dict["actor_update_td3bc"] = 1.0
+        log_dict["actor_td3bc_q_term"] = float(q_term.detach().item())
+        log_dict["actor_td3bc_bc_loss"] = float(bc_term.detach().item())
+        log_dict["actor_td3bc_q_coef"] = float(q_coef.detach().item())
+
     def _update_policy(self, adv, observations, actions, log_dict):
         """
         该函数用于更新 actor policy（策略网络）的参数。policy loss 的计算方式如下：
@@ -495,6 +556,9 @@ class IQLPlanner:
 
         换句话说，policy loss 是将“advantage”作为权重，对行为克隆损失做加权平均，从而鼓励策略在优势大（Q(s, a) > V(s)）的状态-动作对上尽量去模仿数据分布。
         """
+        if self.cfg.actor_update == "td3bc":
+            self._update_policy_td3bc(observations, actions, log_dict)
+            return
         exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
         target_actions = self._actor_bc_targets(actions)
@@ -629,6 +693,9 @@ class IQLPlanner:
         log_dict: Dict[str, float],
     ) -> None:
         """π-step with detached states; weighted actor loss."""
+        if self.cfg.actor_update == "td3bc":
+            self._update_policy_td3bc(observations, actions, log_dict, w=w)
+            return
         exp_adv = torch.exp(self.cfg.beta * adv.detach()).clamp(max=float(self.cfg.adv_max))
         policy_out = self.actor(observations)
         target_actions = self._actor_bc_targets(actions)
@@ -752,6 +819,9 @@ class IQLPlanner:
         cfg_dict.setdefault("encoder_max_grad_norm", 1.0)
         cfg_dict.setdefault("adv_max", EXP_ADV_MAX)
         cfg_dict.setdefault("weight_max", 10.0)
+        cfg_dict.setdefault("actor_update", "awr")
+        cfg_dict.setdefault("td3bc_q_alpha", 2.5)
+        cfg_dict.setdefault("td3bc_bc_alpha", 1.0)
         cfg_dict.setdefault("goal_adapter_enabled", False)
         cfg_dict.setdefault("z_dim", None)
         cfg_dict.setdefault("output_dim", None)

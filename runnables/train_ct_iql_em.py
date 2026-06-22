@@ -188,6 +188,9 @@ def main(args: DictConfig):
         beta=float(OmegaConf.select(args, "exp.iql_beta", default=3.0)),
         adv_max=float(OmegaConf.select(args, "exp.iql_adv_max", default=100.0)),
         weight_max=iql_weight_max,
+        actor_update=str(OmegaConf.select(args, "exp.iql_actor_update", default="awr")),
+        td3bc_q_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_q_alpha", default=2.5)),
+        td3bc_bc_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_bc_alpha", default=1.0)),
         discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
         tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
         actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),
@@ -333,6 +336,10 @@ def main(args: DictConfig):
     em_val_tau_list = _list_from_config(
         OmegaConf.select(args, "exp.em_val_tau_list", default=None)
     )
+    val_action_diag = bool(OmegaConf.select(args, "exp.iql_val_action_diagnostics", default=False))
+    val_action_grid_points = int(OmegaConf.select(args, "exp.iql_val_action_grid_points", default=11))
+    val_action_diag_max_batches = OmegaConf.select(args, "exp.iql_val_action_diag_max_batches", default=2)
+    val_action_diag_max_batches = None if val_action_diag_max_batches is None else int(val_action_diag_max_batches)
     if em_val_tau_list is None:
         em_val_tau_list = [eval_tau]
     if len(em_val_tau_list) == 1:
@@ -500,11 +507,28 @@ def main(args: DictConfig):
                         val_batch_size=val_bs,
                         log_batches=False,
                         worlds=val_worlds,
+                        action_diagnostics=val_action_diag,
+                        action_grid_points=val_action_grid_points,
+                        action_diag_max_batches=val_action_diag_max_batches,
                     )
                     per_world = metrics.get("per_world", {val_worlds[0]: metrics})
                     tau_score = float(per_world[sel_world][val_metric_key])
                     val_scores.append(tau_score)
-                    val_log_metrics[f"val/{sel_world}/tau{int(tau_i)}/{val_metric_key}"] = tau_score
+                    tau_prefix = f"val/{sel_world}/tau{int(tau_i)}"
+                    val_log_metrics[f"{tau_prefix}/{val_metric_key}"] = tau_score
+                    action_diag = per_world[sel_world].get("action_diagnostics", {})
+                    for key in (
+                        "planned_mean",
+                        "factual_mean",
+                        "q_argmax_mean",
+                        "sim_best_proxy_mean",
+                        "planned_minus_factual_mean",
+                        "planned_minus_q_argmax_mean",
+                        "planned_minus_sim_best_proxy_mean",
+                        "q_slope_mean",
+                    ):
+                        if action_diag.get(key) is not None:
+                            val_log_metrics[f"{tau_prefix}/action/{key}"] = float(action_diag[key])
                 val_score = float(sum(val_scores) / len(val_scores))
                 if len(em_val_tau_list) == 1:
                     logger.info(

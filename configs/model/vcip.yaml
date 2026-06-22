@@ -119,6 +119,10 @@ exp:
   iql_tau: 0.7  # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_weight_max: 10.0
+  # Actor extraction update: awr keeps current IQL/AWR behavior; td3bc adds a Q-gradient term.
+  iql_actor_update: awr
+  iql_td3bc_q_alpha: 2.5
+  iql_td3bc_bc_alpha: 1.0
   iql_discount: 0.99
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005
@@ -147,7 +151,7 @@ exp:
   # Eval-time simulator-action calibration after policy output is mapped to [0, 1].
   # This does not change training actions or actor bounds.
   iql_eval_action_scale: 1.0
-  iql_eval_action_shift: 0.10
+  iql_eval_action_shift: 0.0
   # Model-based OPE A/B during IQL val:
   #   - sim:       ground-truth cancer simulator oracle (synthetic benchmark only).
   #   - predictor: learned OutcomePredictor from ct_best_encoder.pt (works on real data).
@@ -156,7 +160,7 @@ exp:
   iql_val_worlds: [sim, predictor]
   # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
   # Must appear in iql_val_worlds.
-  iql_val_selection_world: predictor
+  iql_val_selection_world: sim
   # Dump full resolved Hydra config at startup. Train scripts always log config;
   # eval_iql_planner.py only logs when this is true (default false).
   log_config: false
@@ -225,4 +229,8 @@ exp:
   em_eval_ckpt: ""
   em_val_worlds: [sim]
   em_val_selection_world: sim
+  # Optional validation-only diagnostics; not used for checkpoint selection.
+  iql_val_action_diagnostics: false
+  iql_val_action_grid_points: 11
+  iql_val_action_diag_max_batches: 2
   # Legacy two-stage pipeline (train_ct.py / train_iql_planner.py) — override via CLI when needed.
