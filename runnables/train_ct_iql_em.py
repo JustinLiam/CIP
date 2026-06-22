@@ -346,11 +346,15 @@ def main(args: DictConfig):
     val_action_diag_max_batches = None if val_action_diag_max_batches is None else int(val_action_diag_max_batches)
     if em_val_tau_list is None:
         em_val_tau_list = [eval_tau]
+    val_tau_agg = str(OmegaConf.select(args, "exp.em_val_tau_agg", default="mean")).strip().lower()
+    if val_tau_agg not in {"mean", "max"}:
+        raise ValueError("exp.em_val_tau_agg must be one of {'mean', 'max'}.")
     if len(em_val_tau_list) == 1:
         selection_metric_key = val_metric_key
     else:
+        tau_prefix = "mean" if val_tau_agg == "mean" else "max"
         selection_metric_key = (
-            f"mean_{val_metric_key}_tau"
+            f"{tau_prefix}_{val_metric_key}_tau"
             + "_".join(str(int(t)) for t in em_val_tau_list)
         )
     val_bs = int(OmegaConf.select(args, "exp.iql_val_batch_size", default=None) or args.exp.batch_size_val)
@@ -533,7 +537,9 @@ def main(args: DictConfig):
                     ):
                         if action_diag.get(key) is not None:
                             val_log_metrics[f"{tau_prefix}/action/{key}"] = float(action_diag[key])
-                val_score = float(sum(val_scores) / len(val_scores))
+                val_score_mean = float(sum(val_scores) / len(val_scores))
+                val_score_max = float(max(val_scores))
+                val_score = val_score_mean if val_tau_agg == "mean" else val_score_max
                 if len(em_val_tau_list) == 1:
                     logger.info(
                         "EM val outer=%d %s=%.6f (%s, tau=%d)",
@@ -546,14 +552,18 @@ def main(args: DictConfig):
                     val_log_metrics[f"val/{sel_world}/{val_metric_key}"] = val_score
                 else:
                     logger.info(
-                        "EM val outer=%d %s=%.6f (%s, taus=%s)",
+                        "EM val outer=%d %s=%.6f mean=%.6f max=%.6f (%s, taus=%s)",
                         outer,
                         selection_metric_key,
                         val_score,
+                        val_score_mean,
+                        val_score_max,
                         sel_world,
                         em_val_tau_list,
                     )
                     val_log_metrics[f"val/{sel_world}/{selection_metric_key}"] = val_score
+                    val_log_metrics[f"val/{sel_world}/mean_{val_metric_key}_tau_list"] = val_score_mean
+                    val_log_metrics[f"val/{sel_world}/max_{val_metric_key}_tau_list"] = val_score_max
                 mlf.log_metrics(val_log_metrics, step=outer)
                 if em_save_every_eval_checkpoint:
                     save_em_checkpoint(
@@ -567,6 +577,8 @@ def main(args: DictConfig):
                             "val_metric": selection_metric_key,
                             "val_metric_base": val_metric_key,
                             "val_tau_list": em_val_tau_list,
+                            "val_tau_agg": val_tau_agg,
+                            "val_scores": val_scores,
                         },
                     )
                 if val_score < best_val:
@@ -583,6 +595,8 @@ def main(args: DictConfig):
                             "val_metric": selection_metric_key,
                             "val_metric_base": val_metric_key,
                             "val_tau_list": em_val_tau_list,
+                            "val_tau_agg": val_tau_agg,
+                            "val_scores": val_scores,
                         },
                     )
                     logger.info("Saved best EM checkpoint to %s", ckpt_path)

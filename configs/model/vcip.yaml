@@ -212,6 +212,10 @@ exp:
   em_encoder_max_grad_norm: 1.0
   em_val_every: 2
   em_val_metric: mae_uns
+  # Multi-tau EM checkpoint selection. mean preserves historical behavior;
+  # max selects for worst-horizon validation RMSE/MAE and is useful when every
+  # tau must satisfy a threshold.
+  em_val_tau_agg: mean
   # Save ct_iql_em_outerXXXX.pt at every validation point for checkpoint-selection
   # diagnostics. Keep disabled for normal sweeps to avoid large checkpoint folders.
   em_save_every_eval_checkpoint: false

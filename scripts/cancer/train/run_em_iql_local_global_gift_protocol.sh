@@ -64,6 +64,7 @@ IQL_TARGET_HORIZONS="${IQL_TARGET_HORIZONS:-[1,2,3,4,5,6]}"
 IQL_HORIZON_TERMINAL_DONE="${IQL_HORIZON_TERMINAL_DONE:-true}"
 EVAL_TAU_LIST="${EVAL_TAU_LIST:-[1,2,3,4,5,6]}"
 VAL_METRIC="${VAL_METRIC:-rmse_uns}"
+EM_VAL_TAU_AGG="${EM_VAL_TAU_AGG:-mean}"
 GPU_WAIT_MEMORY_MB="${GPU_WAIT_MEMORY_MB:-1000}"
 GPU_WAIT_SECONDS="${GPU_WAIT_SECONDS:-60}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-em_iql_local_global_gift_protocol}"
@@ -324,7 +325,7 @@ run_one() {
   echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
   echo "  iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} iql_weight_max=${IQL_WEIGHT_MAX}"
   echo "  iql_actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
-  echo "  val_metric=${VAL_METRIC}"
+  echo "  val_metric=${VAL_METRIC} em_val_tau_agg=${EM_VAL_TAU_AGG}"
   echo "  em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} em_m_steps=${EM_M_STEPS} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS}"
   echo "  goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
   echo "  encoder_diagnostics=${EM_ENCODER_DIAGNOSTICS} every=${EM_ENCODER_DIAGNOSTICS_EVERY}"
@@ -375,6 +376,7 @@ run_one() {
     "+exp.iql_goal_adapter_hidden_dim=${IQL_GOAL_ADAPTER_HIDDEN}" \
     "+exp.iql_goal_adapter_init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}" \
     "exp.em_val_metric=${VAL_METRIC}" \
+    "exp.em_val_tau_agg=${EM_VAL_TAU_AGG}" \
     "exp.iql_val_metric=${VAL_METRIC}" \
     "+exp.em_ckpt_dir=${em_dir}" \
     "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
