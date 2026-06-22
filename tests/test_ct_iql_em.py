@@ -318,6 +318,32 @@ def test_bc_actor_update_uses_behavior_cloning_without_advantage_weights():
     assert changed
 
 
+def test_mse_actor_bc_loss_optimizes_actor_mean_not_log_std():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+            actor_update="bc",
+            actor_bc_loss="mse",
+        )
+    )
+    obs = torch.randn(8, 5)
+    actions = torch.clamp(torch.randn(8, 2), -1.0, 1.0)
+    adv = torch.randn(8)
+    before_log_std = planner.actor.log_std.detach().clone()
+    logs = {}
+    planner._update_policy(adv, obs, actions, logs)
+    assert logs["actor_update_bc"] == 1.0
+    assert logs["actor_bc_loss"] >= 0.0
+    assert planner.actor.log_std.grad is None
+    assert torch.allclose(planner.actor.log_std.detach(), before_log_std)
+
+
 def test_awr_td3bc_actor_update_keeps_adv_weights_and_q_gradient():
     planner = IQLPlanner(
         IQLPlannerConfig(

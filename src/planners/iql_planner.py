@@ -34,6 +34,7 @@ class IQLPlannerConfig:
     adv_max: float = EXP_ADV_MAX
     weight_max: Optional[float] = 10.0
     actor_update: str = "awr"
+    actor_bc_loss: str = "nll"
     td3bc_q_alpha: float = 2.5
     td3bc_bc_alpha: float = 1.0
     cql_alpha: float = 0.0
@@ -394,6 +395,12 @@ class IQLPlanner:
                 f"Unknown actor_update={cfg.actor_update!r}; expected 'awr', 'bc', 'td3bc', or 'awr_td3bc'."
             )
         self.cfg.actor_update = actor_update
+        actor_bc_loss = str(cfg.actor_bc_loss).strip().lower()
+        if actor_bc_loss not in ("nll", "mse"):
+            raise ValueError(
+                f"Unknown actor_bc_loss={cfg.actor_bc_loss!r}; expected 'nll' or 'mse'."
+            )
+        self.cfg.actor_bc_loss = actor_bc_loss
 
         self.v_optimizer = torch.optim.Adam(self.vf.parameters(), lr=cfg.vf_lr)
         self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, cfg.max_steps)
@@ -509,6 +516,8 @@ class IQLPlanner:
         return policy_out
 
     def _policy_bc_losses(self, policy_out, target_actions: torch.Tensor) -> torch.Tensor:
+        if self.cfg.actor_bc_loss == "mse":
+            return ((self._actor_output_tanh(policy_out) - target_actions) ** 2).sum(-1)
         if isinstance(policy_out, torch.distributions.Distribution):
             return -policy_out.log_prob(target_actions).sum(-1)
         return ((policy_out - target_actions) ** 2).sum(-1)
@@ -953,6 +962,7 @@ class IQLPlanner:
         cfg_dict.setdefault("adv_max", EXP_ADV_MAX)
         cfg_dict.setdefault("weight_max", 10.0)
         cfg_dict.setdefault("actor_update", "awr")
+        cfg_dict.setdefault("actor_bc_loss", "nll")
         cfg_dict.setdefault("td3bc_q_alpha", 2.5)
         cfg_dict.setdefault("td3bc_bc_alpha", 1.0)
         cfg_dict.setdefault("cql_alpha", 0.0)
