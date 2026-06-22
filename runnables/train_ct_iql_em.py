@@ -190,6 +190,7 @@ def main(args: DictConfig):
         weight_max=iql_weight_max,
         actor_update=str(OmegaConf.select(args, "exp.iql_actor_update", default="awr")),
         actor_bc_loss=str(OmegaConf.select(args, "exp.iql_actor_bc_loss", default="nll")),
+        actor_bc_expectile=float(OmegaConf.select(args, "exp.iql_actor_bc_expectile", default=0.7)),
         td3bc_q_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_q_alpha", default=2.5)),
         td3bc_bc_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_bc_alpha", default=1.0)),
         cql_alpha=float(OmegaConf.select(args, "exp.iql_cql_alpha", default=0.0)),

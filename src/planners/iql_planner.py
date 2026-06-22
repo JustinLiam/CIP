@@ -35,6 +35,7 @@ class IQLPlannerConfig:
     weight_max: Optional[float] = 10.0
     actor_update: str = "awr"
     actor_bc_loss: str = "nll"
+    actor_bc_expectile: float = 0.7
     td3bc_q_alpha: float = 2.5
     td3bc_bc_alpha: float = 1.0
     cql_alpha: float = 0.0
@@ -396,11 +397,13 @@ class IQLPlanner:
             )
         self.cfg.actor_update = actor_update
         actor_bc_loss = str(cfg.actor_bc_loss).strip().lower()
-        if actor_bc_loss not in ("nll", "mse"):
+        if actor_bc_loss not in ("nll", "mse", "expectile"):
             raise ValueError(
-                f"Unknown actor_bc_loss={cfg.actor_bc_loss!r}; expected 'nll' or 'mse'."
+                f"Unknown actor_bc_loss={cfg.actor_bc_loss!r}; expected 'nll', 'mse', or 'expectile'."
             )
         self.cfg.actor_bc_loss = actor_bc_loss
+        if not 0.0 < float(cfg.actor_bc_expectile) < 1.0:
+            raise ValueError("actor_bc_expectile must be in (0, 1).")
 
         self.v_optimizer = torch.optim.Adam(self.vf.parameters(), lr=cfg.vf_lr)
         self.actor_lr_schedule = CosineAnnealingLR(self.actor_optimizer, cfg.max_steps)
@@ -516,6 +519,12 @@ class IQLPlanner:
         return policy_out
 
     def _policy_bc_losses(self, policy_out, target_actions: torch.Tensor) -> torch.Tensor:
+        if self.cfg.actor_bc_loss == "expectile":
+            pred = self._actor_output_tanh(policy_out)
+            diff = target_actions - pred
+            tau = float(self.cfg.actor_bc_expectile)
+            weights = torch.where(diff > 0.0, diff.new_tensor(tau), diff.new_tensor(1.0 - tau))
+            return (weights * diff.pow(2)).sum(-1)
         if self.cfg.actor_bc_loss == "mse":
             return ((self._actor_output_tanh(policy_out) - target_actions) ** 2).sum(-1)
         if isinstance(policy_out, torch.distributions.Distribution):
@@ -963,6 +972,7 @@ class IQLPlanner:
         cfg_dict.setdefault("weight_max", 10.0)
         cfg_dict.setdefault("actor_update", "awr")
         cfg_dict.setdefault("actor_bc_loss", "nll")
+        cfg_dict.setdefault("actor_bc_expectile", 0.7)
         cfg_dict.setdefault("td3bc_q_alpha", 2.5)
         cfg_dict.setdefault("td3bc_bc_alpha", 1.0)
         cfg_dict.setdefault("cql_alpha", 0.0)

@@ -344,6 +344,27 @@ def test_mse_actor_bc_loss_optimizes_actor_mean_not_log_std():
     assert torch.allclose(planner.actor.log_std.detach(), before_log_std)
 
 
+def test_expectile_actor_bc_loss_weights_under_prediction_more():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+            actor_update="bc",
+            actor_bc_loss="expectile",
+            actor_bc_expectile=0.8,
+        )
+    )
+    pred = torch.zeros(2, 2)
+    target = torch.tensor([[0.5, 0.5], [-0.5, -0.5]])
+    losses = planner._policy_bc_losses(pred, target)
+    assert torch.allclose(losses, torch.tensor([0.4, 0.1]), atol=1e-6)
+
+
 def test_awr_td3bc_actor_update_keeps_adv_weights_and_q_gradient():
     planner = IQLPlanner(
         IQLPlannerConfig(

@@ -124,8 +124,10 @@ exp:
   # awr_td3bc keeps advantage-weighted AWR BC and adds a weak Q-gradient term.
   iql_actor_update: awr
   # nll matches standard stochastic AWR; mse directly optimizes the deterministic
-  # actor mean used by eval_iql_planner.py.
+  # actor mean used by eval_iql_planner.py; expectile is behavior-only upper
+  # expectile regression to recover high-action tails without Q extrapolation.
   iql_actor_bc_loss: nll
+  iql_actor_bc_expectile: 0.7
   iql_td3bc_q_alpha: 2.5
   iql_td3bc_bc_alpha: 1.0
   iql_cql_alpha: 0.0

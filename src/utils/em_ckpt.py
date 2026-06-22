@@ -68,6 +68,7 @@ def load_em_planner(em_obj: Dict[str, Any], device: str) -> IQLPlanner:
     cfg_dict.setdefault("weight_max", 10.0)
     cfg_dict.setdefault("actor_update", "awr")
     cfg_dict.setdefault("actor_bc_loss", "nll")
+    cfg_dict.setdefault("actor_bc_expectile", 0.7)
     cfg_dict.setdefault("td3bc_q_alpha", 2.5)
     cfg_dict.setdefault("td3bc_bc_alpha", 1.0)
     cfg_dict.setdefault("cql_alpha", 0.0)
