@@ -118,6 +118,7 @@ exp:
   # iql_tau: expectile 参数，决定“policy value”与“critic value”间的权衡。该值越高，表示算法更乐观、与 offline data 的 policy 匹配度更低、具有更强的探索性；越低则更贴近 offline data，探索性更差。一般建议 0.5~0.9 之间（参考 TD3+BC 和 IQL 论文）。
   iql_tau: 0.7  # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
+  iql_weight_max: 10.0
   iql_discount: 0.99
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005
@@ -143,6 +144,10 @@ exp:
   iql_eval_ckpt: ""
   # Roll out τ steps: each step replans from CT state after appending (a_t, y_{t+1}); false = repeat first action (legacy)
   iql_eval_autoregressive: true
+  # Eval-time simulator-action calibration after policy output is mapped to [0, 1].
+  # This does not change training actions or actor bounds.
+  iql_eval_action_scale: 1.0
+  iql_eval_action_shift: 0.10
   # Model-based OPE A/B during IQL val:
   #   - sim:       ground-truth cancer simulator oracle (synthetic benchmark only).
   #   - predictor: learned OutcomePredictor from ct_best_encoder.pt (works on real data).
@@ -188,7 +193,7 @@ exp:
   ct_w_lr: 1.0e-2
   ct_w_clip: 5.0
   # --- CT+IQL unified EM (train_ct_iql_em.py) ---
-  em_outer_iters: 50
+  em_outer_iters: 20
   em_m_steps_per_outer: 1000
   em_encoder_lr: 5.0e-5
   em_encoder_max_grad_norm: 1.0

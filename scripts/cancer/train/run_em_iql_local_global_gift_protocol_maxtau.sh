@@ -41,6 +41,7 @@ IQL_MAX_GRAD="${IQL_MAX_GRAD:-5.0}"
 IQL_REWARD_TYPE="${IQL_REWARD_TYPE:-negative_outcome}"
 IQL_REWARD_HUBER_DELTA="${IQL_REWARD_HUBER_DELTA:-1.0}"
 IQL_ADV_MAX="${IQL_ADV_MAX:-100}"
+IQL_WEIGHT_MAX="${IQL_WEIGHT_MAX:-10.0}"
 EM_M_STEPS="${EM_M_STEPS:-1000}"
 EM_HER_SAMPLES="${EM_HER_SAMPLES:-1}"
 EM_HER_REFRESH="${EM_HER_REFRESH:-0}"
@@ -67,7 +68,7 @@ mkdir -p "${GRID_ROOT}/logs" "${GRID_ROOT}/ckpts" "${GRID_ROOT}/done"
 
 SUMMARY="${GRID_ROOT}/summary.csv"
 if [[ ! -f "${SUMMARY}" ]]; then
-  echo "combo_id,seed,split,local_conv_layers,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,iql_tau,iql_actor_lr,iql_qf_lr,iql_vf_lr,iql_beta,iql_max_grad_norm,em_m_steps_per_outer,em_her_samples_per_transition,em_her_refresh_every,best_outer,best_val_metric,best_val_score,eval_tau,eval_mae_norm,eval_mae_uns,eval_rmse_norm,eval_rmse_norm_x_std,eval_rmse_uns,gift_rmse,gift_rmse_percent,gift_mae_percent,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
+  echo "combo_id,seed,split,local_conv_layers,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,iql_tau,iql_actor_lr,iql_qf_lr,iql_vf_lr,iql_beta,iql_weight_max,iql_max_grad_norm,em_m_steps_per_outer,em_her_samples_per_transition,em_her_refresh_every,best_outer,best_val_metric,best_val_score,eval_tau,eval_mae_norm,eval_mae_uns,eval_rmse_norm,eval_rmse_norm_x_std,eval_rmse_uns,gift_rmse,gift_rmse_percent,gift_mae_percent,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
 fi
 
 MLFLOW_URI_ARGS=()
@@ -126,7 +127,7 @@ append_eval_rows() {
   local finished_at="${10}"
 
   python - "${SUMMARY}" "${combo_id}" "${seed}" "${split}" "${IQL_TAU}" "${IQL_ACTOR_LR}" "${IQL_QF_LR}" "${IQL_VF_LR}" \
-    "${IQL_BETA}" "${IQL_MAX_GRAD}" "${EM_M_STEPS}" "${EM_HER_SAMPLES}" "${EM_HER_REFRESH}" \
+    "${IQL_BETA}" "${IQL_WEIGHT_MAX}" "${IQL_MAX_GRAD}" "${EM_M_STEPS}" "${EM_HER_SAMPLES}" "${EM_HER_REFRESH}" \
     "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY'
 import csv
 import os
@@ -135,7 +136,7 @@ import sys
 
 (
     summary_path, combo_id, seed, split, iql_tau, actor_lr, qf_lr, vf_lr,
-    iql_beta, iql_max_grad, em_m_steps, em_her_samples, em_her_refresh,
+    iql_beta, iql_weight_max, iql_max_grad, em_m_steps, em_her_samples, em_her_refresh,
     best_outer, best_val_metric, best_val_score, em_ckpt, train_log, eval_log, finished_at
 ) = sys.argv[1:]
 
@@ -199,7 +200,7 @@ if not rows:
 fieldnames = [
     "combo_id", "seed", "split", "local_conv_layers", "dataset_train", "dataset_val", "dataset_test",
     "max_seq_length", "min_seq_length", "iql_tau", "iql_actor_lr", "iql_qf_lr", "iql_vf_lr",
-    "iql_beta", "iql_max_grad_norm", "em_m_steps_per_outer", "em_her_samples_per_transition",
+    "iql_beta", "iql_weight_max", "iql_max_grad_norm", "em_m_steps_per_outer", "em_her_samples_per_transition",
     "em_her_refresh_every", "best_outer", "best_val_metric", "best_val_score", "eval_tau", "eval_mae_norm",
     "eval_mae_uns", "eval_rmse_norm", "eval_rmse_norm_x_std", "eval_rmse_uns", "gift_rmse",
     "gift_rmse_percent", "gift_mae_percent", "em_ckpt", "train_log", "eval_log", "finished_at",
@@ -222,6 +223,7 @@ with open(summary_path, "a", newline="", encoding="utf-8") as f:
             "iql_qf_lr": qf_lr,
             "iql_vf_lr": vf_lr,
             "iql_beta": iql_beta,
+            "iql_weight_max": iql_weight_max,
             "iql_max_grad_norm": iql_max_grad,
             "em_m_steps_per_outer": em_m_steps,
             "em_her_samples_per_transition": em_her_samples,
@@ -252,10 +254,14 @@ run_one() {
   adv_id="${adv_id//-/m}"
   adv_id="${adv_id//+/p}"
   adv_id="${adv_id//[^A-Za-z0-9pm]/}"
+  local wmax_id="${IQL_WEIGHT_MAX//./p}"
+  wmax_id="${wmax_id//-/m}"
+  wmax_id="${wmax_id//+/p}"
+  wmax_id="${wmax_id//[^A-Za-z0-9pm]/}"
   if [[ "${IQL_REWARD_TYPE}" == "negative_outcome_huber" || "${IQL_REWARD_TYPE}" == "huber" || "${IQL_REWARD_TYPE}" == "smooth_l1" ]]; then
     reward_id="${reward_id}_d${IQL_REWARD_HUBER_DELTA//[^A-Za-z0-9]/}"
   fi
-  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_val${VAL_METRIC}_${reward_id}_maxtau${MAX_TAU}"
+  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_w${wmax_id}_val${VAL_METRIC}_${reward_id}_maxtau${MAX_TAU}"
   if [[ "${EM_ENCODER_DIAGNOSTICS}" == "true" ]]; then
     combo_id="${combo_id}_encdiag${EM_ENCODER_DIAGNOSTICS_EVERY}"
   fi
@@ -288,6 +294,7 @@ run_one() {
   echo "  seed=${seed} gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
   echo "  local_conv_layers=${local_layers}"
   echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
+  echo "  iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} iql_weight_max=${IQL_WEIGHT_MAX}"
   echo "  val_metric=${VAL_METRIC}"
   echo "  max_tau=${MAX_TAU}"
   echo "  goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
@@ -312,6 +319,7 @@ run_one() {
     "exp.iql_reward_huber_delta=${IQL_REWARD_HUBER_DELTA}" \
     "exp.iql_beta=${IQL_BETA}" \
     "+exp.iql_adv_max=${IQL_ADV_MAX}" \
+    "exp.iql_weight_max=${IQL_WEIGHT_MAX}" \
     "exp.iql_tau=${IQL_TAU}" \
     "exp.iql_actor_lr=${IQL_ACTOR_LR}" \
     "exp.iql_qf_lr=${IQL_QF_LR}" \
@@ -380,6 +388,7 @@ run_one() {
     echo "min_seq_length=40"
     echo "iql_beta=${IQL_BETA}"
     echo "iql_adv_max=${IQL_ADV_MAX}"
+    echo "iql_weight_max=${IQL_WEIGHT_MAX}"
     echo "em_ckpt=${em_ckpt}"
     echo "train_log=${train_log}"
     echo "eval_log=${eval_log}"
@@ -392,7 +401,7 @@ echo "[gift-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
 echo "[gift-protocol] seeds=(${SEEDS[*]})"
 echo "[gift-protocol] data train/val/test=1000/200/200 max_seq_length=40"
 echo "[gift-protocol] iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
-echo "[gift-protocol] beta=${IQL_BETA} adv_max=${IQL_ADV_MAX} grad=${IQL_MAX_GRAD} m_steps=${EM_M_STEPS} eval_tau_list=${EVAL_TAU_LIST}"
+echo "[gift-protocol] beta=${IQL_BETA} adv_max=${IQL_ADV_MAX} weight_max=${IQL_WEIGHT_MAX} grad=${IQL_MAX_GRAD} m_steps=${EM_M_STEPS} eval_tau_list=${EVAL_TAU_LIST}"
 echo "[gift-protocol] max_tau=${MAX_TAU} val_metric=${VAL_METRIC}"
 echo "[gift-protocol] grid_root=${GRID_ROOT}"
 

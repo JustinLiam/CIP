@@ -171,6 +171,8 @@ def main(args: DictConfig):
     log_window = int(OmegaConf.select(args, "exp.iql_log_window", default=200))
     iql_max_grad = OmegaConf.select(args, "exp.iql_max_grad_norm", default=None)
     iql_max_grad = None if iql_max_grad is None else float(iql_max_grad)
+    iql_weight_max = OmegaConf.select(args, "exp.iql_weight_max", default=10.0)
+    iql_weight_max = None if iql_weight_max is None else float(iql_weight_max)
 
     planner_cfg = IQLPlannerConfig(
         state_dim=int(transitions["states"].shape[1]),
@@ -181,6 +183,7 @@ def main(args: DictConfig):
         iql_tau=float(OmegaConf.select(args, "exp.iql_tau", default=0.7)),
         beta=float(OmegaConf.select(args, "exp.iql_beta", default=3.0)),
         adv_max=float(OmegaConf.select(args, "exp.iql_adv_max", default=100.0)),
+        weight_max=iql_weight_max,
         discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
         tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
         actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),

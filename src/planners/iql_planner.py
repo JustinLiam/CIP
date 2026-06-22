@@ -32,6 +32,7 @@ class IQLPlannerConfig:
     iql_tau: float = 0.7
     beta: float = 3.0
     adv_max: float = EXP_ADV_MAX
+    weight_max: Optional[float] = 10.0
     discount: float = 0.99
     tau: float = 0.005
     actor_lr: float = 3e-4
@@ -69,6 +70,66 @@ def weighted_asymmetric_l2_loss(u: torch.Tensor, tau: float, w: torch.Tensor) ->
 def _weighted_mean_sq(err: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     denom = w.sum().clamp(min=1e-8)
     return (w * err).sum() / denom
+
+
+def _cap_renormalize_weights(
+    w: torch.Tensor, weight_max: Optional[float]
+) -> torch.Tensor:
+    """Cap M-step sample weights while keeping the batch mean close to 1."""
+    if weight_max is None:
+        return w
+    cap = float(weight_max)
+    if cap <= 0:
+        return w
+    if cap < 1.0:
+        raise ValueError("weight_max must be >= 1.0 when enabled.")
+
+    w_nonneg = w.clamp_min(0.0)
+    if w_nonneg.numel() == 0:
+        return w_nonneg
+    if cap == 1.0:
+        return torch.ones_like(w_nonneg)
+
+    target_sum_value = float(w_nonneg.numel())
+    target_sum = w_nonneg.new_tensor(target_sum_value)
+    current_sum = w_nonneg.sum()
+    if float(current_sum.detach().item()) <= 1e-8:
+        return torch.ones_like(w_nonneg)
+
+    positive_count = int((w_nonneg > 0).sum().detach().item())
+    if positive_count == 0 or positive_count * cap < w_nonneg.numel():
+        return torch.ones_like(w_nonneg)
+
+    lo = w_nonneg.new_zeros(())
+    hi = torch.clamp(target_sum / current_sum.clamp(min=1e-8), min=1.0)
+    for _ in range(32):
+        if float(torch.clamp(w_nonneg * hi, max=cap).sum().detach().item()) >= target_sum_value:
+            break
+        hi = hi * 2.0
+
+    for _ in range(48):
+        mid = (lo + hi) * 0.5
+        total = torch.clamp(w_nonneg * mid, max=cap).sum()
+        if float(total.detach().item()) < target_sum_value:
+            lo = mid
+        else:
+            hi = mid
+    return torch.clamp(w_nonneg * hi, max=cap)
+
+
+def _log_weight_stats(log_dict: Dict[str, float], prefix: str, w: torch.Tensor) -> None:
+    w_det = w.detach()
+    if w_det.numel() == 0:
+        return
+    w_float = w_det.float()
+    log_dict[f"{prefix}_mean"] = float(w_float.mean().item())
+    log_dict[f"{prefix}_std"] = float(w_float.std(unbiased=False).item())
+    log_dict[f"{prefix}_max"] = float(w_float.max().item())
+    sorted_w = torch.sort(w_float.reshape(-1))[0]
+    p95_idx = min(int(0.95 * (sorted_w.numel() - 1)), sorted_w.numel() - 1)
+    log_dict[f"{prefix}_p95"] = float(sorted_w[p95_idx].item())
+    ess = w_float.sum().pow(2) / w_float.pow(2).sum().clamp(min=1e-8)
+    log_dict[f"{prefix}_ess_frac"] = float((ess / w_float.numel()).item())
 
 
 def _tensor_l2_norm(values: List[torch.Tensor]) -> float:
@@ -608,7 +669,8 @@ class IQLPlanner:
         _, w = encoder_model.compute_weights(
             Z_t, A_t, detach_z=True, uniform=uniform_weights
         )
-        w = w.detach()
+        w_raw = w.detach()
+        w = _cap_renormalize_weights(w_raw, self.cfg.weight_max)
 
         s_grad = self.build_state(
             Z_t, batch.y_target, batch.delta_t_norm, batch.a_prev_tanh
@@ -636,8 +698,16 @@ class IQLPlanner:
             collect_encoder_diagnostics=collect_encoder_diagnostics,
         )
         self._update_policy_weighted(s_det, batch.action, adv, w, log_dict)
-        log_dict["w_mean"] = float(w.mean().item())
-        log_dict["w_std"] = float(w.std(unbiased=False).item())
+        _log_weight_stats(log_dict, "w_raw", w_raw)
+        _log_weight_stats(log_dict, "w", w)
+        if self.cfg.weight_max is not None and self.cfg.weight_max > 0:
+            log_dict["w_max_config"] = float(self.cfg.weight_max)
+            log_dict["w_clip_frac"] = float(
+                (w_raw > float(self.cfg.weight_max)).float().mean().item()
+            )
+            log_dict["w_at_cap_frac"] = float(
+                (w >= float(self.cfg.weight_max) - 1e-6).float().mean().item()
+            )
         return log_dict
 
     @torch.no_grad()
@@ -681,6 +751,7 @@ class IQLPlanner:
         cfg_dict.setdefault("max_grad_norm", None)
         cfg_dict.setdefault("encoder_max_grad_norm", 1.0)
         cfg_dict.setdefault("adv_max", EXP_ADV_MAX)
+        cfg_dict.setdefault("weight_max", 10.0)
         cfg_dict.setdefault("goal_adapter_enabled", False)
         cfg_dict.setdefault("z_dim", None)
         cfg_dict.setdefault("output_dim", None)

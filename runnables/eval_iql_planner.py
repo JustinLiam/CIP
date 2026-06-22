@@ -58,6 +58,20 @@ def _policy_to_sim_interval_torch(raw: torch.Tensor, max_action: float) -> torch
     return torch.clamp((raw + max_action) / denom, 0.0, 1.0)
 
 
+def _calibrate_sim_actions_torch(a_sim: torch.Tensor, scale: float, shift: float) -> torch.Tensor:
+    """Optional eval-time action calibration in simulator [0, 1] space."""
+    if scale == 1.0 and shift == 0.0:
+        return a_sim
+    return torch.clamp(a_sim * float(scale) + float(shift), 0.0, 1.0)
+
+
+def _calibrate_sim_actions_np(a_sim: np.ndarray, scale: float, shift: float) -> np.ndarray:
+    """Numpy equivalent of ``_calibrate_sim_actions_torch``."""
+    if scale == 1.0 and shift == 0.0:
+        return a_sim
+    return np.clip(a_sim * float(scale) + float(shift), 0.0, 1.0).astype(np.float32)
+
+
 def _sim_actions_to_tanh_batch(a_sim: torch.Tensor, max_action: float) -> torch.Tensor:
     """Match ``dataset_actions_to_tanh_policy_space`` for batched simulator actions [B, A]."""
     if max_action <= 0:
@@ -248,6 +262,14 @@ def main(args: DictConfig):
     if max_tau <= 0:
         raise ValueError("exp.max_tau must be positive for horizon-aware IQL evaluation.")
     autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
+    action_eval_scale = float(OmegaConf.select(args, "exp.iql_eval_action_scale", default=1.0))
+    action_eval_shift = float(OmegaConf.select(args, "exp.iql_eval_action_shift", default=0.0))
+    if action_eval_scale != 1.0 or action_eval_shift != 0.0:
+        logger.info(
+            "IQL eval action calibration enabled: a_sim <- clip(a_sim * %.6f + %.6f, 0, 1)",
+            action_eval_scale,
+            action_eval_shift,
+        )
     mean_ser, std_ser = dataset_collection.train_scaling_params
     tau_list = _resolve_eval_tau_list(args)
     original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=max(tau_list)))
@@ -304,6 +326,9 @@ def main(args: DictConfig):
                             else:
                                 a_raw = torch.clamp(po * ma, -ma, ma)
                             a_sim = _policy_to_sim_interval_torch(a_raw, max_action)
+                            a_sim = _calibrate_sim_actions_torch(
+                                a_sim, action_eval_scale, action_eval_shift
+                            )
                             planned.append(a_sim)
                             y_np = fold.simulate_output_after_actions(
                                 H_work,
@@ -343,6 +368,9 @@ def main(args: DictConfig):
                             a_rows.append(a_b.detach().cpu().numpy().reshape(-1))
                         a_raw = np.stack(a_rows, axis=0)
                         a_sim = _actions_to_sim_interval(a_raw, max_action)
+                        a_sim = _calibrate_sim_actions_np(
+                            a_sim, action_eval_scale, action_eval_shift
+                        )
                         a_seq = torch.tensor(a_sim, device=device, dtype=torch.float32).unsqueeze(1).expand(-1, tau, -1).contiguous()
 
                     output_after_actions = fold.simulate_output_after_actions(
