@@ -327,6 +327,32 @@ def test_weighted_mean_does_not_square_policy_losses():
     assert torch.isclose(_weighted_mean(values, weights), torch.tensor(3.5))
 
 
+def test_cql_regularizer_logs_when_enabled():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+            cql_alpha=0.01,
+            cql_n_actions=3,
+        )
+    )
+    batch = [
+        torch.randn(8, 5),
+        torch.clamp(torch.randn(8, 2), -1.0, 1.0),
+        torch.randn(8, 1),
+        torch.randn(8, 5),
+        torch.zeros(8, 1),
+    ]
+    logs = planner.train_step(batch)
+    assert "cql_loss" in logs
+    assert logs["cql_alpha"] == 0.01
+
+
 def test_q_grid_action_diagnostics_returns_argmax_and_slope():
     planner = IQLPlanner(
         IQLPlannerConfig(

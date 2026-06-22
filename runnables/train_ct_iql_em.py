@@ -191,6 +191,8 @@ def main(args: DictConfig):
         actor_update=str(OmegaConf.select(args, "exp.iql_actor_update", default="awr")),
         td3bc_q_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_q_alpha", default=2.5)),
         td3bc_bc_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_bc_alpha", default=1.0)),
+        cql_alpha=float(OmegaConf.select(args, "exp.iql_cql_alpha", default=0.0)),
+        cql_n_actions=int(OmegaConf.select(args, "exp.iql_cql_n_actions", default=10)),
         discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
         tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
         actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),

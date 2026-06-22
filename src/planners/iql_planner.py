@@ -36,6 +36,8 @@ class IQLPlannerConfig:
     actor_update: str = "awr"
     td3bc_q_alpha: float = 2.5
     td3bc_bc_alpha: float = 1.0
+    cql_alpha: float = 0.0
+    cql_n_actions: int = 10
     discount: float = 0.99
     tau: float = 0.005
     actor_lr: float = 3e-4
@@ -488,6 +490,11 @@ class IQLPlanner:
         targets = rewards + (1.0 - dones.float()) * self.cfg.discount * next_v.detach()
         q1, q2 = self.qf.both(observations, actions)
         q_loss = 0.5 * (F.mse_loss(q1, targets) + F.mse_loss(q2, targets))
+        cql_loss = self._cql_regularizer(observations, q1, q2)
+        if cql_loss is not None:
+            q_loss = q_loss + cql_loss
+            log_dict["cql_loss"] = float(cql_loss.detach().item())
+            log_dict["cql_alpha"] = float(self.cfg.cql_alpha)
         self.q_optimizer.zero_grad()
         q_loss.backward()
         if self.cfg.max_grad_norm is not None:
@@ -505,6 +512,37 @@ class IQLPlanner:
         alpha = float(self.cfg.td3bc_q_alpha)
         denom = q_values.detach().abs().mean().clamp(min=1e-6)
         return q_values.new_tensor(alpha) / denom
+
+    def _cql_regularizer(
+        self,
+        observations: torch.Tensor,
+        q1_data: torch.Tensor,
+        q2_data: torch.Tensor,
+        w: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        alpha = float(self.cfg.cql_alpha)
+        n_actions = int(self.cfg.cql_n_actions)
+        if alpha <= 0.0 or n_actions <= 0:
+            return None
+        batch_size = int(observations.shape[0])
+        if batch_size <= 0:
+            return None
+        random_actions = torch.empty(
+            batch_size * n_actions,
+            int(self.cfg.action_dim),
+            device=observations.device,
+            dtype=observations.dtype,
+        ).uniform_(-float(self.cfg.max_action), float(self.cfg.max_action))
+        obs_rep = observations.repeat_interleave(n_actions, dim=0)
+        q1_rand, q2_rand = self.qf.both(obs_rep, random_actions)
+        log_n = np.log(float(n_actions))
+        cql1 = torch.logsumexp(q1_rand.view(batch_size, n_actions), dim=1) - log_n - q1_data
+        cql2 = torch.logsumexp(q2_rand.view(batch_size, n_actions), dim=1) - log_n - q2_data
+        if w is None:
+            cql = 0.5 * (cql1.mean() + cql2.mean())
+        else:
+            cql = 0.5 * (_weighted_mean(cql1, w) + _weighted_mean(cql2, w))
+        return cql * q1_data.new_tensor(alpha)
 
     def _update_policy_td3bc(
         self,
@@ -694,6 +732,11 @@ class IQLPlanner:
         err1 = (q1 - targets) ** 2
         err2 = (q2 - targets) ** 2
         q_loss = 0.5 * (_weighted_mean_sq(err1, w) + _weighted_mean_sq(err2, w))
+        cql_loss = self._cql_regularizer(observations, q1, q2, w=w)
+        if cql_loss is not None:
+            q_loss = q_loss + cql_loss
+            log_dict["cql_loss"] = float(cql_loss.detach().item())
+            log_dict["cql_alpha"] = float(self.cfg.cql_alpha)
 
         self.q_optimizer.zero_grad(set_to_none=True)
         encoder_optimizer.zero_grad(set_to_none=True)
@@ -886,6 +929,8 @@ class IQLPlanner:
         cfg_dict.setdefault("actor_update", "awr")
         cfg_dict.setdefault("td3bc_q_alpha", 2.5)
         cfg_dict.setdefault("td3bc_bc_alpha", 1.0)
+        cfg_dict.setdefault("cql_alpha", 0.0)
+        cfg_dict.setdefault("cql_n_actions", 10)
         cfg_dict.setdefault("goal_adapter_enabled", False)
         cfg_dict.setdefault("z_dim", None)
         cfg_dict.setdefault("output_dim", None)
