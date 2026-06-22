@@ -42,6 +42,8 @@ IQL_REWARD_HUBER_DELTA="${IQL_REWARD_HUBER_DELTA:-1.0}"
 IQL_ADV_MAX="${IQL_ADV_MAX:-100}"
 IQL_WEIGHT_MAX="${IQL_WEIGHT_MAX:-10.0}"
 IQL_ACTOR_UPDATE="${IQL_ACTOR_UPDATE:-awr}"
+IQL_ACTOR_BC_LOSS="${IQL_ACTOR_BC_LOSS:-nll}"
+IQL_ACTOR_BC_EXPECTILE="${IQL_ACTOR_BC_EXPECTILE:-0.7}"
 IQL_TD3BC_Q_ALPHA="${IQL_TD3BC_Q_ALPHA:-2.5}"
 IQL_TD3BC_BC_ALPHA="${IQL_TD3BC_BC_ALPHA:-1.0}"
 EM_OUTER_ITERS="${EM_OUTER_ITERS:-50}"
@@ -325,6 +327,7 @@ run_one() {
   echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
   echo "  iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} iql_weight_max=${IQL_WEIGHT_MAX}"
   echo "  iql_actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
+  echo "  iql_actor_bc_loss=${IQL_ACTOR_BC_LOSS} iql_actor_bc_expectile=${IQL_ACTOR_BC_EXPECTILE}"
   echo "  val_metric=${VAL_METRIC} em_val_tau_agg=${EM_VAL_TAU_AGG}"
   echo "  em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} em_m_steps=${EM_M_STEPS} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS}"
   echo "  goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
@@ -356,6 +359,8 @@ run_one() {
     "+exp.iql_adv_max=${IQL_ADV_MAX}" \
     "exp.iql_weight_max=${IQL_WEIGHT_MAX}" \
     "exp.iql_actor_update=${IQL_ACTOR_UPDATE}" \
+    "exp.iql_actor_bc_loss=${IQL_ACTOR_BC_LOSS}" \
+    "exp.iql_actor_bc_expectile=${IQL_ACTOR_BC_EXPECTILE}" \
     "exp.iql_td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA}" \
     "exp.iql_td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}" \
     "exp.iql_tau=${IQL_TAU}" \
