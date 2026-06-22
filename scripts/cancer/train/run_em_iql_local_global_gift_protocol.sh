@@ -328,7 +328,7 @@ run_one() {
   echo "  iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} iql_weight_max=${IQL_WEIGHT_MAX}"
   echo "  iql_actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
   echo "  iql_actor_bc_loss=${IQL_ACTOR_BC_LOSS} iql_actor_bc_expectile=${IQL_ACTOR_BC_EXPECTILE}"
-  echo "  val_metric=${VAL_METRIC} em_val_tau_agg=${EM_VAL_TAU_AGG}"
+  echo "  val_metric=${VAL_METRIC} em_val_tau_agg=${EM_VAL_TAU_AGG} val_tau_list=${EVAL_TAU_LIST}"
   echo "  em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} em_m_steps=${EM_M_STEPS} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS}"
   echo "  goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
   echo "  encoder_diagnostics=${EM_ENCODER_DIAGNOSTICS} every=${EM_ENCODER_DIAGNOSTICS_EVERY}"
@@ -374,6 +374,7 @@ run_one() {
     "exp.em_encoder_max_grad_norm=${EM_ENCODER_MAX_GRAD}" \
     "exp.em_warmup_outer_iters=${EM_WARMUP_OUTER_ITERS}" \
     "exp.em_val_every=${EM_VAL_EVERY}" \
+    "exp.em_val_tau_list=${EVAL_TAU_LIST}" \
     "exp.em_save_every_outer_checkpoint=${EM_SAVE_OUTER_CKPTS}" \
     "+exp.em_encoder_diagnostics=${EM_ENCODER_DIAGNOSTICS}" \
     "+exp.em_encoder_diagnostics_every=${EM_ENCODER_DIAGNOSTICS_EVERY}" \
