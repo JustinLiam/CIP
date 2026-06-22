@@ -212,6 +212,7 @@ exp:
   em_encoder_max_grad_norm: 1.0
   em_val_every: 2
   em_val_metric: mae_uns
+  em_val_tau_list: null
   # Multi-tau EM checkpoint selection. mean preserves historical behavior;
   # max selects for worst-horizon validation RMSE/MAE and is useful when every
   # tau must satisfy a threshold.
