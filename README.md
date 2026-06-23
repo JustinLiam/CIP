@@ -38,6 +38,46 @@ mlflow server \
 
 ## Running Experiments
 
+### One-stage CT+IQL EM under the GIFT tumor protocol
+
+Use this command for the current VCIP one-stage CT+IQL EM experiment. It uses the synthetic tumor comparison protocol (`train/val/test=1000/200/200`, `max_seq_length=60`) and evaluates `tau=1,...,6`.
+
+```bash
+ssh thinkstation
+cd /home/liam/pythonProject/VCIP-ICML-main
+source /home/liam/anaconda3/etc/profile.d/conda.sh
+conda activate vcip
+
+GRID_ROOT=grid_results/stable_gift_protocol_best_$(date +%Y%m%d) \
+GRID_SEEDS="20 202 2020 20202 202020" \
+TEST_SPLIT=true \
+FORCE=1 \
+DATASET_TRAIN=1000 \
+DATASET_VAL=200 \
+DATASET_TEST=200 \
+MAX_SEQ_LENGTH=60 \
+MIN_SEQ_LENGTH=60 \
+EM_WARMUP_OUTER_ITERS=2 \
+bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
+```
+
+Current default hyperparameters are stored in `configs/model/vcip.yaml`: AWR actor update, expectile actor BC (`iql_actor_bc_loss=expectile`, `iql_actor_bc_expectile=0.8`), `iql_weight_max=1.0`, `em_warmup_outer_iters=2`, `em_val_metric=rmse_uns`, and max-over-`tau=1,...,6` validation selection. Keep `iql_eval_action_shift=0.0` for main experiments.
+
+For a single diagnostic seed, run:
+
+```bash
+GRID_ROOT=grid_results/stable_gift_protocol_seed2_$(date +%Y%m%d) \
+GRID_SEEDS="2" \
+TEST_SPLIT=true \
+FORCE=1 \
+MAX_SEQ_LENGTH=60 \
+MIN_SEQ_LENGTH=60 \
+EM_WARMUP_OUTER_ITERS=2 \
+bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
+```
+
+Do not choose the final seed set based on test-set performance. If seed 2 is useful, report it as an additional seed or predefine the replacement before reading test metrics.
+
 To train the CT model:
 
 1. Run:

@@ -4,6 +4,7 @@ Unit tests for CT+IQL EM: E-step freezes encoder; M-step encoder grad only on Q-
 import numpy as np
 import pytest
 import torch
+from torch.distributions import Normal
 from omegaconf import OmegaConf
 
 from src.data.ct_transition_dataset import _collate_pad_H
@@ -13,6 +14,7 @@ from src.data.iql_raw_transition_dataset import (
     IQLRawReplayBuffer,
     build_iql_raw_transitions,
 )
+from src.evaluation.iql_action_selection import select_iql_policy_action
 from src.evaluation.iql_planner_eval import _make_action_grid, _q_grid_action_diagnostics
 from src.models.ct_deconfound import CTDeconfoundModel
 from src.models.ct_encoder_weight import CTEncoderWeightModel
@@ -445,6 +447,52 @@ def test_q_grid_action_diagnostics_returns_argmax_and_slope():
     assert diag["q_argmax"].shape == (4, 2)
     assert diag["q_slope"].shape == (4,)
     assert np.isfinite(diag["q_argmax"]).all()
+
+
+def test_q_sample_action_selector_keeps_mean_default_and_filters_by_q():
+    class DummyActor(torch.nn.Module):
+        max_action = 1.0
+
+        def forward(self, obs):
+            mean = torch.zeros(obs.size(0), 2, device=obs.device)
+            std = torch.ones_like(mean)
+            return Normal(mean, std)
+
+    class SumQ(torch.nn.Module):
+        def forward(self, obs, action):
+            return action.sum(dim=-1)
+
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+        )
+    )
+    planner.actor = DummyActor()
+    planner.qf = SumQ()
+    obs = torch.zeros(6, 5)
+
+    mean_action = select_iql_policy_action(planner, obs, selector="mean")
+    assert torch.allclose(mean_action, torch.zeros_like(mean_action))
+
+    torch.manual_seed(0)
+    q_action = select_iql_policy_action(
+        planner,
+        obs,
+        selector="q_sample",
+        candidate_actions=128,
+        q_bc_penalty=0.0,
+    )
+    assert q_action.shape == (6, 2)
+    assert torch.all(q_action <= 1.0)
+    assert torch.all(q_action >= -1.0)
+    assert torch.all(q_action.sum(dim=-1) >= mean_action.sum(dim=-1))
+
 
 def test_m_step_encoder_grad_only_on_q_step():
     device = "cpu"

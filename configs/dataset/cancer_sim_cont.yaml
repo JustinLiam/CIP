@@ -8,11 +8,11 @@ dataset:
   seed: ${exp.seed}
   num_patients:
     train: 1000
-    val: 100
-    test: 100
+    val: 200
+    test: 200
   window_size: 15                                       # Used for biased treatment assignment
   lag: 0                                                # Lag for treatment assignment window
-  max_seq_length: 60                                    # Max length of time series
+  max_seq_length: 60                                    # Max length of time series for the current tumor comparison protocol
   projection_horizon: 5                                 # Range of tau-step-ahead prediction (tau = projection_horizon + 1)
   cf_seq_mode: sliding_treatment                        # sliding_treatment / random_trajectories
   # val_batch_size: 512                                   # Batch size for evaluation

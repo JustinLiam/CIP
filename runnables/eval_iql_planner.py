@@ -19,7 +19,6 @@ from typing import Dict, List
 import hydra
 import numpy as np
 import torch
-from torch.distributions import Distribution
 from hydra.utils import get_original_cwd, instantiate
 from omegaconf import DictConfig, OmegaConf
 
@@ -27,6 +26,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data.cip_dataset import CIPDataset, get_dataloader
 from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_actions_to_tanh_policy_space
+from src.evaluation.iql_action_selection import select_iql_policy_action
 from src.models.inference_model import InferenceModel
 from src.models.sequence_utils import gather_last_valid
 from src.planners.iql_planner import IQLPlanner
@@ -264,11 +264,25 @@ def main(args: DictConfig):
     autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
     action_eval_scale = float(OmegaConf.select(args, "exp.iql_eval_action_scale", default=1.0))
     action_eval_shift = float(OmegaConf.select(args, "exp.iql_eval_action_shift", default=0.0))
+    action_selector = str(OmegaConf.select(args, "exp.iql_eval_action_selector", default="mean"))
+    action_candidate_actions = int(OmegaConf.select(args, "exp.iql_eval_candidate_actions", default=16))
+    action_q_bc_penalty = float(OmegaConf.select(args, "exp.iql_eval_q_bc_penalty", default=0.0))
+    action_candidate_noise_std = float(
+        OmegaConf.select(args, "exp.iql_eval_candidate_noise_std", default=0.25)
+    )
     if action_eval_scale != 1.0 or action_eval_shift != 0.0:
         logger.info(
             "IQL eval action calibration enabled: a_sim <- clip(a_sim * %.6f + %.6f, 0, 1)",
             action_eval_scale,
             action_eval_shift,
+        )
+    if action_selector.strip().lower() not in ("", "mean", "actor_mean"):
+        logger.info(
+            "IQL eval action selector enabled: selector=%s candidates=%d q_bc_penalty=%.6f noise_std=%.6f",
+            action_selector,
+            action_candidate_actions,
+            action_q_bc_penalty,
+            action_candidate_noise_std,
         )
     mean_ser, std_ser = dataset_collection.train_scaling_params
     tau_list = _resolve_eval_tau_list(args)
@@ -319,12 +333,14 @@ def main(args: DictConfig):
                             z, _, _ = inference_model.ct_hidden_history(H_work)
                             a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
                             obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
-                            po = planner.actor(obs)
-                            ma = planner.actor.max_action
-                            if isinstance(po, Distribution):
-                                a_raw = torch.clamp(ma * po.mean, -ma, ma)
-                            else:
-                                a_raw = torch.clamp(po * ma, -ma, ma)
+                            a_raw = select_iql_policy_action(
+                                planner,
+                                obs,
+                                selector=action_selector,
+                                candidate_actions=action_candidate_actions,
+                                q_bc_penalty=action_q_bc_penalty,
+                                candidate_noise_std=action_candidate_noise_std,
+                            )
                             a_sim = _policy_to_sim_interval_torch(a_raw, max_action)
                             a_sim = _calibrate_sim_actions_torch(
                                 a_sim, action_eval_scale, action_eval_shift
@@ -359,12 +375,14 @@ def main(args: DictConfig):
                             delta_b = torch.as_tensor(delta_vec.reshape(1, 1), device=device, dtype=torch.float32)
                             a_prev_b = torch.as_tensor(a_prev_feat[b:b + 1], device=device, dtype=torch.float32)
                             obs_b = planner.build_state(z_b, target_b, delta_b, a_prev_b)
-                            po_b = planner.actor(obs_b)
-                            ma = planner.actor.max_action
-                            if isinstance(po_b, Distribution):
-                                a_b = torch.clamp(ma * po_b.mean, -ma, ma)
-                            else:
-                                a_b = torch.clamp(po_b * ma, -ma, ma)
+                            a_b = select_iql_policy_action(
+                                planner,
+                                obs_b,
+                                selector=action_selector,
+                                candidate_actions=action_candidate_actions,
+                                q_bc_penalty=action_q_bc_penalty,
+                                candidate_noise_std=action_candidate_noise_std,
+                            )
                             a_rows.append(a_b.detach().cpu().numpy().reshape(-1))
                         a_raw = np.stack(a_rows, axis=0)
                         a_sim = _actions_to_sim_interval(a_raw, max_action)

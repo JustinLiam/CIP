@@ -10,10 +10,10 @@ from typing import Any, Dict
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-from torch.distributions import Distribution
 
 from src.data.cip_dataset import CIPDataset, get_dataloader
 from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_actions_to_tanh_policy_space
+from src.evaluation.iql_action_selection import select_iql_policy_action
 from src.models.inference_model import InferenceModel
 from src.models.sequence_utils import gather_last_valid
 from src.planners.iql_planner import IQLPlanner
@@ -504,6 +504,12 @@ def aggregate_iql_planner_metrics(
 
     data = fold.data
     max_action = float(planner.cfg.max_action)
+    action_selector = str(OmegaConf.select(args, "exp.iql_eval_action_selector", default="mean"))
+    action_candidate_actions = int(OmegaConf.select(args, "exp.iql_eval_candidate_actions", default=16))
+    action_q_bc_penalty = float(OmegaConf.select(args, "exp.iql_eval_q_bc_penalty", default=0.0))
+    action_candidate_noise_std = float(
+        OmegaConf.select(args, "exp.iql_eval_candidate_noise_std", default=0.25)
+    )
     mean_ser, std_ser = dataset_collection.train_scaling_params
     scaling_params = dataset_collection.train_scaling_params
 
@@ -585,12 +591,14 @@ def aggregate_iql_planner_metrics(
                         obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
                         if step == 0:
                             first_obs = obs.detach()
-                        po = planner.actor(obs)
-                        ma = planner.actor.max_action
-                        if isinstance(po, Distribution):
-                            a_raw = torch.clamp(ma * po.mean, -ma, ma)
-                        else:
-                            a_raw = torch.clamp(po * ma, -ma, ma)
+                        a_raw = select_iql_policy_action(
+                            planner,
+                            obs,
+                            selector=action_selector,
+                            candidate_actions=action_candidate_actions,
+                            q_bc_penalty=action_q_bc_penalty,
+                            candidate_noise_std=action_candidate_noise_std,
+                        )
                         a_sim = _policy_to_sim_interval_torch(a_raw, max_action)
                         planned.append(a_sim)
                         y_norm = _rollout_one_step_y(
@@ -662,12 +670,14 @@ def aggregate_iql_planner_metrics(
                         delta_b = torch.as_tensor(delta_vec.reshape(1, 1), device=device, dtype=torch.float32)
                         a_prev_b = torch.as_tensor(a_prev_feat[b:b + 1], device=device, dtype=torch.float32)
                         obs_b = planner.build_state(z_b, target_b, delta_b, a_prev_b)
-                        po_b = planner.actor(obs_b)
-                        ma = planner.actor.max_action
-                        if isinstance(po_b, Distribution):
-                            a_b = torch.clamp(ma * po_b.mean, -ma, ma)
-                        else:
-                            a_b = torch.clamp(po_b * ma, -ma, ma)
+                        a_b = select_iql_policy_action(
+                            planner,
+                            obs_b,
+                            selector=action_selector,
+                            candidate_actions=action_candidate_actions,
+                            q_bc_penalty=action_q_bc_penalty,
+                            candidate_noise_std=action_candidate_noise_std,
+                        )
                         a_rows.append(a_b.detach().cpu().numpy().reshape(-1))
                     a_raw = np.stack(a_rows, axis=0)
                     a_sim = _actions_to_sim_interval(a_raw, max_action)

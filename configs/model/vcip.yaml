@@ -118,7 +118,7 @@ exp:
   # iql_tau: expectile 参数，决定“policy value”与“critic value”间的权衡。该值越高，表示算法更乐观、与 offline data 的 policy 匹配度更低、具有更强的探索性；越低则更贴近 offline data，探索性更差。一般建议 0.5~0.9 之间（参考 TD3+BC 和 IQL 论文）。
   iql_tau: 0.7  # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_weight_max: 10.0
+  iql_weight_max: 1.0
   # Actor extraction update: awr keeps IQL/AWR; bc uses pure behavior cloning;
   # td3bc uses Q-gradient + BC;
   # awr_td3bc keeps advantage-weighted AWR BC and adds a weak Q-gradient term.
@@ -126,9 +126,9 @@ exp:
   # nll matches standard stochastic AWR; mse directly optimizes the deterministic
   # actor mean used by eval_iql_planner.py; expectile is behavior-only upper
   # expectile regression to recover high-action tails without Q extrapolation.
-  iql_actor_bc_loss: nll
-  iql_actor_bc_expectile: 0.7
-  iql_td3bc_q_alpha: 2.5
+  iql_actor_bc_loss: expectile
+  iql_actor_bc_expectile: 0.8
+  iql_td3bc_q_alpha: 0.0
   iql_td3bc_bc_alpha: 1.0
   iql_cql_alpha: 0.0
   iql_cql_n_actions: 10
@@ -161,12 +161,20 @@ exp:
   # This does not change training actions or actor bounds.
   iql_eval_action_scale: 1.0
   iql_eval_action_shift: 0.0
+  # Eval-time action selector. mean preserves historical deterministic actor
+  # evaluation. q_sample samples actions from the learned behavior actor and
+  # chooses the highest critic value with an optional distance penalty from the
+  # actor mean, keeping policy improvement behavior-support constrained.
+  iql_eval_action_selector: mean
+  iql_eval_candidate_actions: 16
+  iql_eval_q_bc_penalty: 0.0
+  iql_eval_candidate_noise_std: 0.25
   # Model-based OPE A/B during IQL val:
   #   - sim:       ground-truth cancer simulator oracle (synthetic benchmark only).
   #   - predictor: learned OutcomePredictor from ct_best_encoder.pt (works on real data).
   # When >=2 worlds are listed, train_iql_planner.py tracks a separate best checkpoint
   # per world and logs Spearman rank correlation / top-K overlap / regret across worlds.
-  iql_val_worlds: [sim, predictor]
+  iql_val_worlds: [sim]
   # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
   # Must appear in iql_val_worlds.
   iql_val_selection_world: sim
@@ -211,20 +219,20 @@ exp:
   em_encoder_lr: 5.0e-5
   em_encoder_max_grad_norm: 1.0
   em_val_every: 2
-  em_val_metric: mae_uns
-  em_val_tau_list: null
+  em_val_metric: rmse_uns
+  em_val_tau_list: [1, 2, 3, 4, 5, 6]
   # Multi-tau EM checkpoint selection. mean preserves historical behavior;
   # max selects for worst-horizon validation RMSE/MAE and is useful when every
   # tau must satisfy a threshold.
-  em_val_tau_agg: mean
+  em_val_tau_agg: max
   # Save ct_iql_em_outerXXXX.pt at every validation point for checkpoint-selection
   # diagnostics. Keep disabled for normal sweeps to avoid large checkpoint folders.
-  em_save_every_eval_checkpoint: false
+  em_save_every_eval_checkpoint: true
   # Save ct_iql_em_outerXXXX.pt after every outer iteration without running validation.
   # Use this for post-hoc outer-vs-RMSE diagnostics.
   em_save_every_outer_checkpoint: false
   # M-step only: uniform w for first N outers; E-step always trains WeightNet.
-  em_warmup_outer_iters: 8
+  em_warmup_outer_iters: 2
   # CTD-style full-dataset WeightNet fit per E-step (epoch_w analogue).
   em_e_epochs: 5
   # WeightNet LR for full E-step (CTD-NKO uses 0.1 in wass_calculator.train_model).

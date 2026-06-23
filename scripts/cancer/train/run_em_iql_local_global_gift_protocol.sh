@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # One-stage EM+IQL local-global run under the GIFT Tumor data protocol.
 #
-# Data protocol aligned to external_repos/GIFT/configs/dataset/tumor.yaml:
+# Default data protocol for the current tumor comparison:
 #   train/val/test = 1000/200/200
-#   max_seq_length = 40
-#   min_seq_length = 40 (accepted as a config field for parity; the local simulator
-#   uses fixed seq_length through max_seq_length)
+#   max_seq_length = 60
+#   min_seq_length = 60
+# Override MAX_SEQ_LENGTH/MIN_SEQ_LENGTH to run alternate-history variants.
 #
 # Metric protocol:
 #   existing MAE/RMSE metrics are preserved, and eval_iql_planner logs:
@@ -27,9 +27,14 @@ conda activate vcip
 GPU="${1:-0}"
 GAMMA="${2:-4}"
 
-TEST_SPLIT="${TEST_SPLIT:-false}"
-SEEDS_RAW="${GRID_SEEDS:-20 2020 202020}"
+TEST_SPLIT="${TEST_SPLIT:-true}"
+SEEDS_RAW="${GRID_SEEDS:-20 202 2020 20202 202020}"
 read -r -a SEEDS <<< "${SEEDS_RAW}"
+DATASET_TRAIN="${DATASET_TRAIN:-1000}"
+DATASET_VAL="${DATASET_VAL:-200}"
+DATASET_TEST="${DATASET_TEST:-200}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-60}"
+MIN_SEQ_LENGTH="${MIN_SEQ_LENGTH:-${MAX_SEQ_LENGTH}}"
 
 IQL_BETA="${IQL_BETA:-2.0}"
 IQL_TAU="${IQL_TAU:-0.7}"
@@ -40,21 +45,23 @@ IQL_MAX_GRAD="${IQL_MAX_GRAD:-5.0}"
 IQL_REWARD_TYPE="${IQL_REWARD_TYPE:-negative_outcome}"
 IQL_REWARD_HUBER_DELTA="${IQL_REWARD_HUBER_DELTA:-1.0}"
 IQL_ADV_MAX="${IQL_ADV_MAX:-100}"
-IQL_WEIGHT_MAX="${IQL_WEIGHT_MAX:-10.0}"
+IQL_WEIGHT_MAX="${IQL_WEIGHT_MAX:-1.0}"
 IQL_ACTOR_UPDATE="${IQL_ACTOR_UPDATE:-awr}"
-IQL_ACTOR_BC_LOSS="${IQL_ACTOR_BC_LOSS:-nll}"
-IQL_ACTOR_BC_EXPECTILE="${IQL_ACTOR_BC_EXPECTILE:-0.7}"
-IQL_TD3BC_Q_ALPHA="${IQL_TD3BC_Q_ALPHA:-2.5}"
+IQL_ACTOR_BC_LOSS="${IQL_ACTOR_BC_LOSS:-expectile}"
+IQL_ACTOR_BC_EXPECTILE="${IQL_ACTOR_BC_EXPECTILE:-0.8}"
+IQL_TD3BC_Q_ALPHA="${IQL_TD3BC_Q_ALPHA:-0.0}"
 IQL_TD3BC_BC_ALPHA="${IQL_TD3BC_BC_ALPHA:-1.0}"
-EM_OUTER_ITERS="${EM_OUTER_ITERS:-50}"
+IQL_CQL_ALPHA="${IQL_CQL_ALPHA:-0.0}"
+IQL_CQL_N_ACTIONS="${IQL_CQL_N_ACTIONS:-10}"
+EM_OUTER_ITERS="${EM_OUTER_ITERS:-20}"
 EM_M_STEPS="${EM_M_STEPS:-1000}"
 EM_ENCODER_LR="${EM_ENCODER_LR:-5e-5}"
 EM_ENCODER_MAX_GRAD="${EM_ENCODER_MAX_GRAD:-1.0}"
-EM_WARMUP_OUTER_ITERS="${EM_WARMUP_OUTER_ITERS:-8}"
+EM_WARMUP_OUTER_ITERS="${EM_WARMUP_OUTER_ITERS:-2}"
 EM_VAL_EVERY="${EM_VAL_EVERY:-2}"
 EM_HER_SAMPLES="${EM_HER_SAMPLES:-1}"
 EM_HER_REFRESH="${EM_HER_REFRESH:-0}"
-EM_SAVE_EVAL_CKPTS="${EM_SAVE_EVAL_CKPTS:-false}"
+EM_SAVE_EVAL_CKPTS="${EM_SAVE_EVAL_CKPTS:-true}"
 EM_SAVE_OUTER_CKPTS="${EM_SAVE_OUTER_CKPTS:-false}"
 EM_ENCODER_DIAGNOSTICS="${EM_ENCODER_DIAGNOSTICS:-false}"
 EM_ENCODER_DIAGNOSTICS_EVERY="${EM_ENCODER_DIAGNOSTICS_EVERY:-50}"
@@ -66,7 +73,7 @@ IQL_TARGET_HORIZONS="${IQL_TARGET_HORIZONS:-[1,2,3,4,5,6]}"
 IQL_HORIZON_TERMINAL_DONE="${IQL_HORIZON_TERMINAL_DONE:-true}"
 EVAL_TAU_LIST="${EVAL_TAU_LIST:-[1,2,3,4,5,6]}"
 VAL_METRIC="${VAL_METRIC:-rmse_uns}"
-EM_VAL_TAU_AGG="${EM_VAL_TAU_AGG:-mean}"
+EM_VAL_TAU_AGG="${EM_VAL_TAU_AGG:-max}"
 GPU_WAIT_MEMORY_MB="${GPU_WAIT_MEMORY_MB:-1000}"
 GPU_WAIT_SECONDS="${GPU_WAIT_SECONDS:-60}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-em_iql_local_global_gift_protocol}"
@@ -81,7 +88,7 @@ mkdir -p "${GRID_ROOT}/logs" "${GRID_ROOT}/ckpts" "${GRID_ROOT}/done"
 
 SUMMARY="${GRID_ROOT}/summary.csv"
 if [[ ! -f "${SUMMARY}" ]]; then
-  echo "combo_id,seed,split,local_conv_layers,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,iql_tau,iql_actor_lr,iql_qf_lr,iql_vf_lr,iql_beta,iql_weight_max,iql_max_grad_norm,em_m_steps_per_outer,em_her_samples_per_transition,em_her_refresh_every,best_outer,best_val_metric,best_val_score,eval_tau,eval_mae_norm,eval_mae_uns,eval_rmse_norm,eval_rmse_norm_x_std,eval_rmse_uns,gift_rmse,gift_rmse_percent,gift_mae_percent,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
+  echo "combo_id,seed,split,local_conv_layers,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,iql_tau,iql_actor_lr,iql_qf_lr,iql_vf_lr,iql_beta,iql_weight_max,iql_max_grad_norm,em_m_steps_per_outer,em_her_samples_per_transition,em_her_refresh_every,em_warmup_outer_iters,best_outer,best_val_metric,best_val_score,eval_tau,eval_mae_norm,eval_mae_uns,eval_rmse_norm,eval_rmse_norm_x_std,eval_rmse_uns,gift_rmse,gift_rmse_percent,gift_mae_percent,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
 fi
 
 MLFLOW_URI_ARGS=()
@@ -139,8 +146,8 @@ append_eval_rows() {
   local eval_log="$9"
   local finished_at="${10}"
 
-  python - "${SUMMARY}" "${combo_id}" "${seed}" "${split}" "${IQL_TAU}" "${IQL_ACTOR_LR}" "${IQL_QF_LR}" "${IQL_VF_LR}" \
-    "${IQL_BETA}" "${IQL_WEIGHT_MAX}" "${IQL_MAX_GRAD}" "${EM_M_STEPS}" "${EM_HER_SAMPLES}" "${EM_HER_REFRESH}" \
+  python - "${SUMMARY}" "${combo_id}" "${seed}" "${split}" "${DATASET_TRAIN}" "${DATASET_VAL}" "${DATASET_TEST}" "${MAX_SEQ_LENGTH}" "${MIN_SEQ_LENGTH}" "${IQL_TAU}" "${IQL_ACTOR_LR}" "${IQL_QF_LR}" "${IQL_VF_LR}" \
+    "${IQL_BETA}" "${IQL_WEIGHT_MAX}" "${IQL_MAX_GRAD}" "${EM_M_STEPS}" "${EM_HER_SAMPLES}" "${EM_HER_REFRESH}" "${EM_WARMUP_OUTER_ITERS}" \
     "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY'
 import csv
 import os
@@ -148,8 +155,9 @@ import re
 import sys
 
 (
-    summary_path, combo_id, seed, split, iql_tau, actor_lr, qf_lr, vf_lr,
-    iql_beta, iql_weight_max, iql_max_grad, em_m_steps, em_her_samples, em_her_refresh,
+    summary_path, combo_id, seed, split, dataset_train, dataset_val, dataset_test, max_seq_length, min_seq_length,
+    iql_tau, actor_lr, qf_lr, vf_lr,
+    iql_beta, iql_weight_max, iql_max_grad, em_m_steps, em_her_samples, em_her_refresh, em_warmup_outer_iters,
     best_outer, best_val_metric, best_val_score, em_ckpt, train_log, eval_log, finished_at
 ) = sys.argv[1:]
 
@@ -214,7 +222,7 @@ fieldnames = [
     "combo_id", "seed", "split", "local_conv_layers", "dataset_train", "dataset_val", "dataset_test",
     "max_seq_length", "min_seq_length", "iql_tau", "iql_actor_lr", "iql_qf_lr", "iql_vf_lr",
     "iql_beta", "iql_weight_max", "iql_max_grad_norm", "em_m_steps_per_outer", "em_her_samples_per_transition",
-    "em_her_refresh_every", "best_outer", "best_val_metric", "best_val_score", "eval_tau", "eval_mae_norm",
+    "em_her_refresh_every", "em_warmup_outer_iters", "best_outer", "best_val_metric", "best_val_score", "eval_tau", "eval_mae_norm",
     "eval_mae_uns", "eval_rmse_norm", "eval_rmse_norm_x_std", "eval_rmse_uns", "gift_rmse",
     "gift_rmse_percent", "gift_mae_percent", "em_ckpt", "train_log", "eval_log", "finished_at",
 ]
@@ -226,11 +234,11 @@ with open(summary_path, "a", newline="", encoding="utf-8") as f:
             "seed": seed,
             "split": split,
             "local_conv_layers": "1",
-            "dataset_train": "1000",
-            "dataset_val": "200",
-            "dataset_test": "200",
-            "max_seq_length": "40",
-            "min_seq_length": "40",
+            "dataset_train": dataset_train,
+            "dataset_val": dataset_val,
+            "dataset_test": dataset_test,
+            "max_seq_length": max_seq_length,
+            "min_seq_length": min_seq_length,
             "iql_tau": iql_tau,
             "iql_actor_lr": actor_lr,
             "iql_qf_lr": qf_lr,
@@ -241,6 +249,7 @@ with open(summary_path, "a", newline="", encoding="utf-8") as f:
             "em_m_steps_per_outer": em_m_steps,
             "em_her_samples_per_transition": em_her_samples,
             "em_her_refresh_every": em_her_refresh,
+            "em_warmup_outer_iters": em_warmup_outer_iters,
             "best_outer": best_outer,
             "best_val_metric": best_val_metric,
             "best_val_score": best_val_score,
@@ -292,7 +301,7 @@ run_one() {
   bcalpha_id="${bcalpha_id//-/m}"
   bcalpha_id="${bcalpha_id//+/p}"
   bcalpha_id="${bcalpha_id//[^A-Za-z0-9pm]/}"
-  local combo_id="gift40_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_w${wmax_id}_actor${actor_id}_qa${qalpha_id}_bc${bcalpha_id}_enc${enc_lr_id}_eg${enc_grad_id}_val${VAL_METRIC}_${sampling_id}_${reward_id}_her${EM_HER_SAMPLES}"
+  local combo_id="seq${MAX_SEQ_LENGTH}_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_w${wmax_id}_actor${actor_id}_qa${qalpha_id}_bc${bcalpha_id}_enc${enc_lr_id}_eg${enc_grad_id}_val${VAL_METRIC}_${sampling_id}_${reward_id}_her${EM_HER_SAMPLES}"
   if [[ "${EM_ENCODER_DIAGNOSTICS}" == "true" ]]; then
     combo_id="${combo_id}_encdiag${EM_ENCODER_DIAGNOSTICS_EVERY}"
   fi
@@ -321,12 +330,13 @@ run_one() {
   mkdir -p "${em_dir}" "${log_dir}"
 
   echo "========== ${tag} =========="
-  echo "  GIFT data protocol: train/val/test=1000/200/200, max_seq_length=40"
+  echo "  Tumor data protocol: train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST}, max_seq_length=${MAX_SEQ_LENGTH}, min_seq_length=${MIN_SEQ_LENGTH}"
   echo "  seed=${seed} gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
   echo "  local_conv_layers=${local_layers}"
   echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
   echo "  iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} iql_weight_max=${IQL_WEIGHT_MAX}"
   echo "  iql_actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
+  echo "  iql_cql_alpha=${IQL_CQL_ALPHA} iql_cql_n_actions=${IQL_CQL_N_ACTIONS}"
   echo "  iql_actor_bc_loss=${IQL_ACTOR_BC_LOSS} iql_actor_bc_expectile=${IQL_ACTOR_BC_EXPECTILE}"
   echo "  val_metric=${VAL_METRIC} em_val_tau_agg=${EM_VAL_TAU_AGG} val_tau_list=${EVAL_TAU_LIST}"
   echo "  em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} em_m_steps=${EM_M_STEPS} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS}"
@@ -339,11 +349,11 @@ run_one() {
   CUDA_VISIBLE_DEVICES="${GPU}" python -u runnables/train_ct_iql_em.py \
     +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${GAMMA}*" \
     exp.seed="${seed}" dataset.coeff="${GAMMA}" \
-    "dataset.num_patients.train=1000" \
-    "dataset.num_patients.val=200" \
-    "dataset.num_patients.test=200" \
-    "dataset.max_seq_length=40" \
-    "+dataset.min_seq_length=40" \
+    "dataset.num_patients.train=${DATASET_TRAIN}" \
+    "dataset.num_patients.val=${DATASET_VAL}" \
+    "dataset.num_patients.test=${DATASET_TEST}" \
+    "dataset.max_seq_length=${MAX_SEQ_LENGTH}" \
+    "+dataset.min_seq_length=${MIN_SEQ_LENGTH}" \
     "exp.load_data=false" \
     "model.inference.local_conv_layers=${local_layers}" \
     "exp.em_her_refresh_every=${EM_HER_REFRESH}" \
@@ -363,6 +373,10 @@ run_one() {
     "exp.iql_actor_bc_expectile=${IQL_ACTOR_BC_EXPECTILE}" \
     "exp.iql_td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA}" \
     "exp.iql_td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}" \
+    "exp.iql_cql_alpha=${IQL_CQL_ALPHA}" \
+    "exp.iql_cql_n_actions=${IQL_CQL_N_ACTIONS}" \
+    "exp.iql_val_worlds=[sim]" \
+    "exp.iql_val_selection_world=sim" \
     "exp.iql_tau=${IQL_TAU}" \
     "exp.iql_actor_lr=${IQL_ACTOR_LR}" \
     "exp.iql_qf_lr=${IQL_QF_LR}" \
@@ -400,11 +414,11 @@ run_one() {
     +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${GAMMA}*" \
     exp.seed="${seed}" dataset.coeff="${GAMMA}" \
     exp.test="${TEST_SPLIT}" \
-    "dataset.num_patients.train=1000" \
-    "dataset.num_patients.val=200" \
-    "dataset.num_patients.test=200" \
-    "dataset.max_seq_length=40" \
-    "+dataset.min_seq_length=40" \
+    "dataset.num_patients.train=${DATASET_TRAIN}" \
+    "dataset.num_patients.val=${DATASET_VAL}" \
+    "dataset.num_patients.test=${DATASET_TEST}" \
+    "dataset.max_seq_length=${MAX_SEQ_LENGTH}" \
+    "+dataset.min_seq_length=${MIN_SEQ_LENGTH}" \
     "exp.load_data=false" \
     "model.inference.local_conv_layers=${local_layers}" \
     "exp.em_eval_ckpt=${em_ckpt}" \
@@ -430,11 +444,11 @@ run_one() {
     echo "seed=${seed}"
     echo "split=${split}"
     echo "gift_protocol=true"
-    echo "dataset_train=1000"
-    echo "dataset_val=200"
-    echo "dataset_test=200"
-    echo "max_seq_length=40"
-    echo "min_seq_length=40"
+    echo "dataset_train=${DATASET_TRAIN}"
+    echo "dataset_val=${DATASET_VAL}"
+    echo "dataset_test=${DATASET_TEST}"
+    echo "max_seq_length=${MAX_SEQ_LENGTH}"
+    echo "min_seq_length=${MIN_SEQ_LENGTH}"
     echo "iql_target_sampling=${IQL_TARGET_SAMPLING}"
     echo "iql_target_horizons=${IQL_TARGET_HORIZONS}"
     echo "iql_horizon_terminal_done=${IQL_HORIZON_TERMINAL_DONE}"
@@ -454,9 +468,10 @@ run_one() {
 echo "[gift-protocol] one-stage EM+IQL local-global"
 echo "[gift-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
 echo "[gift-protocol] seeds=(${SEEDS[*]})"
-echo "[gift-protocol] data train/val/test=1000/200/200 max_seq_length=40"
+echo "[gift-protocol] data train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST} max_seq_length=${MAX_SEQ_LENGTH} min_seq_length=${MIN_SEQ_LENGTH}"
 echo "[gift-protocol] iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
 echo "[gift-protocol] beta=${IQL_BETA} adv_max=${IQL_ADV_MAX} weight_max=${IQL_WEIGHT_MAX} actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA} grad=${IQL_MAX_GRAD} outer_iters=${EM_OUTER_ITERS} m_steps=${EM_M_STEPS} em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS} val_every=${EM_VAL_EVERY} eval_tau_list=${EVAL_TAU_LIST}"
+echo "[gift-protocol] cql_alpha=${IQL_CQL_ALPHA} cql_n_actions=${IQL_CQL_N_ACTIONS}"
 echo "[gift-protocol] save_outer_ckpts=${EM_SAVE_OUTER_CKPTS} save_eval_ckpts=${EM_SAVE_EVAL_CKPTS}"
 echo "[gift-protocol] goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
 echo "[gift-protocol] target_sampling=${IQL_TARGET_SAMPLING} target_horizons=${IQL_TARGET_HORIZONS} horizon_terminal_done=${IQL_HORIZON_TERMINAL_DONE} her_samples=${EM_HER_SAMPLES}"
