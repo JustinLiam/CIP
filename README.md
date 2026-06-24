@@ -52,12 +52,6 @@ GRID_ROOT=grid_results/stable_gift_protocol_best_$(date +%Y%m%d) \
 GRID_SEEDS="20 202 2020 20202 202020" \
 TEST_SPLIT=true \
 FORCE=1 \
-DATASET_TRAIN=1000 \
-DATASET_VAL=200 \
-DATASET_TEST=200 \
-MAX_SEQ_LENGTH=60 \
-MIN_SEQ_LENGTH=60 \
-EM_WARMUP_OUTER_ITERS=2 \
 bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
 ```
 
@@ -69,10 +63,8 @@ For a single diagnostic seed, run:
 GRID_ROOT=grid_results/stable_gift_protocol_seed2_$(date +%Y%m%d) \
 GRID_SEEDS="2" \
 TEST_SPLIT=true \
+IQL_WEIGHT_MAX=5.0 \
 FORCE=1 \
-MAX_SEQ_LENGTH=60 \
-MIN_SEQ_LENGTH=60 \
-EM_WARMUP_OUTER_ITERS=2 \
 bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
 ```
 

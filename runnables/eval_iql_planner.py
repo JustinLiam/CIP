@@ -1,11 +1,12 @@
 """
 Evaluate IQL planner with the same simulator and RMSE metric as VAEModel.optimize_interventions_onetime:
-  output_after_actions = fold.simulate_output_after_actions(H_t, a_seq, train_scaling_params)
-  RMSE on normalized cancer_volume vs targets['outputs'][:, -1, :], then × std (cancer) like VCIP.
+  closed_loop_y = final y_norm observed during autoregressive rollout
+  RMSE on normalized cancer_volume vs targets['outputs'][:, -1, :], then × std (cancer).
 
 By default (``exp.iql_eval_autoregressive=true``) the planned sequence is built autoregressively: each step
 re-encodes with ``ct_hidden_history`` after appending the chosen action and one-step simulated outcome.
-The final RMSE still uses the original prefix ``H_t`` and the full ``a_seq`` (same closed-loop sim as VCIP).
+The main RMSE uses the final one-step outcome from that closed-loop rollout. The legacy full-sequence replay
+metric is also logged as ``sequence_replay_rmse`` for diagnostics.
 
 Logs aggregate **t+tau** tumor volume under the IQL plan vs ``targets['outputs'][:, -1]``, in normalized
 (train scaling) and unscaled (raw simulator scale) space.
@@ -307,9 +308,11 @@ def main(args: DictConfig):
             )
 
             losses = []
+            sequence_replay_losses = []
             losses_2 = []
             ture_output_list = []
             output_after_actions_list = []
+            sequence_replay_output_after_actions_list = []
             ture_output_actions_list = []
 
             with torch.no_grad():
@@ -328,6 +331,7 @@ def main(args: DictConfig):
                             H_work["current_treatments"], H_work.get("active_entries")
                         ).clone()
                         planned = []
+                        closed_loop_output_after_actions = None
                         for step in range(tau):
                             H_work = align_h_t_static_to_history(H_work)
                             z, _, _ = inference_model.ct_hidden_history(H_work)
@@ -355,6 +359,7 @@ def main(args: DictConfig):
                             _extend_h_work_after_one_step(
                                 H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
                             )
+                            closed_loop_output_after_actions = y_norm.detach().cpu().numpy()
                             a_prev_sim = a_sim
                         a_seq = torch.stack(planned, dim=1).contiguous()
                     else:
@@ -390,13 +395,19 @@ def main(args: DictConfig):
                             a_sim, action_eval_scale, action_eval_shift
                         )
                         a_seq = torch.tensor(a_sim, device=device, dtype=torch.float32).unsqueeze(1).expand(-1, tau, -1).contiguous()
+                        closed_loop_output_after_actions = None
 
-                    output_after_actions = fold.simulate_output_after_actions(
+                    sequence_replay_output_after_actions = fold.simulate_output_after_actions(
                         H_t, a_seq, dataset_collection.train_scaling_params
                     )
+                    if closed_loop_output_after_actions is None:
+                        closed_loop_output_after_actions = sequence_replay_output_after_actions
+                    output_after_actions = closed_loop_output_after_actions
                     ture_output = targets["outputs"][:, -1, :].detach().cpu().numpy()
                     loss = np.sqrt(((output_after_actions - ture_output) ** 2).mean())
+                    sequence_replay_loss = np.sqrt(((sequence_replay_output_after_actions - ture_output) ** 2).mean())
                     losses.append(loss)
+                    sequence_replay_losses.append(sequence_replay_loss)
 
                     true_actions = targets["current_treatments"]
                     ture_output_actions = fold.simulate_output_after_actions(
@@ -407,25 +418,40 @@ def main(args: DictConfig):
 
                     ture_output_list.append(ture_output)
                     output_after_actions_list.append(output_after_actions)
+                    sequence_replay_output_after_actions_list.append(sequence_replay_output_after_actions)
                     ture_output_actions_list.append(ture_output_actions)
 
-                    logger.info(f"Batch {i} RMSE (IQL plan): {loss:.6f}, RMSE (factual actions): {loss_2:.6f}")
+                    logger.info(
+                        f"Batch {i} RMSE (closed-loop plan): {loss:.6f}, "
+                        f"RMSE (sequence replay): {sequence_replay_loss:.6f}, "
+                        f"RMSE (factual actions): {loss_2:.6f}"
+                    )
 
             ture_output_list = np.concatenate(ture_output_list, axis=0)
             output_after_actions_list = np.concatenate(output_after_actions_list, axis=0)
+            sequence_replay_output_after_actions_list = np.concatenate(sequence_replay_output_after_actions_list, axis=0)
             ture_output_actions_list = np.concatenate(ture_output_actions_list, axis=0)
 
             rmse_norm = float(np.sqrt(((output_after_actions_list - ture_output_list) ** 2).mean()))
+            sequence_replay_rmse_norm = float(np.sqrt(((sequence_replay_output_after_actions_list - ture_output_list) ** 2).mean()))
             rmse_factual_norm = float(np.sqrt(((ture_output_actions_list - ture_output_list) ** 2).mean()))
 
             iql_y_norm = output_after_actions_list.reshape(-1)
             true_y_norm = ture_output_list.reshape(-1)
             iql_y_uns = _unscaled_cancer_volume_np(output_after_actions_list, mean_ser, std_ser).reshape(-1)
+            sequence_replay_y_uns = _unscaled_cancer_volume_np(
+                sequence_replay_output_after_actions_list, mean_ser, std_ser
+            ).reshape(-1)
             true_y_uns = _unscaled_cancer_volume_np(ture_output_list, mean_ser, std_ser).reshape(-1)
 
             mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
             mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
             rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
+            sequence_replay_mae_norm = float(
+                np.mean(np.abs(sequence_replay_output_after_actions_list.reshape(-1) - true_y_norm))
+            )
+            sequence_replay_mae_uns = float(np.mean(np.abs(sequence_replay_y_uns - true_y_uns)))
+            sequence_replay_rmse_uns = float(np.sqrt(np.mean((sequence_replay_y_uns - true_y_uns) ** 2)))
             gift_tumor_norm_const = float(
                 OmegaConf.select(args, "exp.gift_tumor_volume_normalizer", default=GIFT_TUMOR_VOLUME_NORMALIZER)
             )
@@ -435,12 +461,15 @@ def main(args: DictConfig):
             gift_rmse_percent = float(rmse_uns / gift_tumor_norm_const * 100.0)
             gift_mae_percent = float(mae_uns / gift_tumor_norm_const * 100.0)
 
-            logger.info("--- Aggregate (same protocol as optimize_interventions_onetime) ---")
+            logger.info("--- Aggregate closed-loop online policy metric ---")
             logger.info(f"Split: {split_name}")
-            logger.info(f"Mean per-batch RMSE (IQL): {float(np.mean(losses)):.6f}")
+            logger.info(f"Mean per-batch RMSE (closed-loop IQL): {float(np.mean(losses)):.6f}")
+            logger.info(f"Mean per-batch RMSE (sequence replay): {float(np.mean(sequence_replay_losses)):.6f}")
             logger.info(f"Mean per-batch RMSE (factual traj): {float(np.mean(losses_2)):.6f}")
             logger.info(f"Global RMSE on stacked batches (normalized space): {rmse_norm:.6f}")
+            logger.info(f"Sequence replay RMSE on stacked batches (normalized space): {sequence_replay_rmse_norm:.6f}")
             logger.info(f"Global RMSE × std (cancer volume scale, VCIP-style): {rmse_norm * std:.6f}")
+            logger.info(f"Sequence replay RMSE × std: {sequence_replay_rmse_norm * std:.6f}")
             logger.info(f"Factual global RMSE × std: {rmse_factual_norm * std:.6f}")
 
             logger.info("--- t+tau tumor volume (IQL planned actions vs target outputs[:, -1]) ---")
@@ -477,6 +506,14 @@ def main(args: DictConfig):
                 "mae_uns": mae_uns,
                 "rmse_uns": rmse_uns,
                 "rmse_norm": rmse_norm,
+                "closed_loop_rmse": rmse_uns,
+                "closed_loop_rmse_uns": rmse_uns,
+                "closed_loop_rmse_norm": rmse_norm,
+                "sequence_replay_rmse": sequence_replay_rmse_uns,
+                "sequence_replay_rmse_uns": sequence_replay_rmse_uns,
+                "sequence_replay_rmse_norm": sequence_replay_rmse_norm,
+                "sequence_replay_mae_uns": sequence_replay_mae_uns,
+                "sequence_replay_mae_norm": sequence_replay_mae_norm,
                 "gift_rmse": gift_rmse,
                 "gift_rmse_percent": gift_rmse_percent,
                 "gift_mae_percent": gift_mae_percent,

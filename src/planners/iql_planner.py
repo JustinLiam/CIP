@@ -38,8 +38,12 @@ class IQLPlannerConfig:
     actor_bc_expectile: float = 0.7
     td3bc_q_alpha: float = 2.5
     td3bc_bc_alpha: float = 1.0
+    td3bc_action_penalty_alpha: float = 0.0
     cql_alpha: float = 0.0
     cql_n_actions: int = 10
+    q_high_action_penalty_alpha: float = 0.0
+    q_high_action_penalty_margin: float = 0.0
+    q_high_action_penalty_n_actions: int = 1
     discount: float = 0.99
     tau: float = 0.005
     actor_lr: float = 3e-4
@@ -505,6 +509,9 @@ class IQLPlanner:
             q_loss = q_loss + cql_loss
             log_dict["cql_loss"] = float(cql_loss.detach().item())
             log_dict["cql_alpha"] = float(self.cfg.cql_alpha)
+        high_action_loss = self._q_high_action_penalty(observations, actions, q1, q2, log_dict=log_dict)
+        if high_action_loss is not None:
+            q_loss = q_loss + high_action_loss
         self.q_optimizer.zero_grad()
         q_loss.backward()
         if self.cfg.max_grad_norm is not None:
@@ -535,6 +542,17 @@ class IQLPlanner:
         alpha = float(self.cfg.td3bc_q_alpha)
         denom = q_values.detach().abs().mean().clamp(min=1e-6)
         return q_values.new_tensor(alpha) / denom
+
+    def _td3bc_action_deviation_term(
+        self,
+        pi_action: torch.Tensor,
+        data_action: torch.Tensor,
+        w: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        losses = (pi_action - data_action).pow(2).sum(-1)
+        if w is None:
+            return losses.mean()
+        return _weighted_mean(losses, w)
 
     def _cql_regularizer(
         self,
@@ -567,6 +585,54 @@ class IQLPlanner:
             cql = 0.5 * (_weighted_mean(cql1, w) + _weighted_mean(cql2, w))
         return cql * q1_data.new_tensor(alpha)
 
+    def _q_high_action_penalty(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+        q1_data: torch.Tensor,
+        q2_data: torch.Tensor,
+        w: Optional[torch.Tensor] = None,
+        log_dict: Optional[Dict[str, float]] = None,
+    ) -> Optional[torch.Tensor]:
+        alpha = float(self.cfg.q_high_action_penalty_alpha)
+        n_actions = int(self.cfg.q_high_action_penalty_n_actions)
+        if alpha <= 0.0 or n_actions <= 0:
+            return None
+        batch_size = int(actions.shape[0])
+        if batch_size <= 0:
+            return None
+
+        max_action = float(self.cfg.max_action)
+        upper_room = (max_action - actions.detach()).clamp_min(0.0)
+        u = torch.rand(
+            batch_size,
+            n_actions,
+            int(self.cfg.action_dim),
+            device=actions.device,
+            dtype=actions.dtype,
+        )
+        high_actions = actions.detach().unsqueeze(1) + u * upper_room.unsqueeze(1)
+        obs_rep = observations.repeat_interleave(n_actions, dim=0)
+        q1_high, q2_high = self.qf.both(obs_rep, high_actions.reshape(batch_size * n_actions, -1))
+        q1_high = q1_high.view(batch_size, n_actions)
+        q2_high = q2_high.view(batch_size, n_actions)
+        q1_ref = q1_data.detach().view(batch_size, 1)
+        q2_ref = q2_data.detach().view(batch_size, 1)
+        margin = q1_data.new_tensor(float(self.cfg.q_high_action_penalty_margin))
+        excess1 = F.relu(q1_high - q1_ref + margin).pow(2)
+        excess2 = F.relu(q2_high - q2_ref + margin).pow(2)
+        per_sample = 0.5 * (excess1.mean(dim=1) + excess2.mean(dim=1))
+        penalty = per_sample.mean() if w is None else _weighted_mean(per_sample, w)
+        penalty = penalty * q1_data.new_tensor(alpha)
+        if log_dict is not None:
+            positive = 0.5 * (
+                (excess1 > 0.0).float().mean() + (excess2 > 0.0).float().mean()
+            )
+            log_dict["q_high_action_penalty"] = float(penalty.detach().item())
+            log_dict["q_high_action_penalty_alpha"] = alpha
+            log_dict["q_high_action_penalty_positive_frac"] = float(positive.detach().item())
+        return penalty
+
     def _update_policy_td3bc(
         self,
         observations: torch.Tensor,
@@ -593,7 +659,13 @@ class IQLPlanner:
                 denom = w.sum().clamp(min=1e-8)
                 q_term = (w * q_pi).sum() / denom
                 bc_term = (w * bc_losses).sum() / denom
-            policy_loss = -q_coef * q_term + float(self.cfg.td3bc_bc_alpha) * bc_term
+            action_penalty = self._td3bc_action_deviation_term(pi_action, actions, w=w)
+            action_penalty_alpha = float(self.cfg.td3bc_action_penalty_alpha)
+            policy_loss = (
+                -q_coef * q_term
+                + float(self.cfg.td3bc_bc_alpha) * bc_term
+                + action_penalty_alpha * action_penalty
+            )
             self.actor_optimizer.zero_grad(set_to_none=True)
             policy_loss.backward()
             if self.cfg.max_grad_norm is not None:
@@ -609,6 +681,8 @@ class IQLPlanner:
         log_dict["actor_td3bc_q_term"] = float(q_term.detach().item())
         log_dict["actor_td3bc_bc_loss"] = float(bc_term.detach().item())
         log_dict["actor_td3bc_q_coef"] = float(q_coef.detach().item())
+        log_dict["actor_td3bc_action_penalty"] = float(action_penalty.detach().item())
+        log_dict["actor_td3bc_action_penalty_alpha"] = float(self.cfg.td3bc_action_penalty_alpha)
 
     def _update_policy_bc(
         self,
@@ -663,7 +737,13 @@ class IQLPlanner:
             else:
                 awr_term = _weighted_mean(awr_losses, w)
                 q_term = _weighted_mean(q_pi, w)
-            policy_loss = float(self.cfg.td3bc_bc_alpha) * awr_term - q_coef * q_term
+            action_penalty = self._td3bc_action_deviation_term(pi_action, actions, w=w)
+            action_penalty_alpha = float(self.cfg.td3bc_action_penalty_alpha)
+            policy_loss = (
+                float(self.cfg.td3bc_bc_alpha) * awr_term
+                - q_coef * q_term
+                + action_penalty_alpha * action_penalty
+            )
             self.actor_optimizer.zero_grad(set_to_none=True)
             policy_loss.backward()
             if self.cfg.max_grad_norm is not None:
@@ -681,6 +761,8 @@ class IQLPlanner:
         log_dict["actor_awr_td3bc_awr_loss"] = float(awr_term.detach().item())
         log_dict["actor_awr_td3bc_q_term"] = float(q_term.detach().item())
         log_dict["actor_awr_td3bc_q_coef"] = float(q_coef.detach().item())
+        log_dict["actor_awr_td3bc_action_penalty"] = float(action_penalty.detach().item())
+        log_dict["actor_awr_td3bc_action_penalty_alpha"] = float(self.cfg.td3bc_action_penalty_alpha)
 
     def _update_policy(self, adv, observations, actions, log_dict):
         """
@@ -781,6 +863,16 @@ class IQLPlanner:
             q_loss = q_loss + cql_loss
             log_dict["cql_loss"] = float(cql_loss.detach().item())
             log_dict["cql_alpha"] = float(self.cfg.cql_alpha)
+        high_action_loss = self._q_high_action_penalty(
+            observations,
+            actions,
+            q1,
+            q2,
+            w=w,
+            log_dict=log_dict,
+        )
+        if high_action_loss is not None:
+            q_loss = q_loss + high_action_loss
 
         self.q_optimizer.zero_grad(set_to_none=True)
         encoder_optimizer.zero_grad(set_to_none=True)
@@ -975,8 +1067,12 @@ class IQLPlanner:
         cfg_dict.setdefault("actor_bc_expectile", 0.7)
         cfg_dict.setdefault("td3bc_q_alpha", 2.5)
         cfg_dict.setdefault("td3bc_bc_alpha", 1.0)
+        cfg_dict.setdefault("td3bc_action_penalty_alpha", 0.0)
         cfg_dict.setdefault("cql_alpha", 0.0)
         cfg_dict.setdefault("cql_n_actions", 10)
+        cfg_dict.setdefault("q_high_action_penalty_alpha", 0.0)
+        cfg_dict.setdefault("q_high_action_penalty_margin", 0.0)
+        cfg_dict.setdefault("q_high_action_penalty_n_actions", 1)
         cfg_dict.setdefault("goal_adapter_enabled", False)
         cfg_dict.setdefault("z_dim", None)
         cfg_dict.setdefault("output_dim", None)

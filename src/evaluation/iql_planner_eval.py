@@ -523,6 +523,7 @@ def aggregate_iql_planner_metrics(
     collect_series = bool(return_series or debug_panel)
     ture_output_list: list = []
     per_world_pred: Dict[str, list] = {w: [] for w in worlds}
+    per_world_sequence_replay_pred: Dict[str, list] = {w: [] for w in worlds}
     per_world_fact: Dict[str, list] = {w: [] for w in worlds} if include_factual_traj_rmse else {w: [] for w in worlds}
     per_world_batch_rmse_plan: Dict[str, list] = {w: [] for w in worlds}
     per_world_batch_rmse_fact: Dict[str, list] = {w: [] for w in worlds}
@@ -575,6 +576,7 @@ def aggregate_iql_planner_metrics(
                     planned = []
                     history_checks = []
                     first_obs = None
+                    closed_loop_output_after_actions = None
                     for step in range(tau):
                         H_work = align_h_t_static_to_history(H_work)
                         z, _, _ = inference_model.ct_hidden_history(H_work)
@@ -609,6 +611,7 @@ def aggregate_iql_planner_metrics(
                         _extend_h_work_after_one_step(
                             H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
                         )
+                        closed_loop_output_after_actions = y_norm.detach().cpu().numpy()
                         if world_debug is not None and len(history_checks) < 2:
                             post_len = int(H_work["outputs"].size(1))
                             appended_action_ok = bool(torch.allclose(
@@ -687,6 +690,7 @@ def aggregate_iql_planner_metrics(
                         .expand(-1, tau, -1)
                         .contiguous()
                     )
+                    closed_loop_output_after_actions = None
                     if world_debug is not None:
                         world_debug["history_checks"] = []
                         world_debug["history_updates_ok"] = True
@@ -715,13 +719,17 @@ def aggregate_iql_planner_metrics(
                         "max": float(a_seq_np.max()),
                     }
 
-                output_after_actions = _simulate_a_seq_final_y(
+                sequence_replay_output_after_actions = _simulate_a_seq_final_y(
                     world, H_t, a_seq,
                     fold=fold, scaling_params=scaling_params,
                     inference_model=inference_model, device=device,
                     mean_ser=mean_ser, std_ser=std_ser,
                 )
+                if closed_loop_output_after_actions is None:
+                    closed_loop_output_after_actions = sequence_replay_output_after_actions
+                output_after_actions = closed_loop_output_after_actions
                 per_world_pred[world].append(output_after_actions)
+                per_world_sequence_replay_pred[world].append(sequence_replay_output_after_actions)
 
                 if include_factual_traj_rmse:
                     true_actions = targets["current_treatments"]
@@ -766,6 +774,31 @@ def aggregate_iql_planner_metrics(
             batch_rmse_fact=per_world_batch_rmse_fact[world] if include_factual_traj_rmse else None,
             return_series=collect_series,
         )
+        sequence_replay_metrics = _compute_world_metrics(
+            output_after_actions_list=per_world_sequence_replay_pred[world],
+            ture_output_list=ture_output_list,
+            factual_output_list=None,
+            mean_ser=mean_ser,
+            std_ser=std_ser,
+            std=std,
+            batch_rmse_plan=[],
+            batch_rmse_fact=None,
+            return_series=False,
+        )
+        per_world_metrics[world].update({
+            "closed_loop_rmse": per_world_metrics[world]["rmse_uns"],
+            "closed_loop_rmse_uns": per_world_metrics[world]["rmse_uns"],
+            "closed_loop_rmse_norm": per_world_metrics[world]["rmse_norm"],
+            "closed_loop_mae_uns": per_world_metrics[world]["mae_uns"],
+            "closed_loop_mae_norm": per_world_metrics[world]["mae_norm"],
+            "sequence_replay_rmse": sequence_replay_metrics["rmse_uns"],
+            "sequence_replay_rmse_uns": sequence_replay_metrics["rmse_uns"],
+            "sequence_replay_rmse_norm": sequence_replay_metrics["rmse_norm"],
+            "sequence_replay_mae_uns": sequence_replay_metrics["mae_uns"],
+            "sequence_replay_mae_norm": sequence_replay_metrics["mae_norm"],
+            "sequence_replay_gift_rmse": sequence_replay_metrics["gift_rmse"],
+            "sequence_replay_gift_rmse_percent": sequence_replay_metrics["gift_rmse_percent"],
+        })
         if action_diagnostics:
             action_diag = _finalize_action_diagnostics(per_world_action_diag[world])
             if action_diag:

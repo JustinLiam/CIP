@@ -397,6 +397,34 @@ def test_awr_td3bc_actor_update_keeps_adv_weights_and_q_gradient():
     assert changed
 
 
+def test_awr_td3bc_action_penalty_logs_support_constraint():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+            actor_update="awr_td3bc",
+            td3bc_q_alpha=0.1,
+            td3bc_action_penalty_alpha=3.0,
+        )
+    )
+    obs = torch.randn(8, 5)
+    actions = torch.clamp(torch.randn(8, 2), -1.0, 1.0)
+    adv = torch.randn(8)
+    for p in planner.qf.parameters():
+        p.grad = None
+    logs = {}
+    planner._update_policy(adv, obs, actions, logs)
+    assert logs["actor_update_awr_td3bc"] == 1.0
+    assert logs["actor_awr_td3bc_action_penalty"] >= 0.0
+    assert logs["actor_awr_td3bc_action_penalty_alpha"] == 3.0
+    assert all(p.grad is None for p in planner.qf.parameters())
+
+
 def test_weighted_mean_does_not_square_policy_losses():
     values = torch.tensor([2.0, 4.0])
     weights = torch.tensor([1.0, 3.0])
@@ -427,6 +455,33 @@ def test_cql_regularizer_logs_when_enabled():
     logs = planner.train_step(batch)
     assert "cql_loss" in logs
     assert logs["cql_alpha"] == 0.01
+
+
+def test_q_high_action_penalty_logs_when_enabled():
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=5,
+            action_dim=2,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device="cpu",
+            q_high_action_penalty_alpha=0.2,
+            q_high_action_penalty_n_actions=2,
+        )
+    )
+    batch = [
+        torch.randn(8, 5),
+        torch.clamp(torch.randn(8, 2), -1.0, 1.0),
+        torch.randn(8, 1),
+        torch.randn(8, 5),
+        torch.zeros(8, 1),
+    ]
+    logs = planner.train_step(batch)
+    assert "q_high_action_penalty" in logs
+    assert logs["q_high_action_penalty_alpha"] == 0.2
+    assert 0.0 <= logs["q_high_action_penalty_positive_frac"] <= 1.0
 
 
 def test_q_grid_action_diagnostics_returns_argmax_and_slope():

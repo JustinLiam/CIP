@@ -118,7 +118,7 @@ exp:
   # iql_tau: expectile 参数，决定“policy value”与“critic value”间的权衡。该值越高，表示算法更乐观、与 offline data 的 policy 匹配度更低、具有更强的探索性；越低则更贴近 offline data，探索性更差。一般建议 0.5~0.9 之间（参考 TD3+BC 和 IQL 论文）。
   iql_tau: 0.7  # revised in April 26, Sunday, by gridsearch in Thinkstation
   iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_weight_max: 1.0
+  iql_weight_max: 3.0
   # Actor extraction update: awr keeps IQL/AWR; bc uses pure behavior cloning;
   # td3bc uses Q-gradient + BC;
   # awr_td3bc keeps advantage-weighted AWR BC and adds a weak Q-gradient term.
@@ -130,8 +130,16 @@ exp:
   iql_actor_bc_expectile: 0.8
   iql_td3bc_q_alpha: 0.0
   iql_td3bc_bc_alpha: 1.0
+  # Optional support/trust-region penalty for TD3+BC variants:
+  # alpha * ||pi(s) - a_data||^2 in policy action space.
+  iql_td3bc_action_penalty_alpha: 0.0
   iql_cql_alpha: 0.0
   iql_cql_n_actions: 10
+  # Optional critic-side high-action overestimation penalty. When enabled, the
+  # Q-step samples actions above logged actions and penalizes Q_high > Q_data.
+  iql_q_high_action_penalty_alpha: 0.0
+  iql_q_high_action_penalty_margin: 0.0
+  iql_q_high_action_penalty_n_actions: 1
   iql_discount: 0.99
   # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
   iql_target_tau: 0.005
@@ -144,7 +152,7 @@ exp:
   iql_val_every: 200
   iql_val_batch_size: null
   # Metric to minimize for best checkpoint: mae_uns | mae_norm | rmse_uns | rmse_norm
-  iql_val_metric: mae_uns
+  iql_val_metric: rmse_uns
   # Also save final-step weights to iql_planner_last.pt when val is enabled
   iql_val_save_last: true
   # Smoothed metrics in train_iql logs: trailing mean over this many steps (default 200)
@@ -191,7 +199,7 @@ exp:
   mlflow_log_artifacts: true
   mlflow_combo_id: ""  # optional tag for grid search / pipeline scripts
   # eval_iql_planner.py: if set, evaluate all horizons in one MLflow run (scheme 3: eval/tau{k}/mae_uns).
-  iql_eval_tau_list: null
+  iql_eval_tau_list: [1,2,3,4,5,6]
   # Horizon-aware IQL: normalize time-to-go; must match eval_iql_planner / EM raw transitions
   max_tau: 12.0
   # Target sampling for goal-conditioned IQL transitions:
@@ -218,7 +226,7 @@ exp:
   em_m_steps_per_outer: 1000
   em_encoder_lr: 5.0e-5
   em_encoder_max_grad_norm: 1.0
-  em_val_every: 2
+  em_val_every: 1
   em_val_metric: rmse_uns
   em_val_tau_list: [1, 2, 3, 4, 5, 6]
   # Multi-tau EM checkpoint selection. mean preserves historical behavior;
@@ -227,7 +235,7 @@ exp:
   em_val_tau_agg: max
   # Save ct_iql_em_outerXXXX.pt at every validation point for checkpoint-selection
   # diagnostics. Keep disabled for normal sweeps to avoid large checkpoint folders.
-  em_save_every_eval_checkpoint: true
+  em_save_every_eval_checkpoint: false
   # Save ct_iql_em_outerXXXX.pt after every outer iteration without running validation.
   # Use this for post-hoc outer-vs-RMSE diagnostics.
   em_save_every_outer_checkpoint: false

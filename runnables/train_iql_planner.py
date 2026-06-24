@@ -29,7 +29,11 @@ logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
-VAL_METRIC_KEYS = ("mae_uns", "mae_norm", "rmse_uns", "rmse_norm", "gift_rmse", "gift_rmse_percent")
+VAL_METRIC_KEYS = (
+    "mae_uns", "mae_norm", "rmse_uns", "rmse_norm", "gift_rmse", "gift_rmse_percent",
+    "closed_loop_rmse", "closed_loop_rmse_uns", "closed_loop_rmse_norm",
+    "sequence_replay_rmse", "sequence_replay_rmse_uns", "sequence_replay_rmse_norm",
+)
 
 
 def _state_dict_to_cpu(obj):
@@ -189,8 +193,20 @@ def main(args: DictConfig):
         actor_bc_expectile=float(OmegaConf.select(args, "exp.iql_actor_bc_expectile", default=0.7)),
         td3bc_q_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_q_alpha", default=2.5)),
         td3bc_bc_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_bc_alpha", default=1.0)),
+        td3bc_action_penalty_alpha=float(
+            OmegaConf.select(args, "exp.iql_td3bc_action_penalty_alpha", default=0.0)
+        ),
         cql_alpha=float(OmegaConf.select(args, "exp.iql_cql_alpha", default=0.0)),
         cql_n_actions=int(OmegaConf.select(args, "exp.iql_cql_n_actions", default=10)),
+        q_high_action_penalty_alpha=float(
+            OmegaConf.select(args, "exp.iql_q_high_action_penalty_alpha", default=0.0)
+        ),
+        q_high_action_penalty_margin=float(
+            OmegaConf.select(args, "exp.iql_q_high_action_penalty_margin", default=0.0)
+        ),
+        q_high_action_penalty_n_actions=int(
+            OmegaConf.select(args, "exp.iql_q_high_action_penalty_n_actions", default=1)
+        ),
         discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
         tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
         actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),
@@ -368,6 +384,8 @@ def main(args: DictConfig):
                         "rmse_uns": float(per_world[w]["rmse_uns"]),
                         "gift_rmse": float(per_world[w]["gift_rmse"]),
                         "gift_rmse_percent": float(per_world[w]["gift_rmse_percent"]),
+                        "closed_loop_rmse": float(per_world[w]["closed_loop_rmse"]),
+                        "sequence_replay_rmse": float(per_world[w]["sequence_replay_rmse"]),
                     }
                     if "action_diagnostics" in per_world[w]:
                         trace_entry[w]["action_diagnostics"] = per_world[w]["action_diagnostics"]
