@@ -34,6 +34,7 @@ from src.planners.iql_planner import IQLPlanner
 from src.utils.em_ckpt import is_em_checkpoint, load_em_for_eval
 from src.utils.inference_ckpt import load_inference_checkpoint
 from src.utils.mlflow_vcip import VCIPMlflowTracker
+from src.utils.stable_iql_em_defaults import stable_select
 from src.utils.utils import repeat_static, set_seed, to_float
 
 logging.basicConfig(level=logging.INFO)
@@ -168,7 +169,7 @@ def _extend_h_work_after_one_step(
 
 
 def _resolve_eval_tau_list(args: DictConfig) -> List[int]:
-    raw = OmegaConf.select(args, "exp.iql_eval_tau_list", default=None)
+    raw = stable_select(args, "exp.iql_eval_tau_list")
     if raw is not None:
         taus = [int(t) for t in list(raw)]
         if taus:
@@ -177,7 +178,7 @@ def _resolve_eval_tau_list(args: DictConfig) -> List[int]:
 
 
 def _resolve_iql_ckpt(args: DictConfig, original_cwd: Path) -> Path:
-    explicit = OmegaConf.select(args, "exp.iql_eval_ckpt", default="")
+    explicit = stable_select(args, "exp.iql_eval_ckpt")
     if explicit:
         p = Path(str(explicit))
         if not p.is_absolute():
@@ -231,7 +232,7 @@ def main(args: DictConfig):
     batch_size = int(OmegaConf.select(args, "exp.batch_size_val", default=128))
 
     inference_model = InferenceModel(args).to(device)
-    em_eval_ckpt = str(OmegaConf.select(args, "exp.em_eval_ckpt", default="")).strip()
+    em_eval_ckpt = str(stable_select(args, "exp.em_eval_ckpt")).strip()
     planner_path = _resolve_iql_ckpt(args, original_cwd)
     em_path = Path(em_eval_ckpt) if em_eval_ckpt else planner_path
     if em_eval_ckpt and not em_path.is_absolute():
@@ -259,18 +260,16 @@ def main(args: DictConfig):
             )
         planner = IQLPlanner.from_checkpoint(str(planner_path), device=device)
     max_action = float(planner.cfg.max_action)
-    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
+    max_tau = float(stable_select(args, "exp.max_tau"))
     if max_tau <= 0:
         raise ValueError("exp.max_tau must be positive for horizon-aware IQL evaluation.")
-    autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
-    action_eval_scale = float(OmegaConf.select(args, "exp.iql_eval_action_scale", default=1.0))
-    action_eval_shift = float(OmegaConf.select(args, "exp.iql_eval_action_shift", default=0.0))
-    action_selector = str(OmegaConf.select(args, "exp.iql_eval_action_selector", default="mean"))
-    action_candidate_actions = int(OmegaConf.select(args, "exp.iql_eval_candidate_actions", default=16))
-    action_q_bc_penalty = float(OmegaConf.select(args, "exp.iql_eval_q_bc_penalty", default=0.0))
-    action_candidate_noise_std = float(
-        OmegaConf.select(args, "exp.iql_eval_candidate_noise_std", default=0.25)
-    )
+    autoregressive_eval = bool(stable_select(args, "exp.iql_eval_autoregressive"))
+    action_eval_scale = float(stable_select(args, "exp.iql_eval_action_scale"))
+    action_eval_shift = float(stable_select(args, "exp.iql_eval_action_shift"))
+    action_selector = str(stable_select(args, "exp.iql_eval_action_selector"))
+    action_candidate_actions = int(stable_select(args, "exp.iql_eval_candidate_actions"))
+    action_q_bc_penalty = float(stable_select(args, "exp.iql_eval_q_bc_penalty"))
+    action_candidate_noise_std = float(stable_select(args, "exp.iql_eval_candidate_noise_std"))
     if action_eval_scale != 1.0 or action_eval_shift != 0.0:
         logger.info(
             "IQL eval action calibration enabled: a_sim <- clip(a_sim * %.6f + %.6f, 0, 1)",

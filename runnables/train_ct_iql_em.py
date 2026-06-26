@@ -8,10 +8,13 @@ import logging
 import os
 import sys
 import ast
+import random
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict
 
 import hydra
+import numpy as np
 import torch
 from hydra.utils import get_original_cwd, instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -32,6 +35,7 @@ from src.utils.em_config import (
     selection_world_from_config as _selection_world_from_config,
     worlds_from_config as _worlds_from_config,
 )
+from src.utils.stable_iql_em_defaults import stable_select
 from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import repeat_static, set_seed, to_float
 
@@ -69,6 +73,35 @@ def _list_from_config(value):
     return [int(v) for v in value]
 
 
+@contextmanager
+def _isolated_rng(seed: int):
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        seed = int(seed)
+        random.seed(seed)
+        np.random.seed(seed % (2**32 - 1))
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _mean_metric(metric_rows, key: str):
+    vals = [float(row[key]) for row in metric_rows if row.get(key) is not None]
+    if not vals:
+        return None
+    return float(sum(vals) / len(vals))
+
+
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
 def main(args: DictConfig):
     OmegaConf.set_struct(args, False)
@@ -79,63 +112,52 @@ def main(args: DictConfig):
     original_cwd = Path(get_original_cwd())
     args["exp"]["processed_data_dir"] = os.path.join(str(original_cwd), args["exp"]["processed_data_dir"])
 
-    em_outer_iters = int(OmegaConf.select(args, "exp.em_outer_iters", default=50))
-    em_m_steps = int(OmegaConf.select(args, "exp.em_m_steps_per_outer", default=200))
-    em_encoder_lr = float(OmegaConf.select(args, "exp.em_encoder_lr", default=3e-5))
-    em_val_every = int(OmegaConf.select(args, "exp.em_val_every", default=5))
-    em_save_every_eval_checkpoint = bool(
-        OmegaConf.select(args, "exp.em_save_every_eval_checkpoint", default=False)
-    )
-    em_save_every_outer_checkpoint = bool(
-        OmegaConf.select(args, "exp.em_save_every_outer_checkpoint", default=False)
-    )
-    em_warmup = int(OmegaConf.select(args, "exp.em_warmup_outer_iters", default=2))
-    em_log_m_every = int(OmegaConf.select(args, "exp.em_log_m_every", default=50))
-    em_e_epochs = max(1, int(OmegaConf.select(args, "exp.em_e_epochs", default=5)))
-    em_encoder_diagnostics = bool(
-        OmegaConf.select(args, "exp.em_encoder_diagnostics", default=False)
-    )
+    em_outer_iters = int(stable_select(args, "exp.em_outer_iters"))
+    em_m_steps = int(stable_select(args, "exp.em_m_steps_per_outer"))
+    em_encoder_lr = float(stable_select(args, "exp.em_encoder_lr"))
+    em_val_every = int(stable_select(args, "exp.em_val_every"))
+    em_val_repeats = max(1, int(stable_select(args, "exp.em_val_repeats")))
+    em_val_seed_offset = int(stable_select(args, "exp.em_val_seed_offset"))
+    em_val_seed_base = int(args.exp.seed) + em_val_seed_offset
+    em_save_every_eval_checkpoint = bool(stable_select(args, "exp.em_save_every_eval_checkpoint"))
+    em_save_every_outer_checkpoint = bool(stable_select(args, "exp.em_save_every_outer_checkpoint"))
+    em_warmup = int(stable_select(args, "exp.em_warmup_outer_iters"))
+    em_log_m_every = int(stable_select(args, "exp.em_log_m_every"))
+    em_e_epochs = max(1, int(stable_select(args, "exp.em_e_epochs")))
+    em_encoder_diagnostics = bool(stable_select(args, "exp.em_encoder_diagnostics"))
     em_encoder_diagnostics_every = max(
         1,
         int(
-            OmegaConf.select(
-                args,
-                "exp.em_encoder_diagnostics_every",
-                default=em_log_m_every,
-            )
+            stable_select(args, "exp.em_encoder_diagnostics_every", em_log_m_every)
         ),
     )
-    em_e_refresh_every = int(OmegaConf.select(args, "exp.em_e_refresh_every", default=1))
-    em_her_refresh_every = int(OmegaConf.select(args, "exp.em_her_refresh_every", default=1))
+    em_e_refresh_every = int(stable_select(args, "exp.em_e_refresh_every"))
+    em_her_refresh_every = int(stable_select(args, "exp.em_her_refresh_every"))
     em_her_samples_per_transition = max(
         1,
-        int(OmegaConf.select(args, "exp.em_her_samples_per_transition", default=1)),
+        int(stable_select(args, "exp.em_her_samples_per_transition")),
     )
-    iql_target_sampling = str(
-        OmegaConf.select(args, "exp.iql_target_sampling", default="horizon_aligned")
-    )
+    iql_target_sampling = str(stable_select(args, "exp.iql_target_sampling"))
     iql_target_horizons = _list_from_config(
-        OmegaConf.select(args, "exp.iql_target_horizons", default=None)
+        stable_select(args, "exp.iql_target_horizons")
     )
-    iql_horizon_terminal_done = bool(
-        OmegaConf.select(args, "exp.iql_horizon_terminal_done", default=True)
-    )
+    iql_horizon_terminal_done = bool(stable_select(args, "exp.iql_horizon_terminal_done"))
 
-    ct_align = str(OmegaConf.select(args, "exp.ct_align_loss", default="sinkhorn"))
+    ct_align = str(stable_select(args, "exp.ct_align_loss"))
     if ct_align != "sinkhorn":
         raise ValueError(f"EM training requires ct_align_loss=sinkhorn, got {ct_align!r}")
-    ct_blur = float(OmegaConf.select(args, "exp.ct_sinkhorn_blur", default=0.01))
-    _em_e_w_lr = OmegaConf.select(args, "exp.em_e_w_lr", default=None)
+    ct_blur = float(stable_select(args, "exp.ct_sinkhorn_blur"))
+    _em_e_w_lr = stable_select(args, "exp.em_e_w_lr")
     w_lr = (
         float(_em_e_w_lr)
         if _em_e_w_lr is not None
-        else float(OmegaConf.select(args, "exp.ct_w_lr", default=0.1))
+        else float(stable_select(args, "exp.ct_w_lr"))
     )
-    _ct_w_clip = OmegaConf.select(args, "exp.ct_w_clip", default=1.0)
+    _ct_w_clip = stable_select(args, "exp.ct_w_clip")
     w_clip = float(_ct_w_clip) if _ct_w_clip is not None else None
-    ct_wd = float(OmegaConf.select(args, "exp.ct_weight_decay", default=1e-5))
-    ct_batch_size = int(OmegaConf.select(args, "exp.ct_batch_size", default=512))
-    m_batch_size = int(OmegaConf.select(args, "exp.iql_batch_size", default=256))
+    ct_wd = float(stable_select(args, "exp.ct_weight_decay"))
+    ct_batch_size = int(stable_select(args, "exp.ct_batch_size"))
+    m_batch_size = int(stable_select(args, "exp.iql_batch_size"))
 
     dataset_collection = instantiate(args.dataset, _recursive_=True)
     dataset_collection.process_data_multi()
@@ -163,62 +185,48 @@ def main(args: DictConfig):
     out_dim = int(args.dataset.output_size)
     act_dim = int(args.dataset.treatment_size)
     state_dim = z_dim + out_dim + 1 + act_dim
-    goal_adapter_enabled = bool(
-        OmegaConf.select(args, "exp.iql_goal_adapter_enabled", default=False)
-    )
-    goal_adapter_hidden_dim = int(
-        OmegaConf.select(args, "exp.iql_goal_adapter_hidden_dim", default=64)
-    )
-    goal_adapter_init_scale = float(
-        OmegaConf.select(args, "exp.iql_goal_adapter_init_scale", default=1e-3)
-    )
+    goal_adapter_enabled = bool(stable_select(args, "exp.iql_goal_adapter_enabled"))
+    goal_adapter_hidden_dim = int(stable_select(args, "exp.iql_goal_adapter_hidden_dim"))
+    goal_adapter_init_scale = float(stable_select(args, "exp.iql_goal_adapter_init_scale"))
 
-    max_action = float(OmegaConf.select(args, "exp.iql_max_action", default=1.0))
-    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
-    iql_max_grad = OmegaConf.select(args, "exp.iql_max_grad_norm", default=None)
+    max_action = float(stable_select(args, "exp.iql_max_action"))
+    max_tau = float(stable_select(args, "exp.max_tau"))
+    iql_max_grad = stable_select(args, "exp.iql_max_grad_norm")
     iql_max_grad = None if iql_max_grad is None else float(iql_max_grad)
-    enc_max_grad = OmegaConf.select(args, "exp.em_encoder_max_grad_norm", default=1.0)
+    enc_max_grad = stable_select(args, "exp.em_encoder_max_grad_norm")
     enc_max_grad = None if enc_max_grad is None else float(enc_max_grad)
-    iql_weight_max = OmegaConf.select(args, "exp.iql_weight_max", default=10.0)
+    iql_weight_max = stable_select(args, "exp.iql_weight_max")
     iql_weight_max = None if iql_weight_max is None else float(iql_weight_max)
 
     planner_cfg = IQLPlannerConfig(
         state_dim=state_dim,
         action_dim=act_dim,
         max_action=max_action,
-        hidden_dim=int(OmegaConf.select(args, "exp.iql_hidden_dim", default=256)),
-        n_hidden=int(OmegaConf.select(args, "exp.iql_n_hidden", default=2)),
-        iql_tau=float(OmegaConf.select(args, "exp.iql_tau", default=0.5)),
-        beta=float(OmegaConf.select(args, "exp.iql_beta", default=3.0)),
-        adv_max=float(OmegaConf.select(args, "exp.iql_adv_max", default=100.0)),
+        hidden_dim=int(stable_select(args, "exp.iql_hidden_dim")),
+        n_hidden=int(stable_select(args, "exp.iql_n_hidden")),
+        iql_tau=float(stable_select(args, "exp.iql_tau")),
+        beta=float(stable_select(args, "exp.iql_beta")),
+        adv_max=float(stable_select(args, "exp.iql_adv_max")),
         weight_max=iql_weight_max,
-        actor_update=str(OmegaConf.select(args, "exp.iql_actor_update", default="awr")),
-        actor_bc_loss=str(OmegaConf.select(args, "exp.iql_actor_bc_loss", default="nll")),
-        actor_bc_expectile=float(OmegaConf.select(args, "exp.iql_actor_bc_expectile", default=0.7)),
-        td3bc_q_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_q_alpha", default=2.5)),
-        td3bc_bc_alpha=float(OmegaConf.select(args, "exp.iql_td3bc_bc_alpha", default=1.0)),
-        td3bc_action_penalty_alpha=float(
-            OmegaConf.select(args, "exp.iql_td3bc_action_penalty_alpha", default=0.0)
-        ),
-        cql_alpha=float(OmegaConf.select(args, "exp.iql_cql_alpha", default=0.0)),
-        cql_n_actions=int(OmegaConf.select(args, "exp.iql_cql_n_actions", default=10)),
-        q_high_action_penalty_alpha=float(
-            OmegaConf.select(args, "exp.iql_q_high_action_penalty_alpha", default=0.0)
-        ),
-        q_high_action_penalty_margin=float(
-            OmegaConf.select(args, "exp.iql_q_high_action_penalty_margin", default=0.0)
-        ),
-        q_high_action_penalty_n_actions=int(
-            OmegaConf.select(args, "exp.iql_q_high_action_penalty_n_actions", default=1)
-        ),
-        discount=float(OmegaConf.select(args, "exp.iql_discount", default=0.99)),
-        tau=float(OmegaConf.select(args, "exp.iql_target_tau", default=0.005)),
-        actor_lr=float(OmegaConf.select(args, "exp.iql_actor_lr", default=3e-4)),
-        qf_lr=float(OmegaConf.select(args, "exp.iql_qf_lr", default=3e-4)),
-        vf_lr=float(OmegaConf.select(args, "exp.iql_vf_lr", default=3e-4)),
+        actor_update=str(stable_select(args, "exp.iql_actor_update")),
+        actor_bc_loss=str(stable_select(args, "exp.iql_actor_bc_loss")),
+        actor_bc_expectile=float(stable_select(args, "exp.iql_actor_bc_expectile")),
+        td3bc_q_alpha=float(stable_select(args, "exp.iql_td3bc_q_alpha")),
+        td3bc_bc_alpha=float(stable_select(args, "exp.iql_td3bc_bc_alpha")),
+        td3bc_action_penalty_alpha=float(stable_select(args, "exp.iql_td3bc_action_penalty_alpha")),
+        cql_alpha=float(stable_select(args, "exp.iql_cql_alpha")),
+        cql_n_actions=int(stable_select(args, "exp.iql_cql_n_actions")),
+        q_high_action_penalty_alpha=float(stable_select(args, "exp.iql_q_high_action_penalty_alpha")),
+        q_high_action_penalty_margin=float(stable_select(args, "exp.iql_q_high_action_penalty_margin")),
+        q_high_action_penalty_n_actions=int(stable_select(args, "exp.iql_q_high_action_penalty_n_actions")),
+        discount=float(stable_select(args, "exp.iql_discount")),
+        tau=float(stable_select(args, "exp.iql_target_tau")),
+        actor_lr=float(stable_select(args, "exp.iql_actor_lr")),
+        qf_lr=float(stable_select(args, "exp.iql_qf_lr")),
+        vf_lr=float(stable_select(args, "exp.iql_vf_lr")),
         max_steps=em_outer_iters * em_m_steps,
-        deterministic_actor=bool(OmegaConf.select(args, "exp.iql_deterministic", default=False)),
-        actor_dropout=OmegaConf.select(args, "exp.iql_actor_dropout", default=None),
+        deterministic_actor=bool(stable_select(args, "exp.iql_deterministic")),
+        actor_dropout=stable_select(args, "exp.iql_actor_dropout"),
         max_grad_norm=iql_max_grad,
         encoder_max_grad_norm=enc_max_grad,
         device=device,
@@ -246,21 +254,17 @@ def main(args: DictConfig):
     )
 
     def _build_replay(her_seed: int) -> IQLRawReplayBuffer:
-        max_patients = OmegaConf.select(args, "exp.iql_max_patients", default=None)
+        max_patients = stable_select(args, "exp.iql_max_patients")
         raw = build_iql_raw_transitions(
             data=dataset_collection.train_f.data,
-            reward_type=str(OmegaConf.select(args, "exp.iql_reward_type", default="progress")),
+            reward_type=str(stable_select(args, "exp.iql_reward_type")),
             max_patients=max_patients,
             max_action=max_action,
-            dataset_actions_unit_interval=bool(
-                OmegaConf.select(args, "exp.iql_dataset_actions_unit_interval", default=True)
-            ),
+            dataset_actions_unit_interval=bool(stable_select(args, "exp.iql_dataset_actions_unit_interval")),
             max_tau=max_tau,
-            reward_clip=float(OmegaConf.select(args, "exp.iql_reward_clip", default=3.0)),
-            reward_scale=str(OmegaConf.select(args, "exp.iql_reward_scale", default="auto")),
-            reward_huber_delta=float(
-                OmegaConf.select(args, "exp.iql_reward_huber_delta", default=1.0)
-            ),
+            reward_clip=float(stable_select(args, "exp.iql_reward_clip")),
+            reward_scale=str(stable_select(args, "exp.iql_reward_scale")),
+            reward_huber_delta=float(stable_select(args, "exp.iql_reward_huber_delta")),
             samples_per_transition=em_her_samples_per_transition,
             target_sampling=iql_target_sampling,
             target_horizons=iql_target_horizons,
@@ -300,7 +304,7 @@ def main(args: DictConfig):
         CTEstepDataset(dataset_collection.train_f.data),
         batch_size=ct_batch_size,
         shuffle=False,
-        num_workers=int(OmegaConf.select(args, "exp.ct_num_workers", default=0)),
+        num_workers=int(stable_select(args, "exp.ct_num_workers")),
         collate_fn=collate_ct_estep_batch,
         drop_last=False,
     )
@@ -323,7 +327,7 @@ def main(args: DictConfig):
             em_encoder_diagnostics_every,
         )
 
-    _ckpt_override = OmegaConf.select(args, "exp.em_ckpt_dir", default=None)
+    _ckpt_override = stable_select(args, "exp.em_ckpt_dir")
     if _ckpt_override:
         out_dir = Path(str(_ckpt_override))
         if not out_dir.is_absolute():
@@ -337,14 +341,14 @@ def main(args: DictConfig):
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / "ct_iql_em_best.pt"
 
-    val_metric_key = str(OmegaConf.select(args, "exp.em_val_metric", default="mae_uns")).strip().lower()
+    val_metric_key = str(stable_select(args, "exp.em_val_metric")).strip().lower()
     if val_metric_key not in VAL_METRIC_KEYS:
         raise ValueError(
             f"exp.em_val_metric must be one of {VAL_METRIC_KEYS}, got {val_metric_key!r}"
         )
-    val_worlds = _worlds_from_config(OmegaConf.select(args, "exp.em_val_worlds", default=["sim"]))
+    val_worlds = _worlds_from_config(stable_select(args, "exp.em_val_worlds"))
     sel_world = _selection_world_from_config(
-        OmegaConf.select(args, "exp.em_val_selection_world", default=None),
+        stable_select(args, "exp.em_val_selection_world"),
         val_worlds,
     )
     if "predictor" in val_worlds:
@@ -354,15 +358,15 @@ def main(args: DictConfig):
         )
     eval_tau = int(args.exp.tau)
     em_val_tau_list = _list_from_config(
-        OmegaConf.select(args, "exp.em_val_tau_list", default=None)
+        stable_select(args, "exp.em_val_tau_list")
     )
-    val_action_diag = bool(OmegaConf.select(args, "exp.iql_val_action_diagnostics", default=False))
-    val_action_grid_points = int(OmegaConf.select(args, "exp.iql_val_action_grid_points", default=11))
-    val_action_diag_max_batches = OmegaConf.select(args, "exp.iql_val_action_diag_max_batches", default=2)
+    val_action_diag = bool(stable_select(args, "exp.iql_val_action_diagnostics"))
+    val_action_grid_points = int(stable_select(args, "exp.iql_val_action_grid_points"))
+    val_action_diag_max_batches = stable_select(args, "exp.iql_val_action_diag_max_batches")
     val_action_diag_max_batches = None if val_action_diag_max_batches is None else int(val_action_diag_max_batches)
     if em_val_tau_list is None:
         em_val_tau_list = [eval_tau]
-    val_tau_agg = str(OmegaConf.select(args, "exp.em_val_tau_agg", default="mean")).strip().lower()
+    val_tau_agg = str(stable_select(args, "exp.em_val_tau_agg")).strip().lower()
     if val_tau_agg not in {"mean", "max"}:
         raise ValueError("exp.em_val_tau_agg must be one of {'mean', 'max'}.")
     if len(em_val_tau_list) == 1:
@@ -373,12 +377,17 @@ def main(args: DictConfig):
             f"{tau_prefix}_{val_metric_key}_tau"
             + "_".join(str(int(t)) for t in em_val_tau_list)
         )
-    val_bs = int(OmegaConf.select(args, "exp.iql_val_batch_size", default=None) or args.exp.batch_size_val)
-    autoreg = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
+    val_bs = int(stable_select(args, "exp.iql_val_batch_size") or args.exp.batch_size_val)
+    autoreg = bool(stable_select(args, "exp.iql_eval_autoregressive"))
 
     inference_model = InferenceModel(args).to(device)
     best_val = float("inf")
     best_outer = 0
+    logger.info(
+        "EM validation RNG isolation: seed_base=%d repeats=%d",
+        em_val_seed_base,
+        em_val_repeats,
+    )
     last_e_metrics: Dict[str, float] = {
         "align_pre": 0.0,
         "align_post": 0.0,
@@ -518,28 +527,37 @@ def main(args: DictConfig):
                 val_scores = []
                 val_log_metrics = {}
                 for tau_i in em_val_tau_list:
-                    metrics = aggregate_iql_planner_metrics(
-                        planner,
-                        inference_model,
-                        dataset_collection,
-                        dataset_collection.val_f,
-                        args,
-                        device=device,
-                        tau=int(tau_i),
-                        max_tau=max_tau,
-                        autoregressive_eval=autoreg,
-                        val_batch_size=val_bs,
-                        log_batches=False,
-                        worlds=val_worlds,
-                        action_diagnostics=val_action_diag,
-                        action_grid_points=val_action_grid_points,
-                        action_diag_max_batches=val_action_diag_max_batches,
-                    )
-                    per_world = metrics.get("per_world", {val_worlds[0]: metrics})
-                    tau_score = float(per_world[sel_world][val_metric_key])
+                    tau_world_metrics = []
+                    for rep_i in range(em_val_repeats):
+                        val_seed = em_val_seed_base + int(tau_i) * 1000 + rep_i
+                        with _isolated_rng(val_seed):
+                            metrics = aggregate_iql_planner_metrics(
+                                planner,
+                                inference_model,
+                                dataset_collection,
+                                dataset_collection.val_f,
+                                args,
+                                device=device,
+                                tau=int(tau_i),
+                                max_tau=max_tau,
+                                autoregressive_eval=autoreg,
+                                val_batch_size=val_bs,
+                                log_batches=False,
+                                worlds=val_worlds,
+                                action_diagnostics=val_action_diag and rep_i == 0,
+                                action_grid_points=val_action_grid_points,
+                                action_diag_max_batches=val_action_diag_max_batches,
+                            )
+                        per_world = metrics.get("per_world", {val_worlds[0]: metrics})
+                        tau_world_metrics.append(per_world[sel_world])
+                    tau_repeat_scores = [float(m[val_metric_key]) for m in tau_world_metrics]
+                    tau_score = float(sum(tau_repeat_scores) / len(tau_repeat_scores))
                     val_scores.append(tau_score)
                     tau_prefix = f"val/{sel_world}/tau{int(tau_i)}"
                     val_log_metrics[f"{tau_prefix}/{val_metric_key}"] = tau_score
+                    if len(tau_repeat_scores) > 1:
+                        repeat_var = sum((x - tau_score) ** 2 for x in tau_repeat_scores) / len(tau_repeat_scores)
+                        val_log_metrics[f"{tau_prefix}/{val_metric_key}_repeat_std"] = float(repeat_var ** 0.5)
                     for key in (
                         "closed_loop_rmse",
                         "closed_loop_rmse_uns",
@@ -548,9 +566,10 @@ def main(args: DictConfig):
                         "sequence_replay_rmse_uns",
                         "sequence_replay_rmse_norm",
                     ):
-                        if per_world[sel_world].get(key) is not None:
-                            val_log_metrics[f"{tau_prefix}/{key}"] = float(per_world[sel_world][key])
-                    action_diag = per_world[sel_world].get("action_diagnostics", {})
+                        metric_mean = _mean_metric(tau_world_metrics, key)
+                        if metric_mean is not None:
+                            val_log_metrics[f"{tau_prefix}/{key}"] = metric_mean
+                    action_diag = tau_world_metrics[0].get("action_diagnostics", {})
                     for key in (
                         "planned_mean",
                         "factual_mean",
@@ -568,17 +587,18 @@ def main(args: DictConfig):
                 val_score = val_score_mean if val_tau_agg == "mean" else val_score_max
                 if len(em_val_tau_list) == 1:
                     logger.info(
-                        "EM val outer=%d %s=%.6f (%s, tau=%d)",
+                        "EM val outer=%d %s=%.6f (%s, tau=%d, repeats=%d)",
                         outer,
                         selection_metric_key,
                         val_score,
                         sel_world,
                         int(em_val_tau_list[0]),
+                        em_val_repeats,
                     )
                     val_log_metrics[f"val/{sel_world}/{val_metric_key}"] = val_score
                 else:
                     logger.info(
-                        "EM val outer=%d %s=%.6f mean=%.6f max=%.6f (%s, taus=%s)",
+                        "EM val outer=%d %s=%.6f mean=%.6f max=%.6f (%s, taus=%s, repeats=%d)",
                         outer,
                         selection_metric_key,
                         val_score,
@@ -586,6 +606,7 @@ def main(args: DictConfig):
                         val_score_max,
                         sel_world,
                         em_val_tau_list,
+                        em_val_repeats,
                     )
                     val_log_metrics[f"val/{sel_world}/{selection_metric_key}"] = val_score
                     val_log_metrics[f"val/{sel_world}/mean_{val_metric_key}_tau_list"] = val_score_mean
@@ -604,6 +625,8 @@ def main(args: DictConfig):
                             "val_metric_base": val_metric_key,
                             "val_tau_list": em_val_tau_list,
                             "val_tau_agg": val_tau_agg,
+                            "val_repeats": em_val_repeats,
+                            "val_seed_base": em_val_seed_base,
                             "val_scores": val_scores,
                         },
                     )
@@ -622,6 +645,8 @@ def main(args: DictConfig):
                             "val_metric_base": val_metric_key,
                             "val_tau_list": em_val_tau_list,
                             "val_tau_agg": val_tau_agg,
+                            "val_repeats": em_val_repeats,
+                            "val_seed_base": em_val_seed_base,
                             "val_scores": val_scores,
                         },
                     )

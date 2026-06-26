@@ -18,8 +18,7 @@ model:
     _target_: src.models.inference_model.InferenceModel
     hidden_dim: 16
     num_layers: 2
-    # Local-global CTHistoryEncoder switch. Keep default 0 to preserve current CT
-    # unless an experiment explicitly enables low-layer causal depthwise Conv1d.
+    # Current one-stage paper setting: one local causal Conv1d layer, then global attention.
     local_conv_layers: 1
     local_conv_kernel_size: 6
     local_conv_dilation: 1
@@ -78,189 +77,12 @@ exp:
   lambda_action: 1
   lambda_hy: 1
   beta_bound: -10
-  # IQL planner (train_iql_planner.py) — declared so Hydra struct mode allows overrides without +exp.*
-  iql_updates: 5000
-  iql_batch_size: 256
-  iql_max_patients: null
-  # Path to train_ct ``ct_best_encoder.pt``, VAE ``model.ckpt`` (inference_model.*), or flat InferenceModel weights
-  iql_inference_ckpt: ""
-  # Reward design for offline RL transitions (see iql_dataset_builder.py docstring).
-  #   negative_outcome      : r = -|y_{t+1} - y_target|                (L1, RECOMMENDED)
-  #   negative_outcome_huber: r = -Huber(y_{t+1} - y_target)           (RMSE-oriented, robust)
-  #   negative_outcome_mse  : r = -(y_{t+1} - y_target)^2              (L2, heavy-tailed!)
-  #   progress              : r = |y_t - y_target| - |y_{t+1} - y_target|
-  #     NOTE: "progress" was tried as a long-horizon signal but empirically
-  #     collapses V/Q to ≈0 under HER-sampled y_target — mean(r)≈0 and
-  #     |r|~0.01 for slow-changing tumor data, so the AWR advantage vanishes
-  #     and the IQL policy degenerates to pure behavior cloning (actor_loss
-  #     plateaus at the BC baseline, mae_uns stuck at the factual baseline).
-  #     Also has a sign conflict: treatment that shrinks tumor pushes y_next
-  #     away from the factual-future y_target → good actions get negative
-  #     reward. L1 below does not have this issue.
-  iql_reward_type: negative_outcome
-  iql_reward_huber_delta: 1.0
-  # Hard-clip |r| to suppress simulator-overflow outliers (raw MSE on cancer_sim
-  # γ=4 has min≈-117 even though q99=0). With L1 reward the typical |r| ~ 0.3,
-  # outliers |r| ~ 10; clip=3.0 kills the worst 1% without distorting 99% of the
-  # learning signal. Directly eliminates the Twin-Q spike pattern (r in batch
-  # → TD target jumps → q_loss ~ 0.5·r²). 0 disables.
-  iql_reward_clip: 3.0
-  # none | auto. "auto" divides the whole reward buffer by its empirical std
-  # so TD targets stay O(1) regardless of outcome scale (standard IQL trick).
-  # Recommended together with reward_clip: after clipping we re-normalize so
-  # V fixed point ≈ E[r]/(1-γ) is O(10) rather than O(100).
-  iql_reward_scale: auto
-  iql_max_action: 1.0
-  # Map dataset treatments in [0, iql_max_action] to [-iql_max_action, iql_max_action] for Tanh IQL actor
-  iql_dataset_actions_unit_interval: true
-  iql_hidden_dim: 256
-  iql_n_hidden: 2
-  # iql_tau: expectile 参数，决定“policy value”与“critic value”间的权衡。该值越高，表示算法更乐观、与 offline data 的 policy 匹配度更低、具有更强的探索性；越低则更贴近 offline data，探索性更差。一般建议 0.5~0.9 之间（参考 TD3+BC 和 IQL 论文）。
-  iql_tau: 0.7  # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_beta: 2.0 # revised in April 26, Sunday, by gridsearch in Thinkstation
-  iql_weight_max: 3.0
-  # Actor extraction update: awr keeps IQL/AWR; bc uses pure behavior cloning;
-  # td3bc uses Q-gradient + BC;
-  # awr_td3bc keeps advantage-weighted AWR BC and adds a weak Q-gradient term.
-  iql_actor_update: awr
-  # nll matches standard stochastic AWR; mse directly optimizes the deterministic
-  # actor mean used by eval_iql_planner.py; expectile is behavior-only upper
-  # expectile regression to recover high-action tails without Q extrapolation.
-  iql_actor_bc_loss: expectile
-  iql_actor_bc_expectile: 0.8
-  iql_td3bc_q_alpha: 0.0
-  iql_td3bc_bc_alpha: 1.0
-  # Optional support/trust-region penalty for TD3+BC variants:
-  # alpha * ||pi(s) - a_data||^2 in policy action space.
-  iql_td3bc_action_penalty_alpha: 0.0
-  iql_cql_alpha: 0.0
-  iql_cql_n_actions: 10
-  # Optional critic-side high-action overestimation penalty. When enabled, the
-  # Q-step samples actions above logged actions and penalizes Q_high > Q_data.
-  iql_q_high_action_penalty_alpha: 0.0
-  iql_q_high_action_penalty_margin: 0.0
-  iql_q_high_action_penalty_n_actions: 1
-  iql_discount: 0.99
-  # iql_target_tau: 目标网络软更新的参数，每次更新时新参数 = target_tau * 当前参数 + (1 - target_tau) * 旧目标参数。控制 Q/V/Actor 目标网络更新速度，建议 0.001 ~ 0.01 小数。
-  iql_target_tau: 0.005
-  iql_actor_lr: 3.0e-4
-  iql_qf_lr: 3.0e-4
-  iql_vf_lr: 3.0e-4
-  # Periodic val MAE on train_f-side val_f during IQL training; 0 disables (last-step ckpt only).
-  # Selection metric is computed on val_f only (no test_f exposure), with a fixed RNG snapshot
-  # so successive checkpoints share the same eval protocol.
-  iql_val_every: 200
-  iql_val_batch_size: null
-  # Metric to minimize for best checkpoint: mae_uns | mae_norm | rmse_uns | rmse_norm
-  iql_val_metric: rmse_uns
-  # Also save final-step weights to iql_planner_last.pt when val is enabled
-  iql_val_save_last: true
-  # Smoothed metrics in train_iql logs: trailing mean over this many steps (default 200)
-  iql_log_window: 200
-  # Optional L2 grad clip per network (V, Q twin, actor); null = disabled
-  iql_max_grad_norm: 5.0
-  iql_deterministic: false
-  iql_actor_dropout: null
-  # eval_iql_planner.py: empty -> iql_models/seed_{seed}/gamma_{coeff}/iql_planner.pt
-  iql_eval_ckpt: ""
-  # Roll out τ steps: each step replans from CT state after appending (a_t, y_{t+1}); false = repeat first action (legacy)
-  iql_eval_autoregressive: true
-  # Eval-time simulator-action calibration after policy output is mapped to [0, 1].
-  # This does not change training actions or actor bounds.
-  iql_eval_action_scale: 1.0
-  iql_eval_action_shift: 0.0
-  # Eval-time action selector. mean preserves historical deterministic actor
-  # evaluation. q_sample samples actions from the learned behavior actor and
-  # chooses the highest critic value with an optional distance penalty from the
-  # actor mean, keeping policy improvement behavior-support constrained.
-  iql_eval_action_selector: mean
-  iql_eval_candidate_actions: 16
-  iql_eval_q_bc_penalty: 0.0
-  iql_eval_candidate_noise_std: 0.25
-  # Model-based OPE A/B during IQL val:
-  #   - sim:       ground-truth cancer simulator oracle (synthetic benchmark only).
-  #   - predictor: learned OutcomePredictor from ct_best_encoder.pt (works on real data).
-  # When >=2 worlds are listed, train_iql_planner.py tracks a separate best checkpoint
-  # per world and logs Spearman rank correlation / top-K overlap / regret across worlds.
-  iql_val_worlds: [sim]
-  # Which world's best checkpoint becomes the primary iql_planner.pt consumed by eval_iql_planner.
-  # Must appear in iql_val_worlds.
-  iql_val_selection_world: sim
-  # Dump full resolved Hydra config at startup. Train scripts always log config;
-  # eval_iql_planner.py only logs when this is true (default false).
+  # One-stage CT+IQL EM fixed defaults live in src/utils/stable_iql_em_defaults.py.
+  # The old two-stage IQL planner entrypoint is disabled; use train_ct_iql_em.py.
   log_config: false
-  # MLflow (train_ct.py, train_iql_planner.py, eval_iql_planner.py); default on.
+  # MLflow
   use_mlflow: true
   mlflow_experiment: vcip_tumor_one_step
-  # Where training WRITES metrics (not the browser URL). Use file: on the training machine.
-  # Example: file:/home/liam/pythonProject/VCIP-ICML-main/mlruns
-  # http://... is only if you run ``mlflow server`` separately; ``mlflow ui`` is for viewing only.
   mlflow_uri: http://127.0.0.1:5000
   mlflow_log_artifacts: true
-  mlflow_combo_id: ""  # optional tag for grid search / pipeline scripts
-  # eval_iql_planner.py: if set, evaluate all horizons in one MLflow run (scheme 3: eval/tau{k}/mae_uns).
-  iql_eval_tau_list: [1,2,3,4,5,6]
-  # Horizon-aware IQL: normalize time-to-go; must match eval_iql_planner / EM raw transitions
-  max_tau: 12.0
-  # Target sampling for goal-conditioned IQL transitions:
-  #   random_future    : legacy HER, sample any future t_target in [t+1, t+max_tau].
-  #   horizon_aligned  : sample only from fixed horizons below, matching eval tau values.
-  iql_target_sampling: horizon_aligned
-  iql_target_horizons: [1, 2, 3, 4, 5, 6]
-  # Finite-horizon Bellman termination: when the next step reaches sampled t_target,
-  # cut bootstrap even if the patient sequence continues.
-  iql_horizon_terminal_done: true
-  # --- E-step WeightNet (train_ct_iql_em.py) ---
-  # Align P_w(Z,A) toward P(Z)P(A). Legacy train_ct.py can still override these via CLI.
-  ct_align_loss: sinkhorn
-  ct_sinkhorn_blur: 0.01
-  ct_weight_hidden: 64
-  ct_weight_decay: 1.0e-05
-  ct_batch_size: 512
-  ct_num_workers: 4
-  ct_k_inner: 5
-  ct_w_lr: 1.0e-2
-  ct_w_clip: 5.0
-  # --- CT+IQL unified EM (train_ct_iql_em.py) ---
-  em_outer_iters: 20
-  em_m_steps_per_outer: 1000
-  em_encoder_lr: 5.0e-5
-  em_encoder_max_grad_norm: 1.0
-  em_val_every: 1
-  em_val_metric: rmse_uns
-  em_val_tau_list: [1, 2, 3, 4, 5, 6]
-  # Multi-tau EM checkpoint selection. mean preserves historical behavior;
-  # max selects for worst-horizon validation RMSE/MAE and is useful when every
-  # tau must satisfy a threshold.
-  em_val_tau_agg: max
-  # Save ct_iql_em_outerXXXX.pt at every validation point for checkpoint-selection
-  # diagnostics. Keep disabled for normal sweeps to avoid large checkpoint folders.
-  em_save_every_eval_checkpoint: false
-  # Save ct_iql_em_outerXXXX.pt after every outer iteration without running validation.
-  # Use this for post-hoc outer-vs-RMSE diagnostics.
-  em_save_every_outer_checkpoint: false
-  # M-step only: uniform w for first N outers; E-step always trains WeightNet.
-  em_warmup_outer_iters: 2
-  # CTD-style full-dataset WeightNet fit per E-step (epoch_w analogue).
-  em_e_epochs: 5
-  # WeightNet LR for full E-step (CTD-NKO uses 0.1 in wass_calculator.train_model).
-  em_e_w_lr: 0.01
-  # Refit WeightNet every N outer iters (1 = every outer); encoder/Q still update each outer.
-  em_e_refresh_every: 1
-  # Rebuild HER raw transitions every N outer iters (new t_target / y_target / reward).
-  # 1 = refresh every outer; 0 = build once at startup only.
-  em_her_refresh_every: 0
-  # Number of fixed HER targets sampled for each factual (patient, t) transition
-  # whenever a raw replay is built. K>1 increases replay size without changing it
-  # across M-steps when em_her_refresh_every=0.
-  em_her_samples_per_transition: 1
-  em_log_m_every: 50
-  em_ckpt_dir: null
-  em_eval_ckpt: ""
-  em_val_worlds: [sim]
-  em_val_selection_world: sim
-  # Optional validation-only diagnostics; not used for checkpoint selection.
-  iql_val_action_diagnostics: false
-  iql_val_action_grid_points: 11
-  iql_val_action_diag_max_batches: 2
-  # Legacy two-stage pipeline (train_ct.py / train_iql_planner.py) — override via CLI when needed.
+  mlflow_combo_id: ""

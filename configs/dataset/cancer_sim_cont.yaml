@@ -5,7 +5,7 @@ dataset:
   coeff: 4                                              # Confounding coefficient (gamma)
   chemo_coeff: ${dataset.coeff}                         # Confounding coefficient of chemotherapy
   radio_coeff: ${dataset.coeff}                         # Confounding coefficient of radiotherapy
-  seed: ${exp.seed}
+  seed: 10101
   num_patients:
     train: 1000
     val: 200
