@@ -11,6 +11,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
 from src.models.sequence_utils import gather_last_valid, last_valid_mask
+from src.utils.stable_iql_em_defaults import stable_default
 
 
 def _cfg_sel(cfg, key: str, default):
@@ -104,17 +105,26 @@ class CTDeconfoundModel(nn.Module):
     def __init__(self, cfg, x_dim: int):
         super().__init__()
         ds = cfg["dataset"]
-        md = cfg["model"]
         self.cfg = cfg
         self.treatment_dim = int(ds["treatment_size"])
         self.output_dim = int(ds["output_size"])
         self.static_size = int(ds["static_size"])
-        self.z_dim = int(md["z_dim"])
+        self.z_dim = int(_cfg_sel(cfg, "model.z_dim", stable_default("model.z_dim")))
         dropout = float(_cfg_sel(cfg, "exp.dropout", 0.1))
-        num_layers = int(md["inference"]["num_layers"])
-        local_conv_layers = int(_cfg_sel(cfg, "model.inference.local_conv_layers", 0))
-        local_conv_kernel_size = int(_cfg_sel(cfg, "model.inference.local_conv_kernel_size", 6))
-        local_conv_dilation = int(_cfg_sel(cfg, "model.inference.local_conv_dilation", 1))
+        num_layers = int(_cfg_sel(cfg, "model.inference.num_layers", stable_default("model.inference.num_layers")))
+        local_conv_layers = int(
+            _cfg_sel(cfg, "model.inference.local_conv_layers", stable_default("model.inference.local_conv_layers"))
+        )
+        local_conv_kernel_size = int(
+            _cfg_sel(
+                cfg,
+                "model.inference.local_conv_kernel_size",
+                stable_default("model.inference.local_conv_kernel_size"),
+            )
+        )
+        local_conv_dilation = int(
+            _cfg_sel(cfg, "model.inference.local_conv_dilation", stable_default("model.inference.local_conv_dilation"))
+        )
 
         self.ct_encoder = CTHistoryEncoder(
             x_dim=x_dim,

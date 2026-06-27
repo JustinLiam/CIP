@@ -1,21 +1,13 @@
 #!/usr/bin/env bash
-# One-stage EM+IQL local-global run under the GIFT Tumor data protocol.
+# One-stage local/global CT+IQL EM run under the Tumor comparison protocol.
 #
-# Default data protocol for the current tumor comparison:
-#   train/val/test = 1000/200/200
-#   max_seq_length = 60
-#   min_seq_length = 60
-# Override MAX_SEQ_LENGTH/MIN_SEQ_LENGTH to run alternate-history variants.
-#
-# Metric protocol:
-#   existing MAE/RMSE metrics are preserved, and eval_iql_planner logs:
-#     closed_loop_rmse       = online closed-loop policy RMSE (main paper metric)
-#     sequence_replay_rmse   = legacy full-sequence replay RMSE diagnostic
-#     gift_rmse         = unscaled cancer-volume RMSE
-#     gift_rmse_percent = gift_rmse / 1150 * 100
+# Defaults are read from configs/model/vcip.yaml, configs/dataset/cancer_sim_cont.yaml,
+# and fixed code defaults in src/utils/stable_iql_em_defaults.py. This script only
+# controls protocol-level choices: seeds, split, dataset size/length overrides, and output paths.
 #
 # Usage from repo root:
-#   bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh [GPU] [GAMMA]
+#   GRID_SEEDS="10 101 1010 10101 101010" TEST_SPLIT=true bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
+#   DATASET_SEED_MODE=exp_seed GRID_SEEDS="10 101 1010 10101 101010" TEST_SPLIT=true bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
 
 set -euo pipefail
 
@@ -28,65 +20,22 @@ conda activate vcip
 
 GPU="${1:-0}"
 GAMMA="${2:-4}"
-
 TEST_SPLIT="${TEST_SPLIT:-true}"
 SEEDS_RAW="${GRID_SEEDS:-20 202 2020 20202 202020}"
 read -r -a SEEDS <<< "${SEEDS_RAW}"
+
 DATASET_SEED="${DATASET_SEED:-10101}"
+DATASET_SEED_MODE="${DATASET_SEED_MODE:-fixed}"  # fixed | exp_seed
 DATASET_TRAIN="${DATASET_TRAIN:-1000}"
 DATASET_VAL="${DATASET_VAL:-200}"
 DATASET_TEST="${DATASET_TEST:-200}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-60}"
-MIN_SEQ_LENGTH="${MIN_SEQ_LENGTH:-${MAX_SEQ_LENGTH}}"
+MIN_SEQ_LENGTH="${MIN_SEQ_LENGTH:-${MAX_SEQ_LENGTH}}"  # summary/tag only for Tumor
 
-IQL_BETA="2.0"
-IQL_TAU="0.7"
-IQL_ACTOR_LR="3e-4"
-IQL_QF_LR="3e-4"
-IQL_VF_LR="3e-4"
-IQL_MAX_GRAD="5.0"
-IQL_REWARD_TYPE="negative_outcome"
-IQL_REWARD_HUBER_DELTA="1.0"
-IQL_ADV_MAX="100"
-IQL_WEIGHT_MAX="3.0"
-IQL_ACTOR_UPDATE="awr"
-IQL_ACTOR_BC_LOSS="expectile"
-IQL_ACTOR_BC_EXPECTILE="0.8"
-IQL_TD3BC_Q_ALPHA="0.0"
-IQL_TD3BC_BC_ALPHA="1.0"
-IQL_CQL_ALPHA="0.0"
-IQL_CQL_N_ACTIONS="10"
-IQL_Q_HIGH_ACTION_PENALTY_ALPHA="0.0"
-IQL_Q_HIGH_ACTION_PENALTY_MARGIN="0.0"
-IQL_Q_HIGH_ACTION_PENALTY_N_ACTIONS="1"
-EM_OUTER_ITERS="20"
-EM_M_STEPS="1000"
-EM_ENCODER_LR="5e-5"
-EM_ENCODER_MAX_GRAD="1.0"
-EM_WARMUP_OUTER_ITERS="2"
-EM_VAL_EVERY="1"
-EM_VAL_REPEATS="3"
-EM_VAL_SEED_OFFSET="10007"
-EM_HER_SAMPLES="1"
-EM_HER_REFRESH="0"
-EM_SAVE_EVAL_CKPTS="false"
-EM_SAVE_OUTER_CKPTS="false"
-EM_ENCODER_DIAGNOSTICS="false"
-EM_ENCODER_DIAGNOSTICS_EVERY="50"
-IQL_GOAL_ADAPTER="false"
-IQL_GOAL_ADAPTER_HIDDEN="64"
-IQL_GOAL_ADAPTER_INIT_SCALE="1e-3"
-IQL_TARGET_SAMPLING="horizon_aligned"
-IQL_TARGET_HORIZONS="[1,2,3,4,5,6]"
-IQL_HORIZON_TERMINAL_DONE="true"
-EVAL_TAU_LIST="[1,2,3,4,5,6]"
-VAL_METRIC="rmse_uns"
-EM_VAL_TAU_AGG="max"
 GPU_WAIT_MEMORY_MB="${GPU_WAIT_MEMORY_MB:-5000}"
 GPU_WAIT_SECONDS="${GPU_WAIT_SECONDS:-60}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-em_iql_local_global_gift_protocol}"
 MLFLOW_URI="${MLFLOW_URI:-}"
-# FORCE determines whether to forcibly rerun experiments even if results or done markers already exist.
 FORCE="${FORCE:-0}"
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -97,7 +46,7 @@ mkdir -p "${GRID_ROOT}/logs" "${GRID_ROOT}/ckpts" "${GRID_ROOT}/done"
 
 SUMMARY="${GRID_ROOT}/summary.csv"
 if [[ ! -f "${SUMMARY}" ]]; then
-  echo "combo_id,seed,dataset_seed,split,local_conv_layers,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,iql_tau,iql_actor_lr,iql_qf_lr,iql_vf_lr,iql_beta,iql_weight_max,iql_max_grad_norm,em_m_steps_per_outer,em_her_samples_per_transition,em_her_refresh_every,em_warmup_outer_iters,em_val_every,em_val_repeats,em_val_seed_offset,best_outer,best_val_metric,best_val_score,eval_tau,eval_mae_norm,eval_mae_uns,eval_rmse_norm,eval_rmse_norm_x_std,eval_rmse_uns,closed_loop_rmse,closed_loop_rmse_uns,closed_loop_rmse_norm,sequence_replay_rmse,sequence_replay_rmse_uns,sequence_replay_rmse_norm,gift_rmse,gift_rmse_percent,gift_mae_percent,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
+  echo "combo_id,seed,dataset_seed,dataset_seed_mode,split,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,best_outer,best_val_metric,best_val_score,eval_tau,mae_norm,mae_uns,rmse_norm,rmse_norm_x_std,rmse_uns,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
 fi
 
 MLFLOW_URI_ARGS=()
@@ -117,30 +66,46 @@ wait_for_gpu() {
   done
 }
 
+resolve_dataset_seed() {
+  local seed="$1"
+  case "${DATASET_SEED_MODE}" in
+    fixed) echo "${DATASET_SEED}" ;;
+    exp_seed) echo "${seed}" ;;
+    *) echo "ERROR: DATASET_SEED_MODE must be fixed or exp_seed, got ${DATASET_SEED_MODE}" >&2; return 1 ;;
+  esac
+}
+
+hydra_data_overrides() {
+  local -n out_ref=$1
+  out_ref=()
+  [[ "${DATASET_TRAIN}" != "1000" ]] && out_ref+=("dataset.num_patients.train=${DATASET_TRAIN}")
+  [[ "${DATASET_VAL}" != "200" ]] && out_ref+=("dataset.num_patients.val=${DATASET_VAL}")
+  [[ "${DATASET_TEST}" != "200" ]] && out_ref+=("dataset.num_patients.test=${DATASET_TEST}")
+  [[ "${MAX_SEQ_LENGTH}" != "60" ]] && out_ref+=("dataset.max_seq_length=${MAX_SEQ_LENGTH}")
+  return 0
+}
+
 read_em_metrics() {
   local ckpt_path="$1"
-  python - "${ckpt_path}" <<'PY'
+  python - "${ckpt_path}" <<'PY2'
 import sys, torch
 p = sys.argv[1]
 try:
     c = torch.load(p, map_location="cpu", weights_only=False)
 except Exception:
-    print("NA NA")
+    print("NA NA NA")
     raise SystemExit(0)
 extra = c.get("extra") or {}
 outer = c.get("outer_iter", extra.get("outer_iter", "NA"))
 metric = c.get("val_metric", extra.get("val_metric", "NA"))
-val = c.get(
-    "val_score",
-    extra.get("val_score", extra.get("best_val_mae_uns", extra.get("val_mae_uns", "NA"))),
-)
+val = c.get("val_score", extra.get("val_score", extra.get("best_val_mae_uns", extra.get("val_mae_uns", "NA"))))
 def f(v):
     try:
         return f"{float(v):.8g}"
     except Exception:
         return str(v)
 print(f(outer), str(metric), f(val))
-PY
+PY2
 }
 
 append_eval_rows() {
@@ -156,39 +121,26 @@ append_eval_rows() {
   local eval_log="${10}"
   local finished_at="${11}"
 
-  python - "${SUMMARY}" "${combo_id}" "${seed}" "${dataset_seed}" "${split}" "${DATASET_TRAIN}" "${DATASET_VAL}" "${DATASET_TEST}" "${MAX_SEQ_LENGTH}" "${MIN_SEQ_LENGTH}" "${IQL_TAU}" "${IQL_ACTOR_LR}" "${IQL_QF_LR}" "${IQL_VF_LR}" \
-    "${IQL_BETA}" "${IQL_WEIGHT_MAX}" "${IQL_MAX_GRAD}" "${EM_M_STEPS}" "${EM_HER_SAMPLES}" "${EM_HER_REFRESH}" "${EM_WARMUP_OUTER_ITERS}" \
-    "${EM_VAL_EVERY}" "${EM_VAL_REPEATS}" "${EM_VAL_SEED_OFFSET}" "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY'
+  python - "${SUMMARY}" "${combo_id}" "${seed}" "${dataset_seed}" "${DATASET_SEED_MODE}" "${split}"     "${DATASET_TRAIN}" "${DATASET_VAL}" "${DATASET_TEST}" "${MAX_SEQ_LENGTH}" "${MIN_SEQ_LENGTH}"     "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY2'
 import csv
 import os
 import re
 import sys
 
 (
-    summary_path, combo_id, seed, dataset_seed, split, dataset_train, dataset_val, dataset_test, max_seq_length, min_seq_length,
-    iql_tau, actor_lr, qf_lr, vf_lr,
-    iql_beta, iql_weight_max, iql_max_grad, em_m_steps, em_her_samples, em_her_refresh, em_warmup_outer_iters,
-    em_val_every, em_val_repeats, em_val_seed_offset, best_outer, best_val_metric, best_val_score,
-    em_ckpt, train_log, eval_log, finished_at
+    summary_path, combo_id, seed, dataset_seed, dataset_seed_mode, split,
+    dataset_train, dataset_val, dataset_test, max_seq_length, min_seq_length,
+    best_outer, best_val_metric, best_val_score, em_ckpt, train_log, eval_log, finished_at,
 ) = sys.argv[1:]
 
 def empty_metrics():
     return {
         "eval_tau": "NA",
-        "eval_mae_norm": "NA",
-        "eval_mae_uns": "NA",
-        "eval_rmse_norm": "NA",
-        "eval_rmse_norm_x_std": "NA",
-        "eval_rmse_uns": "NA",
-        "closed_loop_rmse": "NA",
-        "closed_loop_rmse_uns": "NA",
-        "closed_loop_rmse_norm": "NA",
-        "sequence_replay_rmse": "NA",
-        "sequence_replay_rmse_uns": "NA",
-        "sequence_replay_rmse_norm": "NA",
-        "gift_rmse": "NA",
-        "gift_rmse_percent": "NA",
-        "gift_mae_percent": "NA",
+        "mae_norm": "NA",
+        "mae_uns": "NA",
+        "rmse_norm": "NA",
+        "rmse_norm_x_std": "NA",
+        "rmse_uns": "NA",
     }
 
 rows = []
@@ -206,41 +158,17 @@ with open(eval_log, "r", encoding="utf-8", errors="replace") as f:
             continue
         m = re.search(r"Global RMSE on stacked batches \(normalized space\): ([0-9.eE+-]+)", line)
         if m:
-            current["eval_rmse_norm"] = m.group(1)
-            current["closed_loop_rmse_norm"] = m.group(1)
+            current["rmse_norm"] = m.group(1)
             continue
-        m = re.search(r"Global RMSE .*VCIP-style\): ([0-9.eE+-]+)", line)
+        m = re.search(r"Global RMSE .*\): ([0-9.eE+-]+)", line)
         if m:
-            current["eval_rmse_norm_x_std"] = m.group(1)
+            current["rmse_norm_x_std"] = m.group(1)
             continue
-        m = re.search(r"Sequence replay RMSE on stacked batches \(normalized space\): ([0-9.eE+-]+)", line)
+        m = re.search(r"MAE normalized: ([0-9.eE+-]+) \| MAE (?:unscaled|scaled): ([0-9.eE+-]+) \| RMSE (?:unscaled|scaled): ([0-9.eE+-]+)", line)
         if m:
-            current["sequence_replay_rmse_norm"] = m.group(1)
-            continue
-        m = re.search(r"Sequence replay RMSE × std: ([0-9.eE+-]+)", line)
-        if m:
-            current["sequence_replay_rmse_uns"] = m.group(1)
-            current["sequence_replay_rmse"] = m.group(1)
-            continue
-        m = re.search(
-            r"MAE normalized: ([0-9.eE+-]+) \| MAE unscaled: ([0-9.eE+-]+) \| RMSE unscaled: ([0-9.eE+-]+)",
-            line,
-        )
-        if m:
-            current["eval_mae_norm"] = m.group(1)
-            current["eval_mae_uns"] = m.group(2)
-            current["eval_rmse_uns"] = m.group(3)
-            current["closed_loop_rmse"] = m.group(3)
-            current["closed_loop_rmse_uns"] = m.group(3)
-            continue
-        m = re.search(
-            r"GIFT-style tumor RMSE unscaled: ([0-9.eE+-]+) \| GIFT-style tumor RMSE \(% of [0-9.eE+-]+\): ([0-9.eE+-]+) \| GIFT-style tumor MAE .*: ([0-9.eE+-]+)",
-            line,
-        )
-        if m:
-            current["gift_rmse"] = m.group(1)
-            current["gift_rmse_percent"] = m.group(2)
-            current["gift_mae_percent"] = m.group(3)
+            current["mae_norm"] = m.group(1)
+            current["mae_uns"] = m.group(2)
+            current["rmse_uns"] = m.group(3)
             continue
 if current is not None:
     rows.append(current)
@@ -248,15 +176,11 @@ if not rows:
     rows = [empty_metrics()]
 
 fieldnames = [
-    "combo_id", "seed", "dataset_seed", "split", "local_conv_layers", "dataset_train", "dataset_val", "dataset_test",
-    "max_seq_length", "min_seq_length", "iql_tau", "iql_actor_lr", "iql_qf_lr", "iql_vf_lr",
-    "iql_beta", "iql_weight_max", "iql_max_grad_norm", "em_m_steps_per_outer", "em_her_samples_per_transition",
-    "em_her_refresh_every", "em_warmup_outer_iters", "em_val_every", "em_val_repeats", "em_val_seed_offset",
-    "best_outer", "best_val_metric", "best_val_score", "eval_tau", "eval_mae_norm",
-    "eval_mae_uns", "eval_rmse_norm", "eval_rmse_norm_x_std", "eval_rmse_uns",
-    "closed_loop_rmse", "closed_loop_rmse_uns", "closed_loop_rmse_norm",
-    "sequence_replay_rmse", "sequence_replay_rmse_uns", "sequence_replay_rmse_norm", "gift_rmse",
-    "gift_rmse_percent", "gift_mae_percent", "em_ckpt", "train_log", "eval_log", "finished_at",
+    "combo_id", "seed", "dataset_seed", "dataset_seed_mode", "split",
+    "dataset_train", "dataset_val", "dataset_test", "max_seq_length", "min_seq_length",
+    "best_outer", "best_val_metric", "best_val_score", "eval_tau",
+    "mae_norm", "mae_uns", "rmse_norm", "rmse_norm_x_std", "rmse_uns",
+    "em_ckpt", "train_log", "eval_log", "finished_at",
 ]
 with open(summary_path, "a", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -265,27 +189,13 @@ with open(summary_path, "a", newline="", encoding="utf-8") as f:
             "combo_id": combo_id,
             "seed": seed,
             "dataset_seed": dataset_seed,
+            "dataset_seed_mode": dataset_seed_mode,
             "split": split,
-            "local_conv_layers": "1",
             "dataset_train": dataset_train,
             "dataset_val": dataset_val,
             "dataset_test": dataset_test,
             "max_seq_length": max_seq_length,
             "min_seq_length": min_seq_length,
-            "iql_tau": iql_tau,
-            "iql_actor_lr": actor_lr,
-            "iql_qf_lr": qf_lr,
-            "iql_vf_lr": vf_lr,
-            "iql_beta": iql_beta,
-            "iql_weight_max": iql_weight_max,
-            "iql_max_grad_norm": iql_max_grad,
-            "em_m_steps_per_outer": em_m_steps,
-            "em_her_samples_per_transition": em_her_samples,
-            "em_her_refresh_every": em_her_refresh,
-            "em_warmup_outer_iters": em_warmup_outer_iters,
-            "em_val_every": em_val_every,
-            "em_val_repeats": em_val_repeats,
-            "em_val_seed_offset": em_val_seed_offset,
             "best_outer": best_outer,
             "best_val_metric": best_val_metric,
             "best_val_score": best_val_score,
@@ -297,59 +207,14 @@ with open(summary_path, "a", newline="", encoding="utf-8") as f:
         row.update(metrics)
         writer.writerow(row)
 print(f"appended {len(rows)} eval row(s) from {os.path.basename(eval_log)}")
-PY
+PY2
 }
 
 run_one() {
   local seed="$1"
-  local dataset_seed="${DATASET_SEED}"
-  local local_layers=1
-  local sampling_id="${IQL_TARGET_SAMPLING//[^A-Za-z0-9]/}"
-  local reward_id="${IQL_REWARD_TYPE//[^A-Za-z0-9]/}"
-  local beta_id="${IQL_BETA//./p}"
-  beta_id="${beta_id//-/m}"
-  beta_id="${beta_id//+/p}"
-  beta_id="${beta_id//[^A-Za-z0-9pm]/}"
-  local adv_id="${IQL_ADV_MAX//./p}"
-  adv_id="${adv_id//-/m}"
-  adv_id="${adv_id//+/p}"
-  adv_id="${adv_id//[^A-Za-z0-9pm]/}"
-  local wmax_id="${IQL_WEIGHT_MAX//./p}"
-  wmax_id="${wmax_id//-/m}"
-  wmax_id="${wmax_id//+/p}"
-  wmax_id="${wmax_id//[^A-Za-z0-9pm]/}"
-  local enc_lr_id="${EM_ENCODER_LR//./p}"
-  enc_lr_id="${enc_lr_id//-/m}"
-  enc_lr_id="${enc_lr_id//+/p}"
-  enc_lr_id="${enc_lr_id//[^A-Za-z0-9pm]/}"
-  local enc_grad_id="${EM_ENCODER_MAX_GRAD//./p}"
-  enc_grad_id="${enc_grad_id//-/m}"
-  enc_grad_id="${enc_grad_id//+/p}"
-  enc_grad_id="${enc_grad_id//[^A-Za-z0-9pm]/}"
-  if [[ "${IQL_REWARD_TYPE}" == "negative_outcome_huber" || "${IQL_REWARD_TYPE}" == "huber" || "${IQL_REWARD_TYPE}" == "smooth_l1" ]]; then
-    reward_id="${reward_id}_d${IQL_REWARD_HUBER_DELTA//[^A-Za-z0-9]/}"
-  fi
-  local actor_id="${IQL_ACTOR_UPDATE//[^A-Za-z0-9]/}"
-  local qalpha_id="${IQL_TD3BC_Q_ALPHA//./p}"
-  qalpha_id="${qalpha_id//-/m}"
-  qalpha_id="${qalpha_id//+/p}"
-  qalpha_id="${qalpha_id//[^A-Za-z0-9pm]/}"
-  local bcalpha_id="${IQL_TD3BC_BC_ALPHA//./p}"
-  bcalpha_id="${bcalpha_id//-/m}"
-  bcalpha_id="${bcalpha_id//+/p}"
-  bcalpha_id="${bcalpha_id//[^A-Za-z0-9pm]/}"
-  local qhigh_id="${IQL_Q_HIGH_ACTION_PENALTY_ALPHA//./p}"
-  qhigh_id="${qhigh_id//-/m}"
-  qhigh_id="${qhigh_id//+/p}"
-  qhigh_id="${qhigh_id//[^A-Za-z0-9pm]/}"
-  local combo_id="seq${MAX_SEQ_LENGTH}_lg_tau07_lr3e4_grad5_m1k_b${beta_id}_adv${adv_id}_w${wmax_id}_actor${actor_id}_qa${qalpha_id}_bc${bcalpha_id}_qhigh${qhigh_id}_enc${enc_lr_id}_eg${enc_grad_id}_val${VAL_METRIC}_ve${EM_VAL_EVERY}_vr${EM_VAL_REPEATS}_${sampling_id}_${reward_id}_her${EM_HER_SAMPLES}"
-  combo_id="${combo_id}_dseed${dataset_seed}"
-  if [[ "${EM_ENCODER_DIAGNOSTICS}" == "true" ]]; then
-    combo_id="${combo_id}_encdiag${EM_ENCODER_DIAGNOSTICS_EVERY}"
-  fi
-  if [[ "${IQL_GOAL_ADAPTER}" == "true" ]]; then
-    combo_id="${combo_id}_goaladapter"
-  fi
+  local dataset_seed
+  dataset_seed="$(resolve_dataset_seed "${seed}")"
+  local combo_id="seq${MAX_SEQ_LENGTH}_localglobal_dseed${dataset_seed}"
   local tag="${combo_id}_seed${seed}"
   local em_dir="${GRID_ROOT}/ckpts/${tag}"
   local em_ckpt="${em_dir}/ct_iql_em_best.pt"
@@ -357,6 +222,8 @@ run_one() {
   local train_log="${log_dir}/train.log"
   local eval_log="${log_dir}/eval.log"
   local done_flag="${GRID_ROOT}/done/${tag}.done"
+  local data_overrides=()
+  hydra_data_overrides data_overrides
 
   if [[ "${FORCE}" != "1" ]]; then
     if [[ -f "${done_flag}" ]]; then
@@ -372,34 +239,15 @@ run_one() {
   mkdir -p "${em_dir}" "${log_dir}"
 
   echo "========== ${tag} =========="
-  echo "  Tumor data protocol: train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST}, max_seq_length=${MAX_SEQ_LENGTH}, min_seq_length=${MIN_SEQ_LENGTH}"
-  echo "  seed=${seed} dataset_seed=${dataset_seed} gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
-  echo "  local_conv_layers=${local_layers}"
-  echo "  iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
-  echo "  iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} iql_weight_max=${IQL_WEIGHT_MAX}"
-  echo "  iql_actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
-  echo "  iql_cql_alpha=${IQL_CQL_ALPHA} iql_cql_n_actions=${IQL_CQL_N_ACTIONS}"
-  echo "  iql_q_high_action_penalty_alpha=${IQL_Q_HIGH_ACTION_PENALTY_ALPHA} margin=${IQL_Q_HIGH_ACTION_PENALTY_MARGIN} n_actions=${IQL_Q_HIGH_ACTION_PENALTY_N_ACTIONS}"
-  echo "  iql_actor_bc_loss=${IQL_ACTOR_BC_LOSS} iql_actor_bc_expectile=${IQL_ACTOR_BC_EXPECTILE}"
-  echo "  val_metric=${VAL_METRIC} em_val_tau_agg=${EM_VAL_TAU_AGG} val_tau_list=${EVAL_TAU_LIST} em_val_every=${EM_VAL_EVERY} em_val_repeats=${EM_VAL_REPEATS}"
-  echo "  em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} em_m_steps=${EM_M_STEPS} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS}"
-  echo "  goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
-  echo "  encoder_diagnostics=${EM_ENCODER_DIAGNOSTICS} every=${EM_ENCODER_DIAGNOSTICS_EVERY}"
-  echo "  reward_type=${IQL_REWARD_TYPE} reward_huber_delta=${IQL_REWARD_HUBER_DELTA}"
-  echo "  target_sampling=${IQL_TARGET_SAMPLING} target_horizons=${IQL_TARGET_HORIZONS} horizon_terminal_done=${IQL_HORIZON_TERMINAL_DONE}"
+  echo "  data train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST}, max_seq_length=${MAX_SEQ_LENGTH}"
+  echo "  seed=${seed} dataset_seed=${dataset_seed} dataset_seed_mode=${DATASET_SEED_MODE} gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
 
   wait_for_gpu
   CUDA_VISIBLE_DEVICES="${GPU}" python -u runnables/train_ct_iql_em.py \
-    +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${GAMMA}*" \
-    exp.seed="${seed}" dataset.coeff="${GAMMA}" \
-    "dataset.seed=${dataset_seed}" \
-    "dataset.num_patients.train=${DATASET_TRAIN}" \
-    "dataset.num_patients.val=${DATASET_VAL}" \
-    "dataset.num_patients.test=${DATASET_TEST}" \
-    "dataset.max_seq_length=${MAX_SEQ_LENGTH}" \
-    "+dataset.min_seq_length=${MIN_SEQ_LENGTH}" \
-    "exp.load_data=false" \
-    "model.inference.local_conv_layers=${local_layers}" \
+    +dataset=cancer_sim_cont +model=vcip \
+    exp.seed="${seed}" dataset.coeff="${GAMMA}" "dataset.seed=${dataset_seed}" \
+    "${data_overrides[@]}" \
+    exp.load_data=false \
     "+exp.em_ckpt_dir=${em_dir}" \
     "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
     "exp.mlflow_combo_id=${combo_id}" \
@@ -413,19 +261,12 @@ run_one() {
 
   wait_for_gpu
   CUDA_VISIBLE_DEVICES="${GPU}" python -u runnables/eval_iql_planner.py \
-    +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${GAMMA}*" \
-    exp.seed="${seed}" dataset.coeff="${GAMMA}" \
-    "dataset.seed=${dataset_seed}" \
+    +dataset=cancer_sim_cont +model=vcip \
+    exp.seed="${seed}" dataset.coeff="${GAMMA}" "dataset.seed=${dataset_seed}" \
     exp.test="${TEST_SPLIT}" \
-    "dataset.num_patients.train=${DATASET_TRAIN}" \
-    "dataset.num_patients.val=${DATASET_VAL}" \
-    "dataset.num_patients.test=${DATASET_TEST}" \
-    "dataset.max_seq_length=${MAX_SEQ_LENGTH}" \
-    "+dataset.min_seq_length=${MIN_SEQ_LENGTH}" \
-    "exp.load_data=false" \
-    "model.inference.local_conv_layers=${local_layers}" \
+    "${data_overrides[@]}" \
+    exp.load_data=false \
     "+exp.em_eval_ckpt=${em_ckpt}" \
-    "+exp.iql_eval_tau_list=${EVAL_TAU_LIST}" \
     "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
     "exp.mlflow_combo_id=${combo_id}" \
     "${MLFLOW_URI_ARGS[@]}" \
@@ -446,25 +287,12 @@ run_one() {
     echo "combo_id=${combo_id}"
     echo "seed=${seed}"
     echo "dataset_seed=${dataset_seed}"
+    echo "dataset_seed_mode=${DATASET_SEED_MODE}"
     echo "split=${split}"
-    echo "gift_protocol=true"
     echo "dataset_train=${DATASET_TRAIN}"
     echo "dataset_val=${DATASET_VAL}"
     echo "dataset_test=${DATASET_TEST}"
     echo "max_seq_length=${MAX_SEQ_LENGTH}"
-    echo "min_seq_length=${MIN_SEQ_LENGTH}"
-    echo "iql_target_sampling=${IQL_TARGET_SAMPLING}"
-    echo "iql_target_horizons=${IQL_TARGET_HORIZONS}"
-    echo "iql_horizon_terminal_done=${IQL_HORIZON_TERMINAL_DONE}"
-    echo "iql_beta=${IQL_BETA}"
-    echo "iql_adv_max=${IQL_ADV_MAX}"
-    echo "iql_weight_max=${IQL_WEIGHT_MAX}"
-    echo "iql_actor_update=${IQL_ACTOR_UPDATE}"
-    echo "iql_td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA}"
-    echo "iql_td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA}"
-    echo "iql_q_high_action_penalty_alpha=${IQL_Q_HIGH_ACTION_PENALTY_ALPHA}"
-    echo "iql_q_high_action_penalty_margin=${IQL_Q_HIGH_ACTION_PENALTY_MARGIN}"
-    echo "iql_q_high_action_penalty_n_actions=${IQL_Q_HIGH_ACTION_PENALTY_N_ACTIONS}"
     echo "em_ckpt=${em_ckpt}"
     echo "train_log=${train_log}"
     echo "eval_log=${eval_log}"
@@ -472,25 +300,17 @@ run_one() {
   echo "[done] ${tag}"
 }
 
-echo "[gift-protocol] one-stage EM+IQL local-global"
-echo "[gift-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
-echo "[gift-protocol] seeds=(${SEEDS[*]})"
-echo "[gift-protocol] dataset_seed=${DATASET_SEED}"
-echo "[gift-protocol] data train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST} max_seq_length=${MAX_SEQ_LENGTH} min_seq_length=${MIN_SEQ_LENGTH}"
-echo "[gift-protocol] iql_tau=${IQL_TAU} actor_lr=${IQL_ACTOR_LR} qf_lr=${IQL_QF_LR} vf_lr=${IQL_VF_LR}"
-echo "[gift-protocol] beta=${IQL_BETA} adv_max=${IQL_ADV_MAX} weight_max=${IQL_WEIGHT_MAX} actor_update=${IQL_ACTOR_UPDATE} td3bc_q_alpha=${IQL_TD3BC_Q_ALPHA} td3bc_bc_alpha=${IQL_TD3BC_BC_ALPHA} grad=${IQL_MAX_GRAD} outer_iters=${EM_OUTER_ITERS} m_steps=${EM_M_STEPS} em_encoder_lr=${EM_ENCODER_LR} em_encoder_max_grad=${EM_ENCODER_MAX_GRAD} warmup_outer_iters=${EM_WARMUP_OUTER_ITERS} val_every=${EM_VAL_EVERY} eval_tau_list=${EVAL_TAU_LIST}"
-echo "[gift-protocol] cql_alpha=${IQL_CQL_ALPHA} cql_n_actions=${IQL_CQL_N_ACTIONS}"
-echo "[gift-protocol] q_high_action_penalty_alpha=${IQL_Q_HIGH_ACTION_PENALTY_ALPHA} margin=${IQL_Q_HIGH_ACTION_PENALTY_MARGIN} n_actions=${IQL_Q_HIGH_ACTION_PENALTY_N_ACTIONS}"
-echo "[gift-protocol] save_outer_ckpts=${EM_SAVE_OUTER_CKPTS} save_eval_ckpts=${EM_SAVE_EVAL_CKPTS}"
-echo "[gift-protocol] goal_adapter=${IQL_GOAL_ADAPTER} hidden=${IQL_GOAL_ADAPTER_HIDDEN} init_scale=${IQL_GOAL_ADAPTER_INIT_SCALE}"
-echo "[gift-protocol] target_sampling=${IQL_TARGET_SAMPLING} target_horizons=${IQL_TARGET_HORIZONS} horizon_terminal_done=${IQL_HORIZON_TERMINAL_DONE} her_samples=${EM_HER_SAMPLES}"
-echo "[gift-protocol] grid_root=${GRID_ROOT}"
+echo "[tumor-protocol] one-stage local/global CT+IQL EM"
+echo "[tumor-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
+echo "[tumor-protocol] seeds=(${SEEDS[*]}) dataset_seed_mode=${DATASET_SEED_MODE} dataset_seed=${DATASET_SEED}"
+echo "[tumor-protocol] data train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST} max_seq_length=${MAX_SEQ_LENGTH}"
+echo "[tumor-protocol] grid_root=${GRID_ROOT}"
 
 for seed in "${SEEDS[@]}"; do
   run_one "${seed}"
 done
 
-python - "${SUMMARY}" <<'PY'
+python - "${SUMMARY}" <<'PY2'
 import csv
 import statistics
 import sys
@@ -500,15 +320,16 @@ path = sys.argv[1]
 rows = list(csv.DictReader(open(path, newline="", encoding="utf-8")))
 groups = defaultdict(list)
 for row in rows:
-    if row.get("gift_rmse_percent") in ("", "NA", None):
+    if row.get("rmse_uns") in ("", "NA", None):
         continue
-    groups[row["eval_tau"]].append(float(row["gift_rmse_percent"]))
+    groups[row["eval_tau"]].append(float(row["rmse_uns"]))
 
-print(f"\nSummary: {path}")
+print()
+print(f"Summary: {path}")
 for tau, vals in sorted(groups.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 999):
+    std = statistics.stdev(vals) if len(vals) > 1 else 0.0
     print(
-        f"tau={tau}: n={len(vals)} "
-        f"gift_rmse_percent_mean={statistics.mean(vals):.6f} "
-        f"vals={[round(v, 6) for v in vals]}"
+        f"tau={tau}: n={len(vals)} rmse_mean={statistics.mean(vals):.6f} "
+        f"rmse_std={std:.6f} vals={[round(v, 6) for v in vals]}"
     )
-PY
+PY2

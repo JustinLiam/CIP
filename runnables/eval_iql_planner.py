@@ -1,15 +1,9 @@
 """
-Evaluate IQL planner with the same simulator and RMSE metric as VAEModel.optimize_interventions_onetime:
-  closed_loop_y = final y_norm observed during autoregressive rollout
-  RMSE on normalized cancer_volume vs targets['outputs'][:, -1, :], then × std (cancer).
+Evaluate the IQL planner as an online closed-loop policy.
 
-By default (``exp.iql_eval_autoregressive=true``) the planned sequence is built autoregressively: each step
-re-encodes with ``ct_hidden_history`` after appending the chosen action and one-step simulated outcome.
-The main RMSE uses the final one-step outcome from that closed-loop rollout. The legacy full-sequence replay
-metric is also logged as ``sequence_replay_rmse`` for diagnostics.
-
-Logs aggregate **t+tau** tumor volume under the IQL plan vs ``targets['outputs'][:, -1]``, in normalized
-(train scaling) and unscaled (raw simulator scale) space.
+The main metric is RMSE between the final y_norm observed during autoregressive
+closed-loop rollout and targets["outputs"][:, -1, :], reported in normalized space
+and unscaled tumor-volume space.
 """
 import logging
 import os
@@ -42,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
-GIFT_TUMOR_VOLUME_NORMALIZER = 1150.0
 
 
 def _actions_to_sim_interval(raw: np.ndarray, max_action: float) -> np.ndarray:
@@ -112,12 +105,40 @@ def _unscaled_cancer_volume_np(y_norm: np.ndarray, mean_ser, std_ser) -> np.ndar
     return y_norm.astype(np.float64) * s + m
 
 
+def _split_scaling_params(scaling_params):
+    if isinstance(scaling_params, dict) and "output_means" in scaling_params:
+        means = np.asarray(scaling_params["output_means"], dtype=np.float64).reshape(1, -1)
+        stds = np.asarray(scaling_params["output_stds"], dtype=np.float64).reshape(1, -1)
+        return means, stds
+    mean_ser, std_ser = scaling_params
+    if hasattr(mean_ser, "__getitem__") and "cancer_volume" in mean_ser:
+        return (
+            np.asarray([[float(mean_ser["cancer_volume"])]], dtype=np.float64),
+            np.asarray([[float(std_ser["cancer_volume"])]], dtype=np.float64),
+        )
+    return (
+        np.asarray(mean_ser, dtype=np.float64).reshape(1, -1),
+        np.asarray(std_ser, dtype=np.float64).reshape(1, -1),
+    )
+
+
+def _unscale_outputs_np(y_norm: np.ndarray, scaling_params) -> np.ndarray:
+    means, stds = _split_scaling_params(scaling_params)
+    return np.asarray(y_norm, dtype=np.float64) * stds + means
+
+
+def _unscale_outputs_torch(y_norm: torch.Tensor, scaling_params, device: torch.device) -> torch.Tensor:
+    means, stds = _split_scaling_params(scaling_params)
+    mean_t = torch.as_tensor(means, dtype=y_norm.dtype, device=device)
+    std_t = torch.as_tensor(stds, dtype=y_norm.dtype, device=device)
+    return y_norm * std_t + mean_t
+
+
 def _extend_h_work_after_one_step(
     H: dict,
     a_sim: torch.Tensor,
     y_norm: torch.Tensor,
-    mean_ser,
-    std_ser,
+    scaling_params,
     device: torch.device,
 ) -> None:
     """
@@ -129,9 +150,9 @@ def _extend_h_work_after_one_step(
     static_features, current_covariates when present).
     """
     B = a_sim.size(0)
-    y_col = y_norm.view(B, 1)
-    y_ch = y_col.unsqueeze(-1)  # [B, 1, 1] for outputs
-    y_uns = _unscaled_cancer_volume(y_col, mean_ser, std_ser)
+    y_step = y_norm.view(B, -1)
+    y_ch = y_step.unsqueeze(1)
+    y_uns = _unscale_outputs_torch(y_step, scaling_params, device)
 
     active = H.get("active_entries")
     last_curr = gather_last_valid(H["current_treatments"], active).unsqueeze(1).clone()
@@ -146,14 +167,21 @@ def _extend_h_work_after_one_step(
         [ae, torch.ones(B, 1, ae.size(-1), device=device, dtype=ae.dtype)], dim=1
     )
 
-    H["cancer_volume"] = torch.cat([H["cancer_volume"], y_col], dim=1)
+    if "sequence_lengths" in H:
+        H["sequence_lengths"] = H["sequence_lengths"] + 1
 
-    uo = H["unscaled_outputs"]
-    y_u = y_uns.unsqueeze(-1) if uo.dim() == 3 else y_uns
-    H["unscaled_outputs"] = torch.cat([uo, y_u], dim=1)
+    if "cancer_volume" in H:
+        H["cancer_volume"] = torch.cat([H["cancer_volume"], y_step[:, 0:1]], dim=1)
 
-    H["chemo_application"] = torch.cat([H["chemo_application"], a_sim[:, 0:1]], dim=1)
-    H["radio_application"] = torch.cat([H["radio_application"], a_sim[:, 1:2]], dim=1)
+    if "unscaled_outputs" in H:
+        uo = H["unscaled_outputs"]
+        y_u = y_uns.unsqueeze(1) if uo.dim() == 3 else y_uns
+        H["unscaled_outputs"] = torch.cat([uo, y_u], dim=1)
+
+    if "chemo_application" in H:
+        H["chemo_application"] = torch.cat([H["chemo_application"], a_sim[:, 0:1]], dim=1)
+    if "radio_application" in H:
+        H["radio_application"] = torch.cat([H["radio_application"], a_sim[:, 1:2]], dim=1)
 
     if "static_features" in H:
         sf = H["static_features"]
@@ -161,10 +189,22 @@ def _extend_h_work_after_one_step(
             last = sf[:, -1:, :].expand(-1, 1, -1)
             H["static_features"] = torch.cat([sf, last], dim=1)
 
+    if "vitals" in H and "future_vitals" in H and H["future_vitals"].size(1) > 0:
+        next_vitals = H["future_vitals"][:, :1, :]
+        H["vitals"] = torch.cat([H["vitals"], next_vitals], dim=1)
+        H["future_vitals"] = H["future_vitals"][:, 1:, :]
+        if "current_covariates" in H:
+            H["current_covariates"] = torch.cat([H["current_covariates"], next_vitals], dim=1)
+        if "next_covariates" in H:
+            H["next_covariates"] = H["next_covariates"][:, 1:, :]
+        if "next_vitals" in H:
+            H["next_vitals"] = H["next_vitals"][:, 1:, :]
+        return
+
     if "current_covariates" in H:
         cc = H["current_covariates"]
         ext = cc[:, -1:, :].clone()
-        ext[:, :, 0:1] = y_ch
+        ext[:, :, 0:y_step.size(-1)] = y_ch
         H["current_covariates"] = torch.cat([cc, ext], dim=1)
 
 
@@ -185,8 +225,11 @@ def _resolve_iql_ckpt(args: DictConfig, original_cwd: Path) -> Path:
             p = original_cwd / p
         return p
     seed = int(args.exp.seed)
-    gamma = int(args.dataset.coeff)
-    return original_cwd / "iql_models" / f"seed_{seed}" / f"gamma_{gamma}" / "iql_planner.pt"
+    coeff = OmegaConf.select(args, "dataset.coeff", default=None)
+    if coeff is not None:
+        return original_cwd / "iql_models" / f"seed_{seed}" / f"gamma_{int(coeff)}" / "iql_planner.pt"
+    name = str(OmegaConf.select(args, "dataset.name", default="dataset")).replace("/", "_")
+    return original_cwd / "iql_models" / f"seed_{seed}" / name / "iql_planner.pt"
 
 
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
@@ -211,6 +254,12 @@ def main(args: DictConfig):
         if dims == 2:
             dataset_collection = repeat_static(dataset_collection)
 
+    scaling_params = dataset_collection.train_scaling_params
+    if isinstance(scaling_params, (tuple, list)) and len(scaling_params) >= 2:
+        mean_ser, std_ser = scaling_params[0], scaling_params[1]
+    else:
+        mean_ser, std_ser = None, None
+    is_mimic = "mimic" in str(args.dataset.name).lower()
     try:
         std = float(dataset_collection.train_scaling_params[1]["cancer_volume"])
     except Exception:
@@ -284,7 +333,6 @@ def main(args: DictConfig):
             action_q_bc_penalty,
             action_candidate_noise_std,
         )
-    mean_ser, std_ser = dataset_collection.train_scaling_params
     tau_list = _resolve_eval_tau_list(args)
     original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=max(tau_list)))
 
@@ -307,11 +355,9 @@ def main(args: DictConfig):
             )
 
             losses = []
-            sequence_replay_losses = []
             losses_2 = []
             ture_output_list = []
             output_after_actions_list = []
-            sequence_replay_output_after_actions_list = []
             ture_output_actions_list = []
 
             with torch.no_grad():
@@ -356,7 +402,7 @@ def main(args: DictConfig):
                             )
                             y_norm = torch.as_tensor(y_np, device=device, dtype=torch.float32)
                             _extend_h_work_after_one_step(
-                                H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
+                                H_work, a_sim, y_norm, scaling_params, torch.device(device)
                             )
                             closed_loop_output_after_actions = y_norm.detach().cpu().numpy()
                             a_prev_sim = a_sim
@@ -396,17 +442,14 @@ def main(args: DictConfig):
                         a_seq = torch.tensor(a_sim, device=device, dtype=torch.float32).unsqueeze(1).expand(-1, tau, -1).contiguous()
                         closed_loop_output_after_actions = None
 
-                    sequence_replay_output_after_actions = fold.simulate_output_after_actions(
-                        H_t, a_seq, dataset_collection.train_scaling_params
-                    )
                     if closed_loop_output_after_actions is None:
-                        closed_loop_output_after_actions = sequence_replay_output_after_actions
+                        closed_loop_output_after_actions = fold.simulate_output_after_actions(
+                            H_t, a_seq, dataset_collection.train_scaling_params
+                        )
                     output_after_actions = closed_loop_output_after_actions
                     ture_output = targets["outputs"][:, -1, :].detach().cpu().numpy()
                     loss = np.sqrt(((output_after_actions - ture_output) ** 2).mean())
-                    sequence_replay_loss = np.sqrt(((sequence_replay_output_after_actions - ture_output) ** 2).mean())
                     losses.append(loss)
-                    sequence_replay_losses.append(sequence_replay_loss)
 
                     true_actions = targets["current_treatments"]
                     ture_output_actions = fold.simulate_output_after_actions(
@@ -417,61 +460,41 @@ def main(args: DictConfig):
 
                     ture_output_list.append(ture_output)
                     output_after_actions_list.append(output_after_actions)
-                    sequence_replay_output_after_actions_list.append(sequence_replay_output_after_actions)
                     ture_output_actions_list.append(ture_output_actions)
 
                     logger.info(
-                        f"Batch {i} RMSE (closed-loop plan): {loss:.6f}, "
-                        f"RMSE (sequence replay): {sequence_replay_loss:.6f}, "
+                        f"Batch {i} RMSE (plan): {loss:.6f}, "
                         f"RMSE (factual actions): {loss_2:.6f}"
                     )
 
             ture_output_list = np.concatenate(ture_output_list, axis=0)
             output_after_actions_list = np.concatenate(output_after_actions_list, axis=0)
-            sequence_replay_output_after_actions_list = np.concatenate(sequence_replay_output_after_actions_list, axis=0)
             ture_output_actions_list = np.concatenate(ture_output_actions_list, axis=0)
 
             rmse_norm = float(np.sqrt(((output_after_actions_list - ture_output_list) ** 2).mean()))
-            sequence_replay_rmse_norm = float(np.sqrt(((sequence_replay_output_after_actions_list - ture_output_list) ** 2).mean()))
             rmse_factual_norm = float(np.sqrt(((ture_output_actions_list - ture_output_list) ** 2).mean()))
 
             iql_y_norm = output_after_actions_list.reshape(-1)
             true_y_norm = ture_output_list.reshape(-1)
-            iql_y_uns = _unscaled_cancer_volume_np(output_after_actions_list, mean_ser, std_ser).reshape(-1)
-            sequence_replay_y_uns = _unscaled_cancer_volume_np(
-                sequence_replay_output_after_actions_list, mean_ser, std_ser
-            ).reshape(-1)
-            true_y_uns = _unscaled_cancer_volume_np(ture_output_list, mean_ser, std_ser).reshape(-1)
+            iql_y_uns = _unscale_outputs_np(output_after_actions_list, scaling_params).reshape(-1)
+            true_y_uns = _unscale_outputs_np(ture_output_list, scaling_params).reshape(-1)
 
             mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
             mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
             rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
-            sequence_replay_mae_norm = float(
-                np.mean(np.abs(sequence_replay_output_after_actions_list.reshape(-1) - true_y_norm))
-            )
-            sequence_replay_mae_uns = float(np.mean(np.abs(sequence_replay_y_uns - true_y_uns)))
-            sequence_replay_rmse_uns = float(np.sqrt(np.mean((sequence_replay_y_uns - true_y_uns) ** 2)))
-            gift_tumor_norm_const = float(
-                OmegaConf.select(args, "exp.gift_tumor_volume_normalizer", default=GIFT_TUMOR_VOLUME_NORMALIZER)
-            )
-            if gift_tumor_norm_const <= 0:
-                raise ValueError("exp.gift_tumor_volume_normalizer must be positive.")
-            gift_rmse = rmse_uns
-            gift_rmse_percent = float(rmse_uns / gift_tumor_norm_const * 100.0)
-            gift_mae_percent = float(mae_uns / gift_tumor_norm_const * 100.0)
 
-            logger.info("--- Aggregate closed-loop online policy metric ---")
+            logger.info("--- Aggregate online policy metric ---")
             logger.info(f"Split: {split_name}")
-            logger.info(f"Mean per-batch RMSE (closed-loop IQL): {float(np.mean(losses)):.6f}")
-            logger.info(f"Mean per-batch RMSE (sequence replay): {float(np.mean(sequence_replay_losses)):.6f}")
+            logger.info(f"Mean per-batch RMSE: {float(np.mean(losses)):.6f}")
             logger.info(f"Mean per-batch RMSE (factual traj): {float(np.mean(losses_2)):.6f}")
             logger.info(f"Global RMSE on stacked batches (normalized space): {rmse_norm:.6f}")
-            logger.info(f"Sequence replay RMSE on stacked batches (normalized space): {sequence_replay_rmse_norm:.6f}")
-            logger.info(f"Global RMSE × std (cancer volume scale, VCIP-style): {rmse_norm * std:.6f}")
-            logger.info(f"Sequence replay RMSE × std: {sequence_replay_rmse_norm * std:.6f}")
-            logger.info(f"Factual global RMSE × std: {rmse_factual_norm * std:.6f}")
+            if is_mimic:
+                logger.info("GIFT-style MIMIC RMSE (normalized 2D outcome): %.6f", rmse_norm)
+            else:
+                logger.info(f"Global RMSE × std (cancer volume scale): {rmse_norm * std:.6f}")
+                logger.info(f"Factual global RMSE × std: {rmse_factual_norm * std:.6f}")
 
-            logger.info("--- t+tau tumor volume (IQL planned actions vs target outputs[:, -1]) ---")
+            logger.info("--- t+tau outcome (IQL planned actions vs target outputs[:, -1]) ---")
             logger.info(
                 f"IQL pred normalized:   mean={float(np.mean(iql_y_norm)):.6f} std={float(np.std(iql_y_norm)):.6f} "
                 f"min={float(np.min(iql_y_norm)):.6f} max={float(np.max(iql_y_norm)):.6f}"
@@ -488,16 +511,12 @@ def main(args: DictConfig):
                 f"Target unscaled:       mean={float(np.mean(true_y_uns)):.6f} std={float(np.std(true_y_uns)):.6f} "
                 f"min={float(np.min(true_y_uns)):.6f} max={float(np.max(true_y_uns)):.6f}"
             )
-            logger.info(
-                f"Train scaling cancer_volume: mean={float(mean_ser['cancer_volume']):.6f} std={float(std_ser['cancer_volume']):.6f}"
-            )
+            if not is_mimic and mean_ser is not None and std_ser is not None:
+                logger.info(
+                    f"Train scaling cancer_volume: mean={float(mean_ser['cancer_volume']):.6f} std={float(std_ser['cancer_volume']):.6f}"
+                )
             logger.info(
                 f"MAE normalized: {mae_norm:.6f} | MAE unscaled: {mae_uns:.6f} | RMSE unscaled: {rmse_uns:.6f}"
-            )
-            logger.info(
-                f"GIFT-style tumor RMSE unscaled: {gift_rmse:.6f} | "
-                f"GIFT-style tumor RMSE (% of {gift_tumor_norm_const:g}): {gift_rmse_percent:.6f} | "
-                f"GIFT-style tumor MAE (% of {gift_tumor_norm_const:g}): {gift_mae_percent:.6f}"
             )
 
             per_tau_metrics[tau] = {
@@ -505,17 +524,6 @@ def main(args: DictConfig):
                 "mae_uns": mae_uns,
                 "rmse_uns": rmse_uns,
                 "rmse_norm": rmse_norm,
-                "closed_loop_rmse": rmse_uns,
-                "closed_loop_rmse_uns": rmse_uns,
-                "closed_loop_rmse_norm": rmse_norm,
-                "sequence_replay_rmse": sequence_replay_rmse_uns,
-                "sequence_replay_rmse_uns": sequence_replay_rmse_uns,
-                "sequence_replay_rmse_norm": sequence_replay_rmse_norm,
-                "sequence_replay_mae_uns": sequence_replay_mae_uns,
-                "sequence_replay_mae_norm": sequence_replay_mae_norm,
-                "gift_rmse": gift_rmse,
-                "gift_rmse_percent": gift_rmse_percent,
-                "gift_mae_percent": gift_mae_percent,
                 "rmse_factual_norm": rmse_factual_norm,
                 "mean_batch_rmse_iql": float(np.mean(losses)),
                 "mean_batch_rmse_factual": float(np.mean(losses_2)),

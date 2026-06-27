@@ -7,6 +7,16 @@ from src.models.ct_deconfound import OutcomePredictor, build_covariate_x
 from src.models.dynamic_model import DynamicParamNetwork
 from src.models.ct_history_encoder import CTHistoryEncoder, ProjectionHead
 from src.models.sequence_utils import gather_last_valid
+from src.utils.stable_iql_em_defaults import stable_select
+
+
+def _hidden_list_from_config(config, path: str, default):
+    value = OmegaConf.select(config, path, default=default)
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, int):
+        return [value]
+    return list(value)
 
 
 def _expand_static_time_dim(H_t: dict, seq_len: int) -> dict:
@@ -23,13 +33,13 @@ class InferenceModel(nn.Module):
     def __init__(self, config):
         super(InferenceModel, self).__init__()
         self.config = config
-        self.z_dim = config['model']['z_dim']
-        self.hidden_dim = config['model']['inference']['hidden_dim']
-        self.num_layers = config['model']['inference']['num_layers']
-        self.do = config['model']['inference']['do']
-        self.hiddens_F_mu = config['model']['inference']['hiddens_F_mu']
-        self.hiddens_F_logvar = config['model']['inference']['hiddens_F_logvar']
-        self.history_dim = config['model']['auxiliary']['hidden_dim']
+        self.z_dim = int(stable_select(config, 'model.z_dim'))
+        self.hidden_dim = int(stable_select(config, 'model.inference.hidden_dim'))
+        self.num_layers = int(stable_select(config, 'model.inference.num_layers'))
+        self.do = bool(stable_select(config, 'model.inference.do'))
+        self.hiddens_F_mu = _hidden_list_from_config(config, 'model.inference.hiddens_F_mu', [self.hidden_dim])
+        self.hiddens_F_logvar = _hidden_list_from_config(config, 'model.inference.hiddens_F_logvar', [self.hidden_dim])
+        self.history_dim = int(OmegaConf.select(config, 'model.auxiliary.hidden_dim', default=self.hidden_dim))
         self.treatment_dim = config['dataset']['treatment_size']
         self.output_dim = config['dataset']['output_size']
         self.input_dim = self.history_dim + self.treatment_dim + self.output_dim + self.z_dim
@@ -38,8 +48,8 @@ class InferenceModel(nn.Module):
         self.input_size = config['dataset']['input_size']
         self.treatment_size = config['dataset']['treatment_size']
         self.predict_X = config['dataset']['predict_X']
-        self.treatment_hidden_dim = config['model']['generative']['treatment_hidden_dim']
-        self.dropout = config['exp']['dropout']
+        self.treatment_hidden_dim = int(OmegaConf.select(config, 'model.generative.treatment_hidden_dim', default=self.hidden_dim))
+        self.dropout = float(OmegaConf.select(config, 'exp.dropout', default=0.1))
 
         ds_dict = OmegaConf.to_container(config["dataset"], resolve=True)
         ct_x_dim = _covariate_stream_dim(ds_dict)
@@ -53,9 +63,9 @@ class InferenceModel(nn.Module):
             num_heads=4,
             num_layers=self.num_layers,
             dropout=self.dropout,
-            local_conv_layers=int(OmegaConf.select(config, "model.inference.local_conv_layers", default=0)),
-            local_conv_kernel_size=int(OmegaConf.select(config, "model.inference.local_conv_kernel_size", default=6)),
-            local_conv_dilation=int(OmegaConf.select(config, "model.inference.local_conv_dilation", default=1)),
+            local_conv_layers=int(stable_select(config, "model.inference.local_conv_layers")),
+            local_conv_kernel_size=int(stable_select(config, "model.inference.local_conv_kernel_size")),
+            local_conv_dilation=int(stable_select(config, "model.inference.local_conv_dilation")),
         )
         self.projection_head = ProjectionHead(input_dim=64, hidden_dim=64, output_dim=self.z_dim)
 
@@ -126,7 +136,11 @@ class InferenceModel(nn.Module):
         output_dim = self.hidden_dim
         self.transition_network = DynamicParamNetwork(input_dim, hidden_dim, output_dim, num_rbf_centers=5)
 
-        self.predict_y_history = config['model']['inference']['predict_y_history']
+        self.predict_y_history = _hidden_list_from_config(
+            config,
+            'model.inference.predict_y_history',
+            [self.hidden_dim],
+        )
         # 如果 self.predict_y_history 的值是 16，那么 self.predict_y_history 实际上等价于 [16]，即只指定了一个隐藏层为 16 维。
         #
         # 下面的代码会自动构造如下网络结构：

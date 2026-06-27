@@ -31,6 +31,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.evaluation.iql_planner_eval import aggregate_iql_planner_metrics
 from src.models.inference_model import InferenceModel
 from src.utils.em_ckpt import is_em_checkpoint, load_em_for_eval
+from src.utils.stable_iql_em_defaults import stable_select
 from src.utils.utils import repeat_static, set_seed, to_float
 
 logging.basicConfig(level=logging.INFO)
@@ -158,17 +159,17 @@ def main(args: DictConfig) -> None:
 
     tau_list = _list_from_config(
         OmegaConf.select(args, "exp.outer_curve_tau_list", default=None),
-        default=[1, 2, 3, 4, 5, 6],
+        default=_list_from_config(stable_select(args, "exp.iql_eval_tau_list"), [1, 2, 3, 4, 5, 6]),
     )
     worlds = tuple(
         w.strip()
         for w in _str_list_from_config(
             OmegaConf.select(args, "exp.outer_curve_worlds", default=None),
-            default=["sim"],
+            default=_str_list_from_config(stable_select(args, "exp.em_val_worlds"), ["sim"]),
         )
         if w.strip()
     )
-    sel_world = str(OmegaConf.select(args, "exp.outer_curve_selection_world", default=worlds[0]))
+    sel_world = str(OmegaConf.select(args, "exp.outer_curve_selection_world", default=stable_select(args, "exp.em_val_selection_world", worlds[0])))
 
     out_dir_raw = str(OmegaConf.select(args, "exp.outer_curve_output_dir", default="")).strip()
     out_dir = _resolve_path(out_dir_raw, original_cwd) if out_dir_raw else ckpt_dir / "outer_rmse_curve"
@@ -187,9 +188,9 @@ def main(args: DictConfig) -> None:
     split_name = "test" if bool(args.exp.test) else "val"
     fold = dataset_collection.test_f if bool(args.exp.test) else dataset_collection.val_f
     inference_model = InferenceModel(args).to(device)
-    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
-    autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
-    val_bs = int(OmegaConf.select(args, "exp.iql_val_batch_size", default=None) or args.exp.batch_size_val)
+    max_tau = float(stable_select(args, "exp.max_tau"))
+    autoregressive_eval = bool(stable_select(args, "exp.iql_eval_autoregressive"))
+    val_bs = int(stable_select(args, "exp.iql_val_batch_size") or args.exp.batch_size_val)
     base_seed = int(args.exp.seed)
 
     rows: List[Dict[str, Any]] = []
@@ -235,7 +236,6 @@ def main(args: DictConfig) -> None:
                     "mae_uns": float(m["mae_uns"]),
                     "rmse_uns": float(m["rmse_uns"]),
                     "rmse_norm": float(m["rmse_norm"]),
-                    "gift_rmse_percent": float(m["gift_rmse_percent"]),
                     "val_score": meta["val_score"],
                     "val_metric": meta["val_metric"],
                     "checkpoint_type": meta["checkpoint_type"],
@@ -267,7 +267,6 @@ def main(args: DictConfig) -> None:
             "mae_uns",
             "rmse_uns",
             "rmse_norm",
-            "gift_rmse_percent",
             "val_score",
             "val_metric",
             "checkpoint_type",

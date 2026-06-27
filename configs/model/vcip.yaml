@@ -1,88 +1,20 @@
 # @package _global_
+# Temporary config name inherited from the original VCIP codebase. This file now
+# describes the one-stage local/global CT+IQL EM method used in our Tumor runs.
 model:
-  _target_: src.models.vae_model.VAEModel
   name: VCIP
-  z_dim: 16
-  auxiliary:
-    _target_: src.models.auxiliary_model.AuxiliaryModel
-    hidden_dim: 16
-    num_layers: 2
-    hiddens_G_y:
-    - 16
-    - 16
-    hiddens_G_x:
-    - 16
-    - 16
-    lr: 0.001
   inference:
     _target_: src.models.inference_model.InferenceModel
-    hidden_dim: 16
-    num_layers: 2
-    # Current one-stage paper setting: one local causal Conv1d layer, then global attention.
-    local_conv_layers: 1
-    local_conv_kernel_size: 6
-    local_conv_dilation: 1
-    hiddens_F_mu:
-    - 16
-    # - 16
-    hiddens_F_logvar:
-    - 16
-    # - 16
-    predict_y_history:
-    - 16
-    # - 16
-    do: True
-  generative:
-    _target_: src.models.generative_model.GenerativeModel
-    entropy_lambda: 1
-    hidden_dim: 16
-    treatment_hidden_dim: 16
-    num_layers: 2
-    hiddens_F_mu:
-    - 16
-    # - 16
-    hiddens_F_logvar:
-    - 16
-    # - 16
-    hiddens_decoder:
-    - 16
-    # - 16
-    hidden_action_decoder:
-    - 16
-    # - 16
-    hidden_action_decoder_step:
-    - 16
-    # - 16
-  lr: 0.001
+
 exp:
   seed: 10
-  batch_size: 512
+  batch_size: 1024
   batch_size_val: 128
-  num_samples: 10
-  dropout: 0.2
-  epochs: 100
-  patience: 20
-  lr: 0.01
-  weight_decay: 1.0e-05
-  lambda_X: 0.1
-  lambda_Y: 1
-  load_best: true
-  val: true
-  weights_ema: true
-  tau: 12
-  repeats: 10
-  lambda_step: 0.1
-  lambda_kl: 1
-  lambda_reg: 1
-  lambda_action: 1
-  lambda_hy: 1
-  beta_bound: -10
-  # One-stage CT+IQL EM fixed defaults live in src/utils/stable_iql_em_defaults.py.
-  # The old two-stage IQL planner entrypoint is disabled; use train_ct_iql_em.py.
+  dropout: 0.0
+  tau: 6
   log_config: false
-  # MLflow
   use_mlflow: true
   mlflow_experiment: vcip_tumor_one_step
   mlflow_uri: http://127.0.0.1:5000
   mlflow_log_artifacts: true
-  mlflow_combo_id: ""
+  mlflow_combo_id: ''

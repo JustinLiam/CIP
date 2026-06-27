@@ -53,6 +53,7 @@ cs = CubicSpline(t_control, f_control, bc_type='clamped')
 # Tumour constants per
 TUMOUR_CELL_DENSITY = 5.8 * 10 ** 8  # cells per cm^3
 TUMOUR_DEATH_THRESHOLD = calc_volume(13)  # assume spherical
+NOISE_SCALE = 0.0
 
 # Patient cancer stage. (mu, sigma, lower bound, upper bound) - for lognormal dist
 tumour_size_distributions = {'I': (1.72, 4.70, 0.3, 5.0),
@@ -283,7 +284,7 @@ def simulate_factual(simulation_params, seq_length, assigned_actions=None, rando
     chemo_probabilities = np.zeros((num_patients, seq_length))
     radio_probabilities = np.zeros((num_patients, seq_length))
 
-    noise_terms = 0.01 * np.random.randn(num_patients, seq_length)  # 5% cell variability
+    noise_terms = NOISE_SCALE * np.random.randn(num_patients, seq_length)
     # noise_terms *= 0
     recovery_rvs = np.random.rand(num_patients, seq_length)
 
@@ -460,7 +461,7 @@ def simulate_counterfactual_1_step(simulation_params, seq_length):
         # if i % 200 == 0:
         #     logging.info("Simulating patient {} of {}".format(i, num_patients))
 
-        noise = 0.01 * np.random.randn(seq_length)  # 5% cell variability
+        noise = NOISE_SCALE * np.random.randn(seq_length)
         recovery_rvs = np.random.rand(seq_length)
 
         # initial values
@@ -662,7 +663,7 @@ def simulate_counterfactuals_treatment_seq(simulation_params, seq_length, projec
         # if i % 200 == 0:
         #     logging.info("Simulating patient {} of {}".format(i, num_patients))
 
-        noise = 0.01 * np.random.randn(seq_length + projection_horizon)  # 5% cell variability
+        noise = NOISE_SCALE * np.random.randn(seq_length + projection_horizon)
         recovery_rvs = np.random.rand(seq_length)
 
         # initial values
@@ -859,7 +860,7 @@ def simulate_output_after_actions(Ht, actions, scaling_params):
     sequence_lengths = np.zeros(num_patients)
     
     drug_half_life = 1  # one day half life for drugs
-    noise = 0.01 * np.random.randn(num_patients, current_t + projection_horizon + 1)
+    noise = NOISE_SCALE * np.random.randn(num_patients, current_t + projection_horizon + 1)
 
     # noise *= 0
     
@@ -1006,6 +1007,5 @@ if __name__ == "__main__":
 
     # Plot patient
     plot_treatments(training_data, 572)
-
 
 

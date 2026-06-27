@@ -9,17 +9,31 @@ class CIPDataset(Dataset):
         self.data = data
         self.train = train
         self.tau = config.exp.tau
-        self.max_history_length = config.dataset.max_seq_length - 1
+        self.config = config
+        self.is_mimic = 'mimic' in str(config.dataset.name).lower()
+        if self.is_mimic and hasattr(config.dataset, 'min_seq_length'):
+            # GIFT's MIMIC planning dataset samples history lengths against
+            # min_seq_length, then uses the real target slice as future vitals.
+            self.max_history_length = int(config.dataset.min_seq_length)
+        else:
+            self.max_history_length = int(config.dataset.max_seq_length) - 1
+        self.min_h = int(getattr(config.dataset, 'min_history_length', 20))
         self.repeats = config.exp.repeats
         np.random.seed(config.exp.seed)
+        history_high = self.max_history_length - self.tau
+        if history_high <= self.min_h:
+            raise ValueError(
+                f"Invalid CIP history sampling bounds: min_history_length={self.min_h}, "
+                f"max_history_length={self.max_history_length}, tau={self.tau}."
+            )
         # 生成不重复的history lengths
         if train:
             # arange from 5 to max_history_length - tau
             # self.history_lengths = np.arange(1, self.max_history_length - self.tau)
-            self.history_lengths = np.random.randint(20, self.max_history_length - self.tau, self.repeats * 4)
+            self.history_lengths = np.random.randint(self.min_h, history_high, self.repeats * 4)
             # self.history_lengths = np.arange(5, 6)
         else:
-            self.history_lengths = np.random.randint(20, self.max_history_length - self.tau, self.repeats)
+            self.history_lengths = np.random.randint(self.min_h, history_high, self.repeats)
             # self.history_lengths = np.arange(5, 6)
         self.history_lengths = np.unique(self.history_lengths)
         self.repeats = len(self.history_lengths)
@@ -39,7 +53,8 @@ class CIPDataset(Dataset):
 
         if not self.train:
             # print(f"self.max_history_length: {self.max_history_length}, self.tau: {self.tau}, history_length:{history_length}")
-            start_idx = np.random.randint(0, self.max_history_length - self.tau - history_length)
+            hi = max(self.max_history_length - self.tau - history_length, 1)
+            start_idx = 0 if self.is_mimic else np.random.randint(0, hi)
         else:
             start_idx = 0
         # print(f"start_idx: {start_idx}")
@@ -61,6 +76,8 @@ class CIPDataset(Dataset):
 
         if sample['static_features'].ndim != sample['outputs'].ndim:
             H_t['static_features'] = sample['static_features']
+        if 'sample_indices' in self.data:
+            H_t['sample_indices'] = self.data['sample_indices'][data_index]
         
 
         # print(f'keys of H_t: {H_t.keys()}')
@@ -68,6 +85,11 @@ class CIPDataset(Dataset):
         # print(f"sample['outputs'].shape: {sample['outputs'].shape}")
         # print(f"self.data['outputs'][0].shape: {self.data['outputs'][0].shape}")
         target = {k: v[history_length+start_idx:history_length+self.tau+start_idx] for k, v in sample.items() if hasattr(v, '__len__')}
+        if self.is_mimic:
+            H_t['sequence_lengths'] = history_length
+            if 'vitals' not in target:
+                raise KeyError("GIFT-aligned MIMIC evaluation requires target['vitals'] for future_vitals.")
+            H_t['future_vitals'] = target['vitals']
 
         # for key in H_t:
         #     # if key == 'static_features':

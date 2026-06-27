@@ -194,28 +194,32 @@ def map_values(array):
             
     return mapped_array
 
+def _has_data_split(dataset_collection, split_name: str) -> bool:
+    split = getattr(dataset_collection, split_name, None)
+    return split is not None and getattr(split, 'data', None) is not None
+
 def add_float_treatment(dataset_collection):
-    if hasattr(dataset_collection, 'train_f'):
+    if _has_data_split(dataset_collection, 'train_f'):
         dataset_collection.train_f.data['current_treatments_float'] = map_values(dataset_collection.train_f.data['current_treatments'])
         dataset_collection.train_f.data['prev_treatments_float'] = map_values(dataset_collection.train_f.data['prev_treatments'])
-    if hasattr(dataset_collection, 'val_f'):
+    if _has_data_split(dataset_collection, 'val_f'):
         dataset_collection.val_f.data['current_treatments_float'] = map_values(dataset_collection.val_f.data['current_treatments'])
         dataset_collection.val_f.data['prev_treatments_float'] = map_values(dataset_collection.val_f.data['prev_treatments'])
-    if hasattr(dataset_collection, 'test_f'):
+    if _has_data_split(dataset_collection, 'test_f'):
         dataset_collection.test_f.data['current_treatments_float'] = map_values(dataset_collection.test_f.data['current_treatments'])
         dataset_collection.test_f.data['prev_treatments_float'] = map_values(dataset_collection.test_f.data['prev_treatments'])
-    if hasattr(dataset_collection, 'test_f_multi'):
+    if _has_data_split(dataset_collection, 'test_f_multi'):
         dataset_collection.test_f_multi.data['current_treatments_float'] = map_values(dataset_collection.test_f_multi.data['current_treatments'])
         dataset_collection.test_f_multi.data['prev_treatments_float'] = map_values(dataset_collection.test_f_multi.data['prev_treatments'])
         dataset_collection.test_f_multi.data_processed_seq['current_treatments_float'] = map_values(dataset_collection.test_f_multi.data_processed_seq['current_treatments'])
         dataset_collection.test_f_multi.data_processed_seq['prev_treatments_float'] = map_values(dataset_collection.test_f_multi.data_processed_seq['prev_treatments'])
-    if hasattr(dataset_collection, 'test_cf'):
+    if _has_data_split(dataset_collection, 'test_cf'):
         dataset_collection.test_cf.data['current_treatments_float'] = map_values(dataset_collection.test_cf.data['current_treatments'])
         dataset_collection.test_cf.data['prev_treatments_float'] = map_values(dataset_collection.test_cf.data['prev_treatments'])
-    if hasattr(dataset_collection, 'test_cf_one_step'):
+    if _has_data_split(dataset_collection, 'test_cf_one_step'):
         dataset_collection.test_cf_one_step.data['current_treatments_float'] = map_values(dataset_collection.test_cf_one_step.data['current_treatments'])
         dataset_collection.test_cf_one_step.data['prev_treatments_float'] = map_values(dataset_collection.test_cf_one_step.data['prev_treatments'])
-    if hasattr(dataset_collection, 'test_cf_treatment_seq'):
+    if _has_data_split(dataset_collection, 'test_cf_treatment_seq'):
         dataset_collection.test_cf_treatment_seq.data['current_treatments_float'] = map_values(dataset_collection.test_cf_treatment_seq.data['current_treatments'])
         dataset_collection.test_cf_treatment_seq.data['prev_treatments_float'] = map_values(dataset_collection.test_cf_treatment_seq.data['prev_treatments'])
         dataset_collection.test_cf_treatment_seq.data_processed_seq['current_treatments_float'] = map_values(dataset_collection.test_cf_treatment_seq.data_processed_seq['current_treatments'])
@@ -229,27 +233,27 @@ def repeat_static(dataset_collection):
     :param dataset_collection:
     :return:
     """
-    if hasattr(dataset_collection, 'train_f'):
+    if _has_data_split(dataset_collection, 'train_f'):
         static_expanded = np.expand_dims(dataset_collection.train_f.data['static_features'], axis=1)
         dataset_collection.train_f.data['static_features'] = np.repeat(static_expanded, dataset_collection.train_f.data['outputs'].shape[1], axis=1)
-    if hasattr(dataset_collection, 'val_f'):
+    if _has_data_split(dataset_collection, 'val_f'):
         static_expanded = np.expand_dims(dataset_collection.val_f.data['static_features'], axis=1)
         dataset_collection.val_f.data['static_features'] = np.repeat(static_expanded, dataset_collection.val_f.data['outputs'].shape[1], axis=1)
-    if hasattr(dataset_collection, 'test_f'):
+    if _has_data_split(dataset_collection, 'test_f'):
         static_expanded = np.expand_dims(dataset_collection.test_f.data['static_features'], axis=1)
         dataset_collection.test_f.data['static_features'] = np.repeat(static_expanded, dataset_collection.test_f.data['outputs'].shape[1], axis=1)
-    if hasattr(dataset_collection, 'test_f_multi'):
+    if _has_data_split(dataset_collection, 'test_f_multi'):
         static_expanded = np.expand_dims(dataset_collection.test_f_multi.data['static_features'], axis=1)
         dataset_collection.test_f_multi.data['static_features'] = np.repeat(static_expanded, dataset_collection.test_f_multi.data['outputs'].shape[1], axis=1)
         static_expanded = np.expand_dims(dataset_collection.test_f_multi.data_processed_seq['static_features'], axis=1)
         dataset_collection.test_f_multi.data_processed_seq['static_features'] = np.repeat(static_expanded, dataset_collection.test_f_multi.data_processed_seq['outputs'].shape[1], axis=1)
-    if hasattr(dataset_collection, 'test_cf'):
+    if _has_data_split(dataset_collection, 'test_cf'):
         static_expanded = np.expand_dims(dataset_collection.test_cf.data['static_features'], axis=1)
         dataset_collection.test_cf.data['static_features'] = np.repeat(static_expanded, dataset_collection.test_cf.data['outputs'].shape[1], axis=1)
-    if hasattr(dataset_collection, 'test_cf_one_step'):
+    if _has_data_split(dataset_collection, 'test_cf_one_step'):
         static_expanded = np.expand_dims(dataset_collection.test_cf_one_step.data['static_features'], axis=1)
         dataset_collection.test_cf_one_step.data['static_features'] = np.repeat(static_expanded, dataset_collection.test_cf_one_step.data['outputs'].shape[1], axis=1)
-    if hasattr(dataset_collection, 'test_cf_treatment_seq'):
+    if _has_data_split(dataset_collection, 'test_cf_treatment_seq'):
         static_expanded = np.expand_dims(dataset_collection.test_cf_treatment_seq.data['static_features'], axis=1)
         dataset_collection.test_cf_treatment_seq.data['static_features'] = np.repeat(static_expanded, dataset_collection.test_cf_treatment_seq.data['outputs'].shape[1], axis=1)
         static_expanded = np.expand_dims(dataset_collection.test_cf_treatment_seq.data_processed_seq['static_features'], axis=1)
@@ -258,27 +262,27 @@ def repeat_static(dataset_collection):
     return dataset_collection
 
 def del_static(dataset_collection):
-    if hasattr(dataset_collection, 'train_f'):
+    if _has_data_split(dataset_collection, 'train_f'):
         static_expanded = np.expand_dims(dataset_collection.train_f.data['static_features'], axis=1)
         dataset_collection.train_f.data['static_features'] = None
-    if hasattr(dataset_collection, 'val_f'):
+    if _has_data_split(dataset_collection, 'val_f'):
         static_expanded = np.expand_dims(dataset_collection.val_f.data['static_features'], axis=1)
         dataset_collection.val_f.data['static_features'] = None
-    if hasattr(dataset_collection, 'test_f'):
+    if _has_data_split(dataset_collection, 'test_f'):
         static_expanded = np.expand_dims(dataset_collection.test_f.data['static_features'], axis=1)
         dataset_collection.test_f.data['static_features'] = None
-    if hasattr(dataset_collection, 'test_f_multi'):
+    if _has_data_split(dataset_collection, 'test_f_multi'):
         static_expanded = np.expand_dims(dataset_collection.test_f_multi.data['static_features'], axis=1)
         dataset_collection.test_f_multi.data['static_features'] = None
         static_expanded = np.expand_dims(dataset_collection.test_f_multi.data_processed_seq['static_features'], axis=1)
         dataset_collection.test_f_multi.data_processed_seq['static_features'] = None
-    if hasattr(dataset_collection, 'test_cf'):
+    if _has_data_split(dataset_collection, 'test_cf'):
         static_expanded = np.expand_dims(dataset_collection.test_cf.data['static_features'], axis=1)
         dataset_collection.test_cf.data['static_features'] = None
-    if hasattr(dataset_collection, 'test_cf_one_step'):
+    if _has_data_split(dataset_collection, 'test_cf_one_step'):
         static_expanded = np.expand_dims(dataset_collection.test_cf_one_step.data['static_features'], axis=1)
         dataset_collection.test_cf_one_step.data['static_features'] = None
-    if hasattr(dataset_collection, 'test_cf_treatment_seq'):
+    if _has_data_split(dataset_collection, 'test_cf_treatment_seq'):
         static_expanded = np.expand_dims(dataset_collection.test_cf_treatment_seq.data['static_features'], axis=1)
         dataset_collection.test_cf_treatment_seq.data['static_features'] = None
         static_expanded = np.expand_dims(dataset_collection.test_cf_treatment_seq.data_processed_seq['static_features'], axis=1)
@@ -287,27 +291,27 @@ def del_static(dataset_collection):
     return dataset_collection
 
 def to_float(dataset_collection):
-    if hasattr(dataset_collection, 'train_f'):
+    if _has_data_split(dataset_collection, 'train_f'):
         for key in dataset_collection.train_f.data.keys():
             dataset_collection.train_f.data[key] = dataset_collection.train_f.data[key].astype(np.float32)
-    if hasattr(dataset_collection, 'val_f'):
+    if _has_data_split(dataset_collection, 'val_f'):
         for key in dataset_collection.val_f.data.keys():
             dataset_collection.val_f.data[key] = dataset_collection.val_f.data[key].astype(np.float32)
-    if hasattr(dataset_collection, 'test_f'):
+    if _has_data_split(dataset_collection, 'test_f'):
         for key in dataset_collection.test_f.data.keys():
             dataset_collection.test_f.data[key] = dataset_collection.test_f.data[key].astype(np.float32)
-    if hasattr(dataset_collection, 'test_f_multi'):
+    if _has_data_split(dataset_collection, 'test_f_multi'):
         for key in dataset_collection.test_f_multi.data.keys():
             dataset_collection.test_f_multi.data[key] = dataset_collection.test_f_multi.data[key].astype(np.float32)
         for key in dataset_collection.test_f_multi.data_processed_seq.keys():
             dataset_collection.test_f_multi.data_processed_seq[key] = dataset_collection.test_f_multi.data_processed_seq[key].astype(np.float32)
-    if hasattr(dataset_collection, 'test_cf'):
+    if _has_data_split(dataset_collection, 'test_cf'):
         for key in dataset_collection.test_cf.data.keys():
             dataset_collection.test_cf.data[key] = dataset_collection.test_cf.data[key].astype(np.float32)
-    if hasattr(dataset_collection, 'test_cf_one_step'):
+    if _has_data_split(dataset_collection, 'test_cf_one_step'):
         for key in dataset_collection.test_cf_one_step.data.keys():
             dataset_collection.test_cf_one_step.data[key] = dataset_collection.test_cf_one_step.data[key].astype(np.float32)
-    if hasattr(dataset_collection, 'test_cf_treatment_seq'):
+    if _has_data_split(dataset_collection, 'test_cf_treatment_seq'):
         for key in dataset_collection.test_cf_treatment_seq.data.keys():
             dataset_collection.test_cf_treatment_seq.data[key] = dataset_collection.test_cf_treatment_seq.data[key].astype(np.float32)
         try:
@@ -319,27 +323,27 @@ def to_float(dataset_collection):
     return dataset_collection
 
 def to_double(dataset_collection):
-    if hasattr(dataset_collection, 'train_f'):
+    if _has_data_split(dataset_collection, 'train_f'):
         for key in dataset_collection.train_f.data.keys():
             dataset_collection.train_f.data[key] = dataset_collection.train_f.data[key].astype(np.float64)
-    if hasattr(dataset_collection, 'val_f'):
+    if _has_data_split(dataset_collection, 'val_f'):
         for key in dataset_collection.val_f.data.keys():
             dataset_collection.val_f.data[key] = dataset_collection.val_f.data[key].astype(np.float64)
-    if hasattr(dataset_collection, 'test_f'):
+    if _has_data_split(dataset_collection, 'test_f'):
         for key in dataset_collection.test_f.data.keys():
             dataset_collection.test_f.data[key] = dataset_collection.test_f.data[key].astype(np.float64)
-    if hasattr(dataset_collection, 'test_f_multi'):
+    if _has_data_split(dataset_collection, 'test_f_multi'):
         for key in dataset_collection.test_f_multi.data.keys():
             dataset_collection.test_f_multi.data[key] = dataset_collection.test_f_multi.data[key].astype(np.float64)
         for key in dataset_collection.test_f_multi.data_processed_seq.keys():
             dataset_collection.test_f_multi.data_processed_seq[key] = dataset_collection.test_f_multi.data_processed_seq[key].astype(np.float64)
-    if hasattr(dataset_collection, 'test_cf'):
+    if _has_data_split(dataset_collection, 'test_cf'):
         for key in dataset_collection.test_cf.data.keys():
             dataset_collection.test_cf.data[key] = dataset_collection.test_cf.data[key].astype(np.float64)
-    if hasattr(dataset_collection, 'test_cf_one_step'):
+    if _has_data_split(dataset_collection, 'test_cf_one_step'):
         for key in dataset_collection.test_cf_one_step.data.keys():
             dataset_collection.test_cf_one_step.data[key] = dataset_collection.test_cf_one_step.data[key].astype(np.float64)
-    if hasattr(dataset_collection, 'test_cf_treatment_seq'):
+    if _has_data_split(dataset_collection, 'test_cf_treatment_seq'):
         for key in dataset_collection.test_cf_treatment_seq.data.keys():
             dataset_collection.test_cf_treatment_seq.data[key] = dataset_collection.test_cf_treatment_seq.data[key].astype(np.float64)
         try:

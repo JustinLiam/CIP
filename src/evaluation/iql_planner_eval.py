@@ -17,6 +17,7 @@ from src.evaluation.iql_action_selection import select_iql_policy_action
 from src.models.inference_model import InferenceModel
 from src.models.sequence_utils import gather_last_valid
 from src.planners.iql_planner import IQLPlanner
+from src.utils.stable_iql_em_defaults import stable_select
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,6 @@ logger = logging.getLogger(__name__)
 #   - "predictor": use the learned OutcomePredictor loaded from ct_best_encoder.pt
 #                  (model-based OPE; works on real data too).
 _VALID_WORLDS = ("sim", "predictor")
-GIFT_TUMOR_VOLUME_NORMALIZER = 1150.0
 
 
 def _actions_to_sim_interval(raw: np.ndarray, max_action: float) -> np.ndarray:
@@ -66,6 +66,35 @@ def _unscaled_cancer_volume_np(y_norm: np.ndarray, mean_ser, std_ser) -> np.ndar
     return y_norm.astype(np.float64) * s + m
 
 
+def _split_scaling_params(scaling_params):
+    if isinstance(scaling_params, dict) and "output_means" in scaling_params:
+        means = np.asarray(scaling_params["output_means"], dtype=np.float64).reshape(1, -1)
+        stds = np.asarray(scaling_params["output_stds"], dtype=np.float64).reshape(1, -1)
+        return means, stds
+    mean_ser, std_ser = scaling_params
+    if hasattr(mean_ser, "__getitem__") and "cancer_volume" in mean_ser:
+        return (
+            np.asarray([[float(mean_ser["cancer_volume"])]], dtype=np.float64),
+            np.asarray([[float(std_ser["cancer_volume"])]], dtype=np.float64),
+        )
+    return (
+        np.asarray(mean_ser, dtype=np.float64).reshape(1, -1),
+        np.asarray(std_ser, dtype=np.float64).reshape(1, -1),
+    )
+
+
+def _unscale_outputs_np(y_norm: np.ndarray, scaling_params) -> np.ndarray:
+    means, stds = _split_scaling_params(scaling_params)
+    return np.asarray(y_norm, dtype=np.float64) * stds + means
+
+
+def _unscale_outputs_torch(y_norm: torch.Tensor, scaling_params, device: torch.device) -> torch.Tensor:
+    means, stds = _split_scaling_params(scaling_params)
+    mean_t = torch.as_tensor(means, dtype=y_norm.dtype, device=device)
+    std_t = torch.as_tensor(stds, dtype=y_norm.dtype, device=device)
+    return y_norm * std_t + mean_t
+
+
 def _fingerprint_np(arr: np.ndarray, max_items: int = 64) -> str:
     flat = np.asarray(arr, dtype=np.float64).reshape(-1)
     if flat.size > max_items:
@@ -102,14 +131,13 @@ def _extend_h_work_after_one_step(
     H: dict,
     a_sim: torch.Tensor,
     y_norm: torch.Tensor,
-    mean_ser,
-    std_ser,
+    scaling_params,
     device: torch.device,
 ) -> None:
     B = a_sim.size(0)
-    y_col = y_norm.view(B, 1)
-    y_ch = y_col.unsqueeze(-1)
-    y_uns = y_col * float(std_ser["cancer_volume"]) + float(mean_ser["cancer_volume"])
+    y_step = y_norm.view(B, -1)
+    y_ch = y_step.unsqueeze(1)
+    y_uns = _unscale_outputs_torch(y_step, scaling_params, device)
 
     active = H.get("active_entries")
     last_curr = gather_last_valid(H["current_treatments"], active).unsqueeze(1).clone()
@@ -124,14 +152,21 @@ def _extend_h_work_after_one_step(
         [ae, torch.ones(B, 1, ae.size(-1), device=device, dtype=ae.dtype)], dim=1
     )
 
-    H["cancer_volume"] = torch.cat([H["cancer_volume"], y_col], dim=1)
+    if "sequence_lengths" in H:
+        H["sequence_lengths"] = H["sequence_lengths"] + 1
 
-    uo = H["unscaled_outputs"]
-    y_u = y_uns.unsqueeze(-1) if uo.dim() == 3 else y_uns
-    H["unscaled_outputs"] = torch.cat([uo, y_u], dim=1)
+    if "cancer_volume" in H:
+        H["cancer_volume"] = torch.cat([H["cancer_volume"], y_step[:, 0:1]], dim=1)
 
-    H["chemo_application"] = torch.cat([H["chemo_application"], a_sim[:, 0:1]], dim=1)
-    H["radio_application"] = torch.cat([H["radio_application"], a_sim[:, 1:2]], dim=1)
+    if "unscaled_outputs" in H:
+        uo = H["unscaled_outputs"]
+        y_u = y_uns.unsqueeze(1) if uo.dim() == 3 else y_uns
+        H["unscaled_outputs"] = torch.cat([uo, y_u], dim=1)
+
+    if "chemo_application" in H:
+        H["chemo_application"] = torch.cat([H["chemo_application"], a_sim[:, 0:1]], dim=1)
+    if "radio_application" in H:
+        H["radio_application"] = torch.cat([H["radio_application"], a_sim[:, 1:2]], dim=1)
 
     if "static_features" in H:
         sf = H["static_features"]
@@ -139,10 +174,22 @@ def _extend_h_work_after_one_step(
             last = sf[:, -1:, :].expand(-1, 1, -1)
             H["static_features"] = torch.cat([sf, last], dim=1)
 
+    if "vitals" in H and "future_vitals" in H and H["future_vitals"].size(1) > 0:
+        next_vitals = H["future_vitals"][:, :1, :]
+        H["vitals"] = torch.cat([H["vitals"], next_vitals], dim=1)
+        H["future_vitals"] = H["future_vitals"][:, 1:, :]
+        if "current_covariates" in H:
+            H["current_covariates"] = torch.cat([H["current_covariates"], next_vitals], dim=1)
+        if "next_covariates" in H:
+            H["next_covariates"] = H["next_covariates"][:, 1:, :]
+        if "next_vitals" in H:
+            H["next_vitals"] = H["next_vitals"][:, 1:, :]
+        return
+
     if "current_covariates" in H:
         cc = H["current_covariates"]
         ext = cc[:, -1:, :].clone()
-        ext[:, :, 0:1] = y_ch
+        ext[:, :, 0:y_step.size(-1)] = y_ch
         H["current_covariates"] = torch.cat([cc, ext], dim=1)
 
 
@@ -216,7 +263,7 @@ def _simulate_a_seq_final_y(
                 fold=fold, scaling_params=scaling_params,
                 inference_model=inference_model, device=device,
             )
-            _extend_h_work_after_one_step(H_work, a_step, y_norm, mean_ser, std_ser, torch.device(device))
+            _extend_h_work_after_one_step(H_work, a_step, y_norm, scaling_params, torch.device(device))
             y_last = y_norm
         assert y_last is not None
         return y_last.detach().cpu().numpy()
@@ -396,8 +443,7 @@ def _compute_world_metrics(
     output_after_actions_list: list,
     ture_output_list: list,
     factual_output_list: list | None,
-    mean_ser,
-    std_ser,
+    scaling_params,
     std: float,
     batch_rmse_plan: list,
     batch_rmse_fact: list | None,
@@ -414,32 +460,25 @@ def _compute_world_metrics(
     if factual_output_list is not None and len(factual_output_list) > 0:
         fact_arr = np.concatenate(factual_output_list, axis=0)
         rmse_factual_norm = float(np.sqrt(((fact_arr - true_arr) ** 2).mean()))
-        fact_y_uns = _unscaled_cancer_volume_np(fact_arr, mean_ser, std_ser).reshape(-1)
-        true_y_uns_full = _unscaled_cancer_volume_np(true_arr, mean_ser, std_ser).reshape(-1)
+        fact_y_uns = _unscale_outputs_np(fact_arr, scaling_params).reshape(-1)
+        true_y_uns_full = _unscale_outputs_np(true_arr, scaling_params).reshape(-1)
         mae_factual_norm = float(np.mean(np.abs(fact_arr.reshape(-1) - true_arr.reshape(-1))))
         mae_factual_uns = float(np.mean(np.abs(fact_y_uns - true_y_uns_full)))
 
     iql_y_norm = pred_arr.reshape(-1)
     true_y_norm = true_arr.reshape(-1)
-    iql_y_uns = _unscaled_cancer_volume_np(pred_arr, mean_ser, std_ser).reshape(-1)
-    true_y_uns = _unscaled_cancer_volume_np(true_arr, mean_ser, std_ser).reshape(-1)
+    iql_y_uns = _unscale_outputs_np(pred_arr, scaling_params).reshape(-1)
+    true_y_uns = _unscale_outputs_np(true_arr, scaling_params).reshape(-1)
 
     mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
     mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
     rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
-    gift_rmse = rmse_uns
-    gift_rmse_percent = float(rmse_uns / GIFT_TUMOR_VOLUME_NORMALIZER * 100.0)
-    gift_mae_percent = float(mae_uns / GIFT_TUMOR_VOLUME_NORMALIZER * 100.0)
-
     out: Dict[str, Any] = {
         "mae_norm": mae_norm,
         "mae_uns": mae_uns,
         "rmse_norm": rmse_norm,
         "rmse_uns": rmse_uns,
         "rmse_norm_x_std": rmse_norm * std,
-        "gift_rmse": gift_rmse,
-        "gift_rmse_percent": gift_rmse_percent,
-        "gift_mae_percent": gift_mae_percent,
         "mean_batch_rmse_plan": float(np.mean(batch_rmse_plan)) if batch_rmse_plan else None,
         "mean_batch_rmse_factual": float(np.mean(batch_rmse_fact)) if batch_rmse_fact else None,
         "rmse_factual_norm": rmse_factual_norm,
@@ -504,14 +543,15 @@ def aggregate_iql_planner_metrics(
 
     data = fold.data
     max_action = float(planner.cfg.max_action)
-    action_selector = str(OmegaConf.select(args, "exp.iql_eval_action_selector", default="mean"))
-    action_candidate_actions = int(OmegaConf.select(args, "exp.iql_eval_candidate_actions", default=16))
-    action_q_bc_penalty = float(OmegaConf.select(args, "exp.iql_eval_q_bc_penalty", default=0.0))
-    action_candidate_noise_std = float(
-        OmegaConf.select(args, "exp.iql_eval_candidate_noise_std", default=0.25)
-    )
-    mean_ser, std_ser = dataset_collection.train_scaling_params
+    action_selector = str(stable_select(args, "exp.iql_eval_action_selector"))
+    action_candidate_actions = int(stable_select(args, "exp.iql_eval_candidate_actions"))
+    action_q_bc_penalty = float(stable_select(args, "exp.iql_eval_q_bc_penalty"))
+    action_candidate_noise_std = float(stable_select(args, "exp.iql_eval_candidate_noise_std"))
     scaling_params = dataset_collection.train_scaling_params
+    if isinstance(scaling_params, (tuple, list)) and len(scaling_params) >= 2:
+        mean_ser, std_ser = scaling_params[0], scaling_params[1]
+    else:
+        mean_ser, std_ser = None, None
 
     original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=tau))
     args.exp.tau = int(tau)
@@ -523,7 +563,6 @@ def aggregate_iql_planner_metrics(
     collect_series = bool(return_series or debug_panel)
     ture_output_list: list = []
     per_world_pred: Dict[str, list] = {w: [] for w in worlds}
-    per_world_sequence_replay_pred: Dict[str, list] = {w: [] for w in worlds}
     per_world_fact: Dict[str, list] = {w: [] for w in worlds} if include_factual_traj_rmse else {w: [] for w in worlds}
     per_world_batch_rmse_plan: Dict[str, list] = {w: [] for w in worlds}
     per_world_batch_rmse_fact: Dict[str, list] = {w: [] for w in worlds}
@@ -609,7 +648,7 @@ def aggregate_iql_planner_metrics(
                             inference_model=inference_model, device=device,
                         )
                         _extend_h_work_after_one_step(
-                            H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
+                            H_work, a_sim, y_norm, scaling_params, torch.device(device)
                         )
                         closed_loop_output_after_actions = y_norm.detach().cpu().numpy()
                         if world_debug is not None and len(history_checks) < 2:
@@ -719,17 +758,15 @@ def aggregate_iql_planner_metrics(
                         "max": float(a_seq_np.max()),
                     }
 
-                sequence_replay_output_after_actions = _simulate_a_seq_final_y(
-                    world, H_t, a_seq,
-                    fold=fold, scaling_params=scaling_params,
-                    inference_model=inference_model, device=device,
-                    mean_ser=mean_ser, std_ser=std_ser,
-                )
                 if closed_loop_output_after_actions is None:
-                    closed_loop_output_after_actions = sequence_replay_output_after_actions
+                    closed_loop_output_after_actions = _simulate_a_seq_final_y(
+                        world, H_t, a_seq,
+                        fold=fold, scaling_params=scaling_params,
+                        inference_model=inference_model, device=device,
+                        mean_ser=mean_ser, std_ser=std_ser,
+                    )
                 output_after_actions = closed_loop_output_after_actions
                 per_world_pred[world].append(output_after_actions)
-                per_world_sequence_replay_pred[world].append(sequence_replay_output_after_actions)
 
                 if include_factual_traj_rmse:
                     true_actions = targets["current_treatments"]
@@ -767,38 +804,12 @@ def aggregate_iql_planner_metrics(
             output_after_actions_list=per_world_pred[world],
             ture_output_list=ture_output_list,
             factual_output_list=(per_world_fact[world] if include_factual_traj_rmse else None),
-            mean_ser=mean_ser,
-            std_ser=std_ser,
+            scaling_params=scaling_params,
             std=std,
             batch_rmse_plan=per_world_batch_rmse_plan[world],
             batch_rmse_fact=per_world_batch_rmse_fact[world] if include_factual_traj_rmse else None,
             return_series=collect_series,
         )
-        sequence_replay_metrics = _compute_world_metrics(
-            output_after_actions_list=per_world_sequence_replay_pred[world],
-            ture_output_list=ture_output_list,
-            factual_output_list=None,
-            mean_ser=mean_ser,
-            std_ser=std_ser,
-            std=std,
-            batch_rmse_plan=[],
-            batch_rmse_fact=None,
-            return_series=False,
-        )
-        per_world_metrics[world].update({
-            "closed_loop_rmse": per_world_metrics[world]["rmse_uns"],
-            "closed_loop_rmse_uns": per_world_metrics[world]["rmse_uns"],
-            "closed_loop_rmse_norm": per_world_metrics[world]["rmse_norm"],
-            "closed_loop_mae_uns": per_world_metrics[world]["mae_uns"],
-            "closed_loop_mae_norm": per_world_metrics[world]["mae_norm"],
-            "sequence_replay_rmse": sequence_replay_metrics["rmse_uns"],
-            "sequence_replay_rmse_uns": sequence_replay_metrics["rmse_uns"],
-            "sequence_replay_rmse_norm": sequence_replay_metrics["rmse_norm"],
-            "sequence_replay_mae_uns": sequence_replay_metrics["mae_uns"],
-            "sequence_replay_mae_norm": sequence_replay_metrics["mae_norm"],
-            "sequence_replay_gift_rmse": sequence_replay_metrics["gift_rmse"],
-            "sequence_replay_gift_rmse_percent": sequence_replay_metrics["gift_rmse_percent"],
-        })
         if action_diagnostics:
             action_diag = _finalize_action_diagnostics(per_world_action_diag[world])
             if action_diag:

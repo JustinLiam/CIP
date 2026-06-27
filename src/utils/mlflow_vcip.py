@@ -273,26 +273,8 @@ class VCIPMlflowTracker:
             metrics[f"{prefix}/rmse_norm"] = float(wm["rmse_norm"])
             if wm.get("rmse_uns") is not None:
                 metrics[f"{prefix}/rmse_uns"] = float(wm["rmse_uns"])
-            if wm.get("gift_rmse") is not None:
-                metrics[f"{prefix}/gift_rmse"] = float(wm["gift_rmse"])
-            if wm.get("gift_rmse_percent") is not None:
-                metrics[f"{prefix}/gift_rmse_percent"] = float(wm["gift_rmse_percent"])
-            if wm.get("gift_mae_percent") is not None:
-                metrics[f"{prefix}/gift_mae_percent"] = float(wm["gift_mae_percent"])
-            for key in (
-                "closed_loop_rmse",
-                "closed_loop_rmse_uns",
-                "closed_loop_rmse_norm",
-                "closed_loop_mae_uns",
-                "closed_loop_mae_norm",
-                "sequence_replay_rmse",
-                "sequence_replay_rmse_uns",
-                "sequence_replay_rmse_norm",
-                "sequence_replay_mae_uns",
-                "sequence_replay_mae_norm",
-            ):
-                if wm.get(key) is not None:
-                    metrics[f"{prefix}/{key}"] = float(wm[key])
+            if wm.get("rmse_norm_x_std") is not None:
+                metrics[f"{prefix}/rmse_norm_x_std"] = float(wm["rmse_norm_x_std"])
             metrics[f"{prefix}/{val_metric_key}"] = float(wm[val_metric_key])
             action_diag = wm.get("action_diagnostics", {})
             for key in (

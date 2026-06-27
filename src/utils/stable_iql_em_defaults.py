@@ -1,8 +1,8 @@
-"""Stable one-stage CT+IQL EM defaults.
+"""Fixed one-stage CT+IQL EM defaults.
 
-These values define the current paper configuration. They intentionally live in
-code instead of the public Hydra YAML so routine runs do not expose stale
-two-stage or sweep-only knobs as if they were still active experiment choices.
+The public Hydra model config exposes only method structure and routine run
+settings. Hyperparameters that are no longer swept live here as code defaults,
+so they are maintained in one place without cluttering the YAML file.
 """
 from typing import Any, Dict
 
@@ -10,6 +10,14 @@ from omegaconf import OmegaConf
 
 
 STABLE_IQL_EM_DEFAULTS: Dict[str, Any] = {
+    # One-stage local/global encoder structure
+    "model.z_dim": 16,
+    "model.inference.hidden_dim": 16,
+    "model.inference.num_layers": 2,
+    "model.inference.do": True,
+    "model.inference.local_conv_layers": 1,
+    "model.inference.local_conv_kernel_size": 6,
+    "model.inference.local_conv_dilation": 1,
     # IQL replay and reward construction
     "exp.iql_batch_size": 256,
     "exp.iql_max_patients": None,

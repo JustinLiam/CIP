@@ -31,6 +31,7 @@ from src.models.ct_encoder_weight import CTEncoderWeightModel  # noqa: E402
 from src.models.inference_model import InferenceModel  # noqa: E402
 from src.planners.iql_planner import _cap_renormalize_weights  # noqa: E402
 from src.utils.em_ckpt import load_em_ct_model, load_em_for_eval  # noqa: E402
+from src.utils.stable_iql_em_defaults import stable_select  # noqa: E402
 from src.utils.utils import repeat_static, set_seed, to_float  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -57,9 +58,10 @@ def _coerce_int_list(raw: Any, default: Optional[Iterable[int]] = None) -> List[
 def _resolve_tau_list(args: DictConfig) -> List[int]:
     raw = OmegaConf.select(args, "exp.action_diag_tau_list", default=None)
     if raw is None:
-        raw = OmegaConf.select(args, "exp.iql_eval_tau_list", default=None)
-    taus = _coerce_int_list(raw, default=[1, 2, 3, 4, 5, 6])
-    return taus or [1, 2, 3, 4, 5, 6]
+        raw = stable_select(args, "exp.iql_eval_tau_list")
+    default_taus = _coerce_int_list(stable_select(args, "exp.iql_eval_tau_list"), default=[1, 2, 3, 4, 5, 6])
+    taus = _coerce_int_list(raw, default=default_taus)
+    return taus or default_taus
 
 
 def _stats(x: np.ndarray) -> Dict[str, float]:
@@ -140,7 +142,7 @@ def _prepare_dataset(args: DictConfig):
 
 
 def _resolve_ckpt(args: DictConfig, original_cwd: Path, seed: int) -> Path:
-    raw = str(OmegaConf.select(args, "exp.em_eval_ckpt", default="")).strip()
+    raw = str(stable_select(args, "exp.em_eval_ckpt")).strip()
     if not raw:
         raise ValueError("Set exp.em_eval_ckpt to an EM checkpoint path or a template containing {seed}.")
     raw = raw.format(seed=seed)
@@ -154,25 +156,25 @@ def _resolve_ckpt(args: DictConfig, original_cwd: Path, seed: int) -> Path:
 
 def _replay_diagnostics(args: DictConfig, dataset_collection, ckpt_path: Path, planner, device: str) -> Dict[str, Any]:
     max_action = float(planner.cfg.max_action)
-    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
+    max_tau = float(stable_select(args, "exp.max_tau"))
     max_patients = OmegaConf.select(args, "exp.action_diag_replay_max_patients", default=256)
     max_patients = None if max_patients is None else int(max_patients)
     sample_n = int(OmegaConf.select(args, "exp.action_diag_replay_samples", default=4096))
 
     raw = build_iql_raw_transitions(
         dataset_collection.train_f.data,
-        reward_type=str(OmegaConf.select(args, "exp.iql_reward_type", default="negative_outcome")),
+        reward_type=str(stable_select(args, "exp.iql_reward_type")),
         max_patients=max_patients,
         max_action=max_action,
-        dataset_actions_unit_interval=bool(OmegaConf.select(args, "exp.iql_dataset_actions_unit_interval", default=True)),
+        dataset_actions_unit_interval=bool(stable_select(args, "exp.iql_dataset_actions_unit_interval")),
         max_tau=max_tau,
-        reward_clip=float(OmegaConf.select(args, "exp.iql_reward_clip", default=3.0)),
-        reward_scale=str(OmegaConf.select(args, "exp.iql_reward_scale", default="auto")),
-        reward_huber_delta=float(OmegaConf.select(args, "exp.iql_reward_huber_delta", default=1.0)),
-        samples_per_transition=int(OmegaConf.select(args, "exp.em_her_samples_per_transition", default=1)),
-        target_sampling=str(OmegaConf.select(args, "exp.iql_target_sampling", default="horizon_aligned")),
-        target_horizons=OmegaConf.select(args, "exp.iql_target_horizons", default=None),
-        horizon_terminal_done=bool(OmegaConf.select(args, "exp.iql_horizon_terminal_done", default=True)),
+        reward_clip=float(stable_select(args, "exp.iql_reward_clip")),
+        reward_scale=str(stable_select(args, "exp.iql_reward_scale")),
+        reward_huber_delta=float(stable_select(args, "exp.iql_reward_huber_delta")),
+        samples_per_transition=int(stable_select(args, "exp.em_her_samples_per_transition")),
+        target_sampling=str(stable_select(args, "exp.iql_target_sampling")),
+        target_horizons=stable_select(args, "exp.iql_target_horizons"),
+        horizon_terminal_done=bool(stable_select(args, "exp.iql_horizon_terminal_done")),
         seed=int(args.exp.seed) + 9109,
     )
     if not raw:
@@ -239,16 +241,16 @@ def _run_one_seed(args: DictConfig, seed: int, original_cwd: Path) -> Dict[str, 
     split_name = "test" if bool(OmegaConf.select(args, "exp.test", default=False)) else "val"
     fold = dataset_collection.test_f if split_name == "test" else dataset_collection.val_f
     tau_list = _resolve_tau_list(args)
-    grid_points = int(OmegaConf.select(args, "exp.action_diag_grid_points", default=OmegaConf.select(args, "exp.iql_val_action_grid_points", default=11)))
+    grid_points = int(OmegaConf.select(args, "exp.action_diag_grid_points", default=stable_select(args, "exp.iql_val_action_grid_points")))
     max_batches = OmegaConf.select(
         args,
         "exp.action_diag_max_batches",
-        default=OmegaConf.select(args, "exp.iql_val_action_diag_max_batches", default=2),
+        default=stable_select(args, "exp.iql_val_action_diag_max_batches"),
     )
     max_batches = None if max_batches is None else int(max_batches)
     val_bs = int(OmegaConf.select(args, "exp.batch_size_val", default=128))
-    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
-    autoreg = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
+    max_tau = float(stable_select(args, "exp.max_tau"))
+    autoreg = bool(stable_select(args, "exp.iql_eval_autoregressive"))
 
     per_tau = {}
     for tau in tau_list:

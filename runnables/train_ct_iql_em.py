@@ -45,9 +45,7 @@ logger = logging.getLogger(__name__)
 OmegaConf.register_new_resolver("toint", lambda x: int(x), replace=True)
 
 VAL_METRIC_KEYS = (
-    "mae_uns", "mae_norm", "rmse_uns", "rmse_norm", "gift_rmse", "gift_rmse_percent",
-    "closed_loop_rmse", "closed_loop_rmse_uns", "closed_loop_rmse_norm",
-    "sequence_replay_rmse", "sequence_replay_rmse_uns", "sequence_replay_rmse_norm",
+    "mae_uns", "mae_norm", "rmse_uns", "rmse_norm", "rmse_norm_x_std",
 )
 
 
@@ -100,6 +98,14 @@ def _mean_metric(metric_rows, key: str):
     if not vals:
         return None
     return float(sum(vals) / len(vals))
+
+
+def _dataset_run_slug(args: DictConfig) -> str:
+    name = str(OmegaConf.select(args, "dataset.name", default="dataset")).replace("/", "_")
+    coeff = OmegaConf.select(args, "dataset.coeff", default=None)
+    if coeff is not None:
+        return f"seed_{int(args.exp.seed)}_gamma_{int(coeff)}"
+    return f"seed_{int(args.exp.seed)}_{name}"
 
 
 @hydra.main(version_base=None, config_name="config.yaml", config_path="../configs/")
@@ -181,7 +187,7 @@ def main(args: DictConfig):
     if int(getattr(ct_model.ct_encoder, "global_attention_layers", 0)) <= 0:
         logger.warning("global_attention_layers <= 0: local-global encoder has no global attention layer.")
 
-    z_dim = int(args.model.z_dim)
+    z_dim = int(stable_select(args, "model.z_dim"))
     out_dim = int(args.dataset.output_size)
     act_dim = int(args.dataset.treatment_size)
     state_dim = z_dim + out_dim + 1 + act_dim
@@ -336,7 +342,7 @@ def main(args: DictConfig):
         out_dir = (
             original_cwd
             / "em_checkpoints"
-            / f"seed_{int(args.exp.seed)}_gamma_{int(args.dataset.coeff)}"
+            / _dataset_run_slug(args)
         )
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / "ct_iql_em_best.pt"
@@ -559,12 +565,11 @@ def main(args: DictConfig):
                         repeat_var = sum((x - tau_score) ** 2 for x in tau_repeat_scores) / len(tau_repeat_scores)
                         val_log_metrics[f"{tau_prefix}/{val_metric_key}_repeat_std"] = float(repeat_var ** 0.5)
                     for key in (
-                        "closed_loop_rmse",
-                        "closed_loop_rmse_uns",
-                        "closed_loop_rmse_norm",
-                        "sequence_replay_rmse",
-                        "sequence_replay_rmse_uns",
-                        "sequence_replay_rmse_norm",
+                        "mae_uns",
+                        "mae_norm",
+                        "rmse_uns",
+                        "rmse_norm",
+                        "rmse_norm_x_std",
                     ):
                         metric_mean = _mean_metric(tau_world_metrics, key)
                         if metric_mean is not None:

@@ -22,7 +22,6 @@ from torch.distributions import Distribution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eval_iql_planner import (  # noqa: E402
-    GIFT_TUMOR_VOLUME_NORMALIZER,
     _extend_h_work_after_one_step,
     _iql_augmented_state,
     _policy_to_sim_interval_torch,
@@ -38,6 +37,7 @@ from src.models.sequence_utils import gather_last_valid  # noqa: E402
 from src.planners.iql_planner import IQLPlanner  # noqa: E402
 from src.utils.em_ckpt import is_em_checkpoint, load_em_for_eval  # noqa: E402
 from src.utils.inference_ckpt import load_inference_checkpoint  # noqa: E402
+from src.utils.stable_iql_em_defaults import stable_select  # noqa: E402
 from src.utils.utils import repeat_static, set_seed, to_float  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -77,7 +77,7 @@ def _to_list(raw, default: Iterable[int]) -> List[int]:
 
 def _load_planner_and_encoder(args: DictConfig, original_cwd: Path, device: str):
     inference_model = InferenceModel(args).to(device)
-    em_eval_ckpt = str(OmegaConf.select(args, "exp.em_eval_ckpt", default="")).strip()
+    em_eval_ckpt = str(stable_select(args, "exp.em_eval_ckpt")).strip()
     planner_path = _resolve_iql_ckpt(args, original_cwd)
     em_path = Path(em_eval_ckpt) if em_eval_ckpt else planner_path
     if em_eval_ckpt and not em_path.is_absolute():
@@ -134,8 +134,8 @@ def main(args: DictConfig) -> None:
 
     inference_model, planner, ckpt_path = _load_planner_and_encoder(args, original_cwd, device)
     max_action = float(planner.cfg.max_action)
-    max_tau = float(OmegaConf.select(args, "exp.max_tau", default=12.0))
-    autoregressive_eval = bool(OmegaConf.select(args, "exp.iql_eval_autoregressive", default=True))
+    max_tau = float(stable_select(args, "exp.max_tau"))
+    autoregressive_eval = bool(stable_select(args, "exp.iql_eval_autoregressive"))
     batch_size = int(OmegaConf.select(args, "exp.batch_size_val", default=128))
     tau_list = _resolve_eval_tau_list(args)
     original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=max(tau_list)))
@@ -252,8 +252,6 @@ def main(args: DictConfig) -> None:
                 "top10pct_mse_share": _top_share(se, 0.10),
                 "top1pct_mae_share": _top_share(ae, 0.01),
                 "top5pct_mae_share": _top_share(ae, 0.05),
-                "gift_rmse_percent": float(np.sqrt(se.mean()) / GIFT_TUMOR_VOLUME_NORMALIZER * 100.0),
-                "gift_mae_percent": float(ae.mean() / GIFT_TUMOR_VOLUME_NORMALIZER * 100.0),
                 "checkpoint": str(ckpt_path),
             }
             summary_rows.append(row)
