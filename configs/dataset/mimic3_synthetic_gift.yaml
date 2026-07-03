@@ -6,7 +6,7 @@ dataset:
   path: data/processed/all_hourly_data.h5                  # Path with MIMIC-3 dataset (HDFStore)
   min_seq_length: 60                                       # Min sequence length in cohort
   max_seq_length: 60                                      # Max sequence length in cohort
-  max_number: 50                                          # Maximum number of patients in cohort
+  max_number: 500                                          # Maximum number of patients in cohort
   data_seed: ${exp.seed}
   projection_horizon: 10                                   # Range of tau-step-ahead prediction (tau = projection_horizon + 1)
   n_treatments_seq: 10                                     # Number of random treatments trajectories, sampled for each patient

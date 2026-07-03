@@ -13,6 +13,7 @@ Notes:
 """
 
 import logging
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -53,7 +54,7 @@ cs = CubicSpline(t_control, f_control, bc_type='clamped')
 # Tumour constants per
 TUMOUR_CELL_DENSITY = 5.8 * 10 ** 8  # cells per cm^3
 TUMOUR_DEATH_THRESHOLD = calc_volume(13)  # assume spherical
-NOISE_SCALE = 0.0
+NOISE_SCALE = float(os.environ.get("TUMOR_NOISE_SCALE", "0.0"))
 
 # Patient cancer stage. (mu, sigma, lower bound, upper bound) - for lognormal dist
 tumour_size_distributions = {'I': (1.72, 4.70, 0.3, 5.0),
@@ -1007,5 +1008,4 @@ if __name__ == "__main__":
 
     # Plot patient
     plot_treatments(training_data, 572)
-
 
