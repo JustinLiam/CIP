@@ -19,7 +19,7 @@ EM_CKPT="${EM_DIR}/ct_iql_em_best.pt"
 
 mkdir -p "${EM_DIR}"
 CUDA_VISIBLE_DEVICES="${GPU}" python runnables/train_ct_iql_em.py \
-  +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${GAMMA}*" \
+  +dataset=cancer_sim_cont +model=vcip \
   exp.seed="${SEED}" dataset.coeff="${GAMMA}" \
   "+exp.em_ckpt_dir=${EM_DIR}"
 
@@ -29,7 +29,7 @@ if [[ ! -f "${EM_CKPT}" ]]; then
 fi
 
 CUDA_VISIBLE_DEVICES="${GPU}" python runnables/eval_iql_planner.py \
-  +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=${GAMMA}*" \
+  +dataset=cancer_sim_cont +model=vcip \
   exp.seed="${SEED}" dataset.coeff="${GAMMA}" exp.test=false \
   "exp.em_eval_ckpt=${EM_CKPT}"
 

@@ -70,48 +70,13 @@ bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
 
 Do not choose the final seed set based on test-set performance. If seed 2 is useful, report it as an additional seed or predefine the replacement before reading test metrics.
 
-To train the CT model:
-
-1. Run:
-```bash
-python runnables/train_ct.py +dataset=cancer_sim_cont +model=vcip
-```
-
-CUDA_VISIBLE_DEVICES=0 python runnables/train_ct.py +dataset=cancer_sim_cont +model=vcip "+model/hparams/cancer=4*" exp.seed=10 dataset.coeff=4 exp.ct_epochs=2 exp.ct_weight_log_every=1
-  "+exp.ct_ckpt_dir=/tmp/ct_smoke_$$"
-
-2. Run the IQL model using the CT checkpoint:
-```bash
-python runnables/train_iql_planner.py +dataset=cancer_sim_cont +model=vcip   exp.iql_inference_ckpt=/home/liam/pythonProject/VCIP-ICML-main/ct_checkpoints/seed_10_gamma_4/ct_best_encoder.pt
-```
+For a single current-method smoke run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python runnables/train_iql_planner.py +dataset=cancer_sim_cont +model=vcip \
-  exp.iql_inference_ckpt=/home/liam/pythonProject/VCIP-ICML-main/ct_checkpoints/seed_10_gamma_4/kmax1_dyn005/ct_best_encoder.pt \
-  +exp.iql_save_dir=/home/liam/pythonProject/VCIP-ICML-main/iql_runs/kmax3_seed10_g4
+bash scripts/cancer/train/train_ct_iql_em.sh 0 4 10
 ```
 
-CUDA_VISIBLE_DEVICES=1 python runnables/eval_iql_planner.py +dataset=cancer_sim_cont +model=vcip   exp.seed=10 dataset.coeff=4 exp.tau=12 exp.max_tau=12.0   exp.test=True   exp.iql_inference_ckpt=/home/liam/pythonProject/VCIP-ICML-main/ct_checkpoints/seed_10_gamma_4/kmax1_dyn005/ct_best_encoder.pt exp.iql_eval_ckpt=/home/liam/pythonProject/VCIP-ICML-main/iql_runs/kmax3_seed10_g4/iql_planner_best_predictor.pt
-
-3. Run the IQL model validation:
-```bash
-python runnables/eval_iql_planner.py +dataset=cancer_sim_cont +model=vcip exp.test=True  exp.iql_inference_ckpt=/home/liam/pythonProject/VCIP-ICML-main/ct_checkpoints/seed_10_gamma_4/ct_best_encoder.pt
-```
-
-开了 CT_IQL_SKIP_TRAIN=1，脚本不会跑 train_ct 和 train_iql_planner，只会做 eval。
-
-第一次为这个 seed 跑完整流程（不要设 CT_IQL_SKIP_TRAIN）：
-
-```bash 
-scripts/cancer/train/train_ct_iql.sh false 4 0 12
-```
-（把 4 0 12 换成你的 gamma、GPU、eval_tau；若不需要改 tau，第 4 个参数可省略。）
-这样会依次：train_ct → 写出 ct_best_encoder.pt → train_iql_planner（用该 CT）→ eval。
-
-之后若只想换 exp.tau 做 eval、不重训，再用：
-```bash
-CT_IQL_SKIP_TRAIN=1 bash scripts/cancer/train/train_ct_iql.sh false 4 0 12
-```
+For MIMIC synthetic experiments, use `+dataset=mimic3_synthetic_gift`, which is the GIFT-aligned semi-synthetic MIMIC data path. The legacy `mimic3_real` and two-stage `train_iql_planner.py` workflows have been removed from the supported experiment surface because they do not implement the current one-stage CT+IQL EM method.
 
 
 The results will be saved in the `results/all/` directory, matching the experimental results presented in the paper.

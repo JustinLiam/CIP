@@ -1,7 +1,7 @@
 """
 Load weights into ``InferenceModel`` from:
   - ``train_ct.py`` → ``ct_best_encoder.pt`` (``ct_history_encoder`` + ``projection_head`` only)
-  - Full ``VAEModel.state_dict()`` with ``inference_model.*`` keys
+  - Legacy flat checkpoints with ``inference_model.*`` keys
   - Raw ``InferenceModel.state_dict()``-style flat dict
 """
 import logging
