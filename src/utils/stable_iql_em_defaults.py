@@ -59,6 +59,7 @@ STABLE_IQL_EM_DEFAULTS: Dict[str, Any] = {
     "exp.iql_target_sampling": "horizon_aligned",
     "exp.iql_target_horizons": [1, 2, 3, 4, 5, 6],
     "exp.iql_horizon_terminal_done": True,
+    "exp.iql_decision_interval_days": 1,
     # One-stage EM loop
     "exp.em_outer_iters": 20,
     "exp.em_m_steps_per_outer": 1000,
@@ -83,8 +84,6 @@ STABLE_IQL_EM_DEFAULTS: Dict[str, Any] = {
     "exp.em_encoder_diagnostics_every": 50,
     "exp.em_ckpt_dir": None,
     "exp.em_eval_ckpt": "",
-    "exp.em_val_worlds": ["sim"],
-    "exp.em_val_selection_world": "sim",
     # E-step WeightNet and encoder alignment
     "exp.ct_align_loss": "sinkhorn",
     "exp.ct_sinkhorn_blur": 0.01,

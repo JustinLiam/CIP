@@ -56,22 +56,6 @@ def _list_from_config(value: Any, default: List[int]) -> List[int]:
     return [int(v) for v in value]
 
 
-def _str_list_from_config(value: Any, default: List[str]) -> List[str]:
-    if value is None:
-        return list(default)
-    if OmegaConf.is_config(value):
-        value = OmegaConf.to_container(value, resolve=True)
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return list(default)
-        if raw.startswith("["):
-            value = ast.literal_eval(raw)
-        else:
-            value = [x.strip() for x in raw.split(",") if x.strip()]
-    return [str(v) for v in value]
-
-
 def _resolve_path(value: str, original_cwd: Path) -> Path:
     p = Path(str(value))
     return p if p.is_absolute() else original_cwd / p
@@ -161,16 +145,6 @@ def main(args: DictConfig) -> None:
         OmegaConf.select(args, "exp.outer_curve_tau_list", default=None),
         default=_list_from_config(stable_select(args, "exp.iql_eval_tau_list"), [1, 2, 3, 4, 5, 6]),
     )
-    worlds = tuple(
-        w.strip()
-        for w in _str_list_from_config(
-            OmegaConf.select(args, "exp.outer_curve_worlds", default=None),
-            default=_str_list_from_config(stable_select(args, "exp.em_val_worlds"), ["sim"]),
-        )
-        if w.strip()
-    )
-    sel_world = str(OmegaConf.select(args, "exp.outer_curve_selection_world", default=stable_select(args, "exp.em_val_selection_world", worlds[0])))
-
     out_dir_raw = str(OmegaConf.select(args, "exp.outer_curve_output_dir", default="")).strip()
     out_dir = _resolve_path(out_dir_raw, original_cwd) if out_dir_raw else ckpt_dir / "outer_rmse_curve"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -196,11 +170,12 @@ def main(args: DictConfig) -> None:
     rows: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
     logger.info(
-        "Evaluating %d checkpoints from %s on split=%s taus=%s",
+        "Evaluating %d checkpoints from %s on split=%s taus=%s gift_aligned_sample_seed=%d",
         len(ckpts),
         ckpt_dir,
         split_name,
         tau_list,
+        base_seed,
     )
 
     for ckpt in ckpts:
@@ -210,7 +185,6 @@ def main(args: DictConfig) -> None:
         planner = load_em_for_eval(inference_model, str(ckpt), device)
         tau_rmse = []
         for tau in tau_list:
-            set_seed(base_seed + int(tau) * 1009)
             metrics = aggregate_iql_planner_metrics(
                 planner,
                 inference_model,
@@ -223,10 +197,9 @@ def main(args: DictConfig) -> None:
                 autoregressive_eval=autoregressive_eval,
                 val_batch_size=val_bs,
                 log_batches=False,
-                worlds=worlds,
+                sample_seed=base_seed,
             )
-            per_world = metrics.get("per_world", {worlds[0]: metrics})
-            m = per_world[sel_world]
+            m = metrics
             tau_rmse.append(float(m["rmse_uns"]))
             rows.append(
                 {

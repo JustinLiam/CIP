@@ -147,7 +147,7 @@ rows = []
 current = None
 with open(eval_log, "r", encoding="utf-8", errors="replace") as f:
     for line in f:
-        m = re.search(r"IQL eval autoregressive action rollout: .*?\(tau=(\d+),", line)
+        m = re.search(r"IQL eval (?:autoregressive action rollout|unified closed-loop rollout): .*?\(tau=(\d+),", line)
         if m:
             if current is not None:
                 rows.append(current)

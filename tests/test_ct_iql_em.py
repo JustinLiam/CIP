@@ -7,6 +7,7 @@ import torch
 from torch.distributions import Normal
 from omegaconf import OmegaConf
 
+from src.data.cip_dataset import CIPDataset
 from src.data.ct_transition_dataset import _collate_pad_H
 from src.data.iql_dataset_builder import dataset_actions_to_tanh_policy_space
 from src.data.iql_raw_transition_dataset import (
@@ -21,7 +22,7 @@ from src.models.ct_encoder_weight import CTEncoderWeightModel
 from src.models.ct_history_encoder import CTHistoryEncoder
 from src.models.sequence_utils import gather_last_valid, last_valid_indices, last_valid_mask
 from src.planners.iql_planner import IQLPlanner, IQLPlannerConfig, _weighted_mean
-from src.utils.em_config import empty_replay_error, selection_world_from_config, worlds_from_config
+from src.utils.em_config import empty_replay_error
 
 
 def _tiny_cfg():
@@ -85,6 +86,85 @@ def _raw_iql_data(length: int = 4):
         "outputs": np.arange(length, dtype=np.float32).reshape(1, length, 1),
         "active_entries": np.ones((1, length, 1), dtype=np.float32),
     }
+
+
+def test_cip_dataset_uses_exp_seed_for_history_lengths():
+    cfg = OmegaConf.create({
+        "dataset": {
+            "name": "cancer_sim_cont",
+            "max_seq_length": 12,
+            "min_history_length": 2,
+        },
+        "model": {"name": "vcip"},
+        "exp": {
+            "tau": 2,
+            "repeats": 6,
+            "seed": 10,
+        },
+    })
+    data = {"outputs": np.zeros((3, 20, 1), dtype=np.float32)}
+
+    np.random.seed(10)
+    expected = np.unique(np.random.randint(2, 9, 5))
+    dataset = CIPDataset(data, cfg, train=False)
+
+    np.testing.assert_array_equal(dataset.history_lengths, expected)
+
+
+def test_cip_dataset_accepts_internal_sample_seed_for_validation_repeats():
+    cfg = OmegaConf.create({
+        "dataset": {
+            "name": "cancer_sim_cont",
+            "max_seq_length": 12,
+            "min_history_length": 2,
+        },
+        "model": {"name": "vcip"},
+        "exp": {
+            "tau": 2,
+            "repeats": 6,
+            "seed": 10,
+        },
+    })
+    data = {"outputs": np.zeros((3, 20, 1), dtype=np.float32)}
+
+    np.random.seed(1019)
+    expected = np.unique(np.random.randint(2, 9, 5))
+    dataset = CIPDataset(data, cfg, train=False, sample_seed=1019)
+
+    np.testing.assert_array_equal(dataset.history_lengths, expected)
+
+
+def test_cip_dataset_uses_fixed_repeats_for_mimic_and_tumor():
+    base = {
+        "model": {"name": "vcip"},
+        "exp": {
+            "tau": 2,
+            "repeats": 99,
+            "seed": 10,
+        },
+    }
+    data = {"outputs": np.zeros((3, 80, 1), dtype=np.float32)}
+
+    mimic_cfg = OmegaConf.create({
+        **base,
+        "dataset": {
+            "name": "mimic3_synthetic_gift",
+            "max_seq_length": 60,
+            "min_seq_length": 60,
+            "min_history_length": 20,
+        },
+    })
+    tumor_cfg = OmegaConf.create({
+        **base,
+        "dataset": {
+            "name": "tumor_generator",
+            "max_seq_length": 60,
+            "min_history_length": 20,
+        },
+    })
+
+    assert CIPDataset(data, mimic_cfg, train=False).repeats == 3
+    assert CIPDataset(data, tumor_cfg, train=False).repeats == 5
 
 
 def test_last_valid_gather_after_collate_padding():
@@ -163,17 +243,7 @@ def test_empty_replay_sampling_fails_readably():
         replay.sample(1)
 
 
-def test_em_worlds_config_parses_and_validates():
-    assert worlds_from_config(["sim"]) == ("sim",)
-    assert worlds_from_config("sim,predictor") == ("sim", "predictor")
-    assert worlds_from_config("[sim,predictor]") == ("sim", "predictor")
-    assert selection_world_from_config(None, ("sim", "predictor")) == "sim"
-    assert selection_world_from_config("predictor", ("sim", "predictor")) == "predictor"
-    with pytest.raises(ValueError, match="Unknown exp.em_val_worlds"):
-        worlds_from_config("invalid")
-    with pytest.raises(ValueError, match="em_val_selection_world"):
-        selection_world_from_config("predictor", ("sim",))
-
+def test_empty_replay_error_includes_context():
     msg = empty_replay_error(
         {"active_entries": np.zeros((2, 4, 1), dtype=np.float32)},
         max_patients=None,
@@ -206,24 +276,6 @@ def test_max_action_mapping_and_actor_bc_targets_are_consistent():
     )
     target = planner._actor_bc_targets(torch.tensor(mapped))
     assert torch.allclose(target, torch.tensor([[-1.0, 0.0, 1.0]]))
-
-
-def test_predictor_world_without_loaded_predictor_hard_fails():
-    from src.evaluation.iql_planner_eval import _rollout_one_step_y
-
-    class DummyInference:
-        _outcome_predictor_loaded = False
-
-    with pytest.raises(RuntimeError, match="outcome_predictor weights"):
-        _rollout_one_step_y(
-            "predictor",
-            {},
-            torch.zeros(1, 2),
-            fold=None,
-            scaling_params=None,
-            inference_model=DummyInference(),
-            device="cpu",
-        )
 
 
 def test_e_step_does_not_update_encoder():

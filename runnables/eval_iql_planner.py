@@ -19,8 +19,9 @@ from omegaconf import DictConfig, OmegaConf
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.cip_dataset import CIPDataset, get_dataloader
+from src.data.cip_dataset import CIPDataset, get_dataloader, planning_repeats
 from src.data.iql_dataset_builder import align_h_t_static_to_history, dataset_actions_to_tanh_policy_space
+from src.evaluation.iql_planner_eval import aggregate_iql_planner_metrics
 from src.evaluation.iql_action_selection import select_iql_policy_action
 from src.models.inference_model import InferenceModel
 from src.models.sequence_utils import gather_last_valid
@@ -335,6 +336,12 @@ def main(args: DictConfig):
         )
     tau_list = _resolve_eval_tau_list(args)
     original_exp_tau = int(OmegaConf.select(args, "exp.tau", default=max(tau_list)))
+    base_seed = int(args.exp.seed)
+    logger.info(
+        "IQL eval tau RNG protocol: gift_aligned_same_seed_per_tau=True sample_seed=%d repeats=%s",
+        base_seed,
+        planning_repeats(args),
+    )
 
     mlf = VCIPMlflowTracker.from_hydra(args, stage="eval")
     mlf.tags["eval_split"] = split_name
@@ -344,189 +351,48 @@ def main(args: DictConfig):
     per_tau_metrics: Dict[int, Dict[str, float]] = {}
     try:
         for tau in tau_list:
-            args.exp.tau = int(tau)
-            try:
-                dataloader = get_dataloader(CIPDataset(data, args, train=False), batch_size=batch_size, shuffle=False)
-            finally:
-                args.exp.tau = original_exp_tau
+            tau_seed = base_seed
             logger.info(
-                f"IQL eval autoregressive action rollout: {autoregressive_eval} "
-                f"(tau={tau}, target_horizon={tau}, max_tau={max_tau}, split={split_name})"
+                f"IQL eval unified closed-loop rollout: {autoregressive_eval} "
+                f"(tau={tau}, target_horizon={tau}, max_tau={max_tau}, split={split_name}, sample_seed={tau_seed})"
             )
-
-            losses = []
-            losses_2 = []
-            ture_output_list = []
-            output_after_actions_list = []
-            ture_output_actions_list = []
-
-            with torch.no_grad():
-                for i, batch in enumerate(dataloader):
-                    H_t, targets = batch
-                    H_t = align_h_t_static_to_history(H_t)
-                    for key in H_t:
-                        H_t[key] = H_t[key].to(device)
-                    for key in targets:
-                        targets[key] = targets[key].to(device)
-
-                    if autoregressive_eval:
-                        eval_target = targets["outputs"][:, -1, :]
-                        H_work = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_t.items()}
-                        a_prev_sim = gather_last_valid(
-                            H_work["current_treatments"], H_work.get("active_entries")
-                        ).clone()
-                        planned = []
-                        closed_loop_output_after_actions = None
-                        for step in range(tau):
-                            H_work = align_h_t_static_to_history(H_work)
-                            z, _, _ = inference_model.ct_hidden_history(H_work)
-                            a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
-                            obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
-                            a_raw = select_iql_policy_action(
-                                planner,
-                                obs,
-                                selector=action_selector,
-                                candidate_actions=action_candidate_actions,
-                                q_bc_penalty=action_q_bc_penalty,
-                                candidate_noise_std=action_candidate_noise_std,
-                            )
-                            a_sim = _policy_to_sim_interval_torch(a_raw, max_action)
-                            a_sim = _calibrate_sim_actions_torch(
-                                a_sim, action_eval_scale, action_eval_shift
-                            )
-                            planned.append(a_sim)
-                            y_np = fold.simulate_output_after_actions(
-                                H_work,
-                                a_sim.unsqueeze(1),
-                                dataset_collection.train_scaling_params,
-                            )
-                            y_norm = torch.as_tensor(y_np, device=device, dtype=torch.float32)
-                            _extend_h_work_after_one_step(
-                                H_work, a_sim, y_norm, scaling_params, torch.device(device)
-                            )
-                            closed_loop_output_after_actions = y_norm.detach().cpu().numpy()
-                            a_prev_sim = a_sim
-                        a_seq = torch.stack(planned, dim=1).contiguous()
-                    else:
-                        z, _, _ = inference_model.ct_hidden_history(H_t)
-                        z_np = z.detach().cpu().numpy()
-                        eval_target_np = targets["outputs"][:, -1, :].detach().cpu().numpy()
-                        a_prev_raw = gather_last_valid(
-                            H_t["current_treatments"], H_t.get("active_entries")
-                        ).detach().cpu().numpy()
-                        a_prev_feat = dataset_actions_to_tanh_policy_space(a_prev_raw, max_action)
-                        bsz = z_np.shape[0]
-                        delta_scalar = float(tau - 0) / max_tau
-                        delta_vec = np.array([delta_scalar], dtype=np.float32)
-                        a_rows = []
-                        for b in range(bsz):
-                            z_b = torch.as_tensor(z_np[b:b + 1], device=device, dtype=torch.float32)
-                            target_b = torch.as_tensor(eval_target_np[b:b + 1], device=device, dtype=torch.float32)
-                            delta_b = torch.as_tensor(delta_vec.reshape(1, 1), device=device, dtype=torch.float32)
-                            a_prev_b = torch.as_tensor(a_prev_feat[b:b + 1], device=device, dtype=torch.float32)
-                            obs_b = planner.build_state(z_b, target_b, delta_b, a_prev_b)
-                            a_b = select_iql_policy_action(
-                                planner,
-                                obs_b,
-                                selector=action_selector,
-                                candidate_actions=action_candidate_actions,
-                                q_bc_penalty=action_q_bc_penalty,
-                                candidate_noise_std=action_candidate_noise_std,
-                            )
-                            a_rows.append(a_b.detach().cpu().numpy().reshape(-1))
-                        a_raw = np.stack(a_rows, axis=0)
-                        a_sim = _actions_to_sim_interval(a_raw, max_action)
-                        a_sim = _calibrate_sim_actions_np(
-                            a_sim, action_eval_scale, action_eval_shift
-                        )
-                        a_seq = torch.tensor(a_sim, device=device, dtype=torch.float32).unsqueeze(1).expand(-1, tau, -1).contiguous()
-                        closed_loop_output_after_actions = None
-
-                    if closed_loop_output_after_actions is None:
-                        closed_loop_output_after_actions = fold.simulate_output_after_actions(
-                            H_t, a_seq, dataset_collection.train_scaling_params
-                        )
-                    output_after_actions = closed_loop_output_after_actions
-                    ture_output = targets["outputs"][:, -1, :].detach().cpu().numpy()
-                    loss = np.sqrt(((output_after_actions - ture_output) ** 2).mean())
-                    losses.append(loss)
-
-                    true_actions = targets["current_treatments"]
-                    ture_output_actions = fold.simulate_output_after_actions(
-                        H_t, true_actions, dataset_collection.train_scaling_params
-                    )
-                    loss_2 = np.sqrt(((ture_output_actions - ture_output) ** 2).mean())
-                    losses_2.append(loss_2)
-
-                    ture_output_list.append(ture_output)
-                    output_after_actions_list.append(output_after_actions)
-                    ture_output_actions_list.append(ture_output_actions)
-
-                    logger.info(
-                        f"Batch {i} RMSE (plan): {loss:.6f}, "
-                        f"RMSE (factual actions): {loss_2:.6f}"
-                    )
-
-            ture_output_list = np.concatenate(ture_output_list, axis=0)
-            output_after_actions_list = np.concatenate(output_after_actions_list, axis=0)
-            ture_output_actions_list = np.concatenate(ture_output_actions_list, axis=0)
-
-            rmse_norm = float(np.sqrt(((output_after_actions_list - ture_output_list) ** 2).mean()))
-            rmse_factual_norm = float(np.sqrt(((ture_output_actions_list - ture_output_list) ** 2).mean()))
-
-            iql_y_norm = output_after_actions_list.reshape(-1)
-            true_y_norm = ture_output_list.reshape(-1)
-            iql_y_uns = _unscale_outputs_np(output_after_actions_list, scaling_params).reshape(-1)
-            true_y_uns = _unscale_outputs_np(ture_output_list, scaling_params).reshape(-1)
-
-            mae_norm = float(np.mean(np.abs(iql_y_norm - true_y_norm)))
-            mae_uns = float(np.mean(np.abs(iql_y_uns - true_y_uns)))
-            rmse_uns = float(np.sqrt(np.mean((iql_y_uns - true_y_uns) ** 2)))
-
+            metrics = aggregate_iql_planner_metrics(
+                planner,
+                inference_model,
+                dataset_collection,
+                fold,
+                args,
+                device=device,
+                tau=int(tau),
+                max_tau=max_tau,
+                autoregressive_eval=autoregressive_eval,
+                val_batch_size=batch_size,
+                log_batches=True,
+                include_factual_traj_rmse=True,
+                sample_seed=tau_seed,
+            )
             logger.info("--- Aggregate online policy metric ---")
             logger.info(f"Split: {split_name}")
-            logger.info(f"Mean per-batch RMSE: {float(np.mean(losses)):.6f}")
-            logger.info(f"Mean per-batch RMSE (factual traj): {float(np.mean(losses_2)):.6f}")
-            logger.info(f"Global RMSE on stacked batches (normalized space): {rmse_norm:.6f}")
-            if is_mimic:
-                logger.info("GIFT-style MIMIC RMSE (normalized 2D outcome): %.6f", rmse_norm)
-            else:
-                logger.info(f"Global RMSE × std (cancer volume scale): {rmse_norm * std:.6f}")
-                logger.info(f"Factual global RMSE × std: {rmse_factual_norm * std:.6f}")
-
-            logger.info("--- t+tau outcome (IQL planned actions vs target outputs[:, -1]) ---")
+            logger.info(f"Global RMSE on stacked batches (normalized space): {float(metrics['rmse_norm']):.6f}")
             logger.info(
-                f"IQL pred normalized:   mean={float(np.mean(iql_y_norm)):.6f} std={float(np.std(iql_y_norm)):.6f} "
-                f"min={float(np.min(iql_y_norm)):.6f} max={float(np.max(iql_y_norm)):.6f}"
+                f"MAE normalized: {float(metrics['mae_norm']):.6f} | "
+                f"MAE unscaled: {float(metrics['mae_uns']):.6f} | "
+                f"RMSE unscaled: {float(metrics['rmse_uns']):.6f}"
             )
-            logger.info(
-                f"Target normalized:       mean={float(np.mean(true_y_norm)):.6f} std={float(np.std(true_y_norm)):.6f} "
-                f"min={float(np.min(true_y_norm)):.6f} max={float(np.max(true_y_norm)):.6f}"
-            )
-            logger.info(
-                f"IQL pred unscaled:     mean={float(np.mean(iql_y_uns)):.6f} std={float(np.std(iql_y_uns)):.6f} "
-                f"min={float(np.min(iql_y_uns)):.6f} max={float(np.max(iql_y_uns)):.6f}"
-            )
-            logger.info(
-                f"Target unscaled:       mean={float(np.mean(true_y_uns)):.6f} std={float(np.std(true_y_uns)):.6f} "
-                f"min={float(np.min(true_y_uns)):.6f} max={float(np.max(true_y_uns)):.6f}"
-            )
-            if not is_mimic and mean_ser is not None and std_ser is not None:
-                logger.info(
-                    f"Train scaling cancer_volume: mean={float(mean_ser['cancer_volume']):.6f} std={float(std_ser['cancer_volume']):.6f}"
-                )
-            logger.info(
-                f"MAE normalized: {mae_norm:.6f} | MAE unscaled: {mae_uns:.6f} | RMSE unscaled: {rmse_uns:.6f}"
-            )
-
-            per_tau_metrics[tau] = {
-                "mae_norm": mae_norm,
-                "mae_uns": mae_uns,
-                "rmse_uns": rmse_uns,
-                "rmse_norm": rmse_norm,
-                "rmse_factual_norm": rmse_factual_norm,
-                "mean_batch_rmse_iql": float(np.mean(losses)),
-                "mean_batch_rmse_factual": float(np.mean(losses_2)),
+            per_tau_metrics[int(tau)] = {
+                "mae_norm": float(metrics["mae_norm"]),
+                "mae_uns": float(metrics["mae_uns"]),
+                "rmse_uns": float(metrics["rmse_uns"]),
+                "rmse_norm": float(metrics["rmse_norm"]),
+                "rmse_factual_norm": float(metrics["rmse_factual_norm"])
+                if metrics.get("rmse_factual_norm") is not None
+                else float("nan"),
+                "mean_batch_rmse_iql": float(metrics["mean_batch_rmse_plan"])
+                if metrics.get("mean_batch_rmse_plan") is not None
+                else float("nan"),
+                "mean_batch_rmse_factual": float(metrics["mean_batch_rmse_factual"])
+                if metrics.get("mean_batch_rmse_factual") is not None
+                else float("nan"),
             }
 
         mlf.log_eval_tau_metrics(per_tau_metrics, step=0)

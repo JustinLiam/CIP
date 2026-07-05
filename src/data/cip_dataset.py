@@ -4,8 +4,24 @@ from torch.utils.data import Dataset
 import numpy as np
 from torch.utils.data import DataLoader
 
+
+def _sample_seed(config, sample_seed=None):
+    # Match GIFT's CIP evaluation protocol: every tau rebuilds CIPDataset and
+    # samples history lengths from the same experiment seed.
+    return int(config.exp.seed if sample_seed is None else sample_seed)
+
+
+def planning_repeats(config):
+    name = str(getattr(config.dataset, "name", "")).lower()
+    if "mimic" in name:
+        return 3
+    if "cancer" in name or "tumor" in name:
+        return 5
+    return int(config.exp.repeats)
+
+
 class CIPDataset(Dataset):
-    def __init__(self, data, config, train=False):
+    def __init__(self, data, config, train=False, sample_seed=None):
         self.data = data
         self.train = train
         self.tau = config.exp.tau
@@ -18,8 +34,8 @@ class CIPDataset(Dataset):
         else:
             self.max_history_length = int(config.dataset.max_seq_length) - 1
         self.min_h = int(getattr(config.dataset, 'min_history_length', 20))
-        self.repeats = config.exp.repeats
-        np.random.seed(config.exp.seed)
+        self.repeats = planning_repeats(config)
+        np.random.seed(_sample_seed(config, sample_seed=sample_seed))
         history_high = self.max_history_length - self.tau
         if history_high <= self.min_h:
             raise ValueError(
