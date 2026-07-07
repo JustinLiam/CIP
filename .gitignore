@@ -1,11 +1,15 @@
 __pycache__/
 *.pyc
+._*
+.DS_Store
+.__codex_tmp_sync_marker/
+tmp/
 checkpoint/
 my_outputs/
 # data/
+data/processed/epi_abm/
 *.pth
 *.ckpt
-.DS_Store
 *.log
 *.pth
 *.pt

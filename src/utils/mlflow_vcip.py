@@ -257,40 +257,36 @@ class VCIPMlflowTracker:
     def log_iql_val_step(
         self,
         step: int,
-        per_world: Mapping[str, Mapping[str, float]],
-        val_worlds: Sequence[str],
+        vals: Mapping[str, Any],
         val_metric_key: str,
         *,
-        improved_worlds: Optional[Sequence[str]] = None,
+        improved: bool = False,
+        prefix: str = "val/closed_loop",
     ) -> None:
-        improved = set(improved_worlds or ())
         metrics: Dict[str, float] = {}
-        for w in val_worlds:
-            wm = per_world[w]
-            prefix = f"val/{w}"
-            metrics[f"{prefix}/mae_norm"] = float(wm["mae_norm"])
-            metrics[f"{prefix}/mae_uns"] = float(wm["mae_uns"])
-            metrics[f"{prefix}/rmse_norm"] = float(wm["rmse_norm"])
-            if wm.get("rmse_uns") is not None:
-                metrics[f"{prefix}/rmse_uns"] = float(wm["rmse_uns"])
-            if wm.get("rmse_norm_x_std") is not None:
-                metrics[f"{prefix}/rmse_norm_x_std"] = float(wm["rmse_norm_x_std"])
-            metrics[f"{prefix}/{val_metric_key}"] = float(wm[val_metric_key])
-            action_diag = wm.get("action_diagnostics", {})
-            for key in (
-                "planned_mean",
-                "factual_mean",
-                "q_argmax_mean",
-                "sim_best_proxy_mean",
-                "planned_minus_factual_mean",
-                "planned_minus_q_argmax_mean",
-                "planned_minus_sim_best_proxy_mean",
-                "q_slope_mean",
-            ):
-                if action_diag.get(key) is not None:
-                    metrics[f"{prefix}/action/{key}"] = float(action_diag[key])
-            if w in improved:
-                metrics[f"{prefix}/best_improved"] = 1.0
+        metrics[f"{prefix}/mae_norm"] = float(vals["mae_norm"])
+        metrics[f"{prefix}/mae_uns"] = float(vals["mae_uns"])
+        metrics[f"{prefix}/rmse_norm"] = float(vals["rmse_norm"])
+        if vals.get("rmse_uns") is not None:
+            metrics[f"{prefix}/rmse_uns"] = float(vals["rmse_uns"])
+        if vals.get("rmse_norm_x_std") is not None:
+            metrics[f"{prefix}/rmse_norm_x_std"] = float(vals["rmse_norm_x_std"])
+        metrics[f"{prefix}/{val_metric_key}"] = float(vals[val_metric_key])
+        action_diag = vals.get("action_diagnostics", {})
+        for key in (
+            "planned_mean",
+            "factual_mean",
+            "q_argmax_mean",
+            "sim_best_proxy_mean",
+            "planned_minus_factual_mean",
+            "planned_minus_q_argmax_mean",
+            "planned_minus_sim_best_proxy_mean",
+            "q_slope_mean",
+        ):
+            if action_diag.get(key) is not None:
+                metrics[f"{prefix}/action/{key}"] = float(action_diag[key])
+        if improved:
+            metrics[f"{prefix}/best_improved"] = 1.0
         self.log_metrics(metrics, step=step)
 
     def _end_active_run_quietly(self) -> None:

@@ -1,41 +1,6 @@
 """Lightweight EM configuration parsing and validation helpers."""
 from __future__ import annotations
 
-try:
-    from omegaconf import OmegaConf
-except ImportError:  # pragma: no cover - only for minimal utility imports.
-    OmegaConf = None
-
-
-def worlds_from_config(value, default=("sim",)):
-    if value is None:
-        return tuple(default)
-    if OmegaConf is not None and OmegaConf.is_config(value):
-        value = OmegaConf.to_container(value, resolve=True)
-    if isinstance(value, str):
-        raw = value.strip()
-        if raw.startswith("[") and raw.endswith("]"):
-            raw = raw[1:-1]
-        value = [x.strip().strip("'\"") for x in raw.split(",") if x.strip()]
-    worlds = tuple(str(w).strip() for w in value if str(w).strip())
-    if not worlds:
-        raise ValueError("exp.em_val_worlds must contain at least one world.")
-    valid = {"sim", "predictor"}
-    bad = [w for w in worlds if w not in valid]
-    if bad:
-        raise ValueError(f"Unknown exp.em_val_worlds entries {bad}; valid worlds are {sorted(valid)}.")
-    return worlds
-
-
-def selection_world_from_config(value, worlds):
-    sel_world = str(value if value is not None else worlds[0]).strip()
-    if sel_world not in worlds:
-        raise ValueError(
-            f"exp.em_val_selection_world={sel_world!r} must be one of exp.em_val_worlds={worlds}."
-        )
-    return sel_world
-
-
 def empty_replay_error(data, *, max_patients, target_sampling, target_horizons, max_tau, samples_per_transition):
     active = data["active_entries"]
     n_total = int(active.shape[0])

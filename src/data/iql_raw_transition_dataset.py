@@ -116,6 +116,7 @@ def build_iql_raw_transitions(
     target_sampling: str = "horizon_aligned",
     target_horizons: Optional[Iterable[int]] = None,
     horizon_terminal_done: bool = True,
+    decision_interval_days: int = 1,
     seed: Optional[int] = None,
 ) -> List[IQLRawTransition]:
     """
@@ -132,6 +133,7 @@ def build_iql_raw_transitions(
         n_patients = min(n_patients, max_patients)
     if max_tau <= 0:
         raise ValueError("max_tau must be positive.")
+    decision_interval_days = max(1, int(decision_interval_days))
 
     transitions: List[IQLRawTransition] = []
     for i in range(n_patients):
@@ -142,6 +144,14 @@ def build_iql_raw_transitions(
         last_idx = length - 1
 
         for t in range(1, length - 1):
+            if decision_interval_days > 1:
+                if "sim_day" in data:
+                    day_value = int(np.asarray(data["sim_day"][i, t]).reshape(-1)[0])
+                else:
+                    day_value = int(t)
+                if day_value % decision_interval_days != 0:
+                    continue
+
             target_indices = _sample_target_indices(
                 t=t,
                 last_idx=last_idx,
@@ -231,7 +241,8 @@ def build_iql_raw_transitions(
 
     logging.getLogger(__name__).info(
         "Built %d raw IQL transitions (no precomputed states, samples_per_transition=%d, "
-        "target_sampling=%s, target_horizons=%s, horizon_terminal_done=%s).",
+        "target_sampling=%s, target_horizons=%s, horizon_terminal_done=%s, "
+        "decision_interval_days=%d).",
         len(transitions),
         samples_per_transition,
         target_sampling,
@@ -239,6 +250,7 @@ def build_iql_raw_transitions(
         if str(target_sampling).strip().lower() in ("horizon_aligned", "aligned", "fixed_horizon")
         else None,
         horizon_terminal_done,
+        decision_interval_days,
     )
     return transitions
 

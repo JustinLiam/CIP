@@ -30,11 +30,7 @@ from src.models.inference_model import InferenceModel
 from src.planners.iql_planner import IQLPlanner, IQLPlannerConfig
 from src.training.ct_iql_em_loop import EMTrainConfig, run_e_step_full, run_m_step_steps
 from src.utils.em_ckpt import load_encoder_into_inference, save_em_checkpoint
-from src.utils.em_config import (
-    empty_replay_error as _empty_replay_error,
-    selection_world_from_config as _selection_world_from_config,
-    worlds_from_config as _worlds_from_config,
-)
+from src.utils.em_config import empty_replay_error as _empty_replay_error
 from src.utils.stable_iql_em_defaults import stable_select
 from src.utils.mlflow_vcip import VCIPMlflowTracker
 from src.utils.utils import repeat_static, set_seed, to_float
@@ -275,6 +271,7 @@ def main(args: DictConfig):
             target_sampling=iql_target_sampling,
             target_horizons=iql_target_horizons,
             horizon_terminal_done=iql_horizon_terminal_done,
+            decision_interval_days=int(stable_select(args, "exp.iql_decision_interval_days")),
             seed=her_seed,
         )
         if not raw:
@@ -352,16 +349,7 @@ def main(args: DictConfig):
         raise ValueError(
             f"exp.em_val_metric must be one of {VAL_METRIC_KEYS}, got {val_metric_key!r}"
         )
-    val_worlds = _worlds_from_config(stable_select(args, "exp.em_val_worlds"))
-    sel_world = _selection_world_from_config(
-        stable_select(args, "exp.em_val_selection_world"),
-        val_worlds,
-    )
-    if "predictor" in val_worlds:
-        raise ValueError(
-            "End-to-end EM checkpoints do not train/load outcome_predictor; remove 'predictor' "
-            "from exp.em_val_worlds or add predictor training before using predictor-world validation."
-        )
+    val_prefix = "closed_loop"
     eval_tau = int(args.exp.tau)
     em_val_tau_list = _list_from_config(
         stable_select(args, "exp.em_val_tau_list")
@@ -533,7 +521,7 @@ def main(args: DictConfig):
                 val_scores = []
                 val_log_metrics = {}
                 for tau_i in em_val_tau_list:
-                    tau_world_metrics = []
+                    tau_repeat_metrics = []
                     for rep_i in range(em_val_repeats):
                         val_seed = em_val_seed_base + int(tau_i) * 1000 + rep_i
                         with _isolated_rng(val_seed):
@@ -549,17 +537,16 @@ def main(args: DictConfig):
                                 autoregressive_eval=autoreg,
                                 val_batch_size=val_bs,
                                 log_batches=False,
-                                worlds=val_worlds,
                                 action_diagnostics=val_action_diag and rep_i == 0,
                                 action_grid_points=val_action_grid_points,
                                 action_diag_max_batches=val_action_diag_max_batches,
+                                sample_seed=val_seed,
                             )
-                        per_world = metrics.get("per_world", {val_worlds[0]: metrics})
-                        tau_world_metrics.append(per_world[sel_world])
-                    tau_repeat_scores = [float(m[val_metric_key]) for m in tau_world_metrics]
+                        tau_repeat_metrics.append(metrics)
+                    tau_repeat_scores = [float(m[val_metric_key]) for m in tau_repeat_metrics]
                     tau_score = float(sum(tau_repeat_scores) / len(tau_repeat_scores))
                     val_scores.append(tau_score)
-                    tau_prefix = f"val/{sel_world}/tau{int(tau_i)}"
+                    tau_prefix = f"val/{val_prefix}/tau{int(tau_i)}"
                     val_log_metrics[f"{tau_prefix}/{val_metric_key}"] = tau_score
                     if len(tau_repeat_scores) > 1:
                         repeat_var = sum((x - tau_score) ** 2 for x in tau_repeat_scores) / len(tau_repeat_scores)
@@ -571,10 +558,10 @@ def main(args: DictConfig):
                         "rmse_norm",
                         "rmse_norm_x_std",
                     ):
-                        metric_mean = _mean_metric(tau_world_metrics, key)
+                        metric_mean = _mean_metric(tau_repeat_metrics, key)
                         if metric_mean is not None:
                             val_log_metrics[f"{tau_prefix}/{key}"] = metric_mean
-                    action_diag = tau_world_metrics[0].get("action_diagnostics", {})
+                    action_diag = tau_repeat_metrics[0].get("action_diagnostics", {})
                     for key in (
                         "planned_mean",
                         "factual_mean",
@@ -596,11 +583,11 @@ def main(args: DictConfig):
                         outer,
                         selection_metric_key,
                         val_score,
-                        sel_world,
+                        val_prefix,
                         int(em_val_tau_list[0]),
                         em_val_repeats,
                     )
-                    val_log_metrics[f"val/{sel_world}/{val_metric_key}"] = val_score
+                    val_log_metrics[f"val/{val_prefix}/{val_metric_key}"] = val_score
                 else:
                     logger.info(
                         "EM val outer=%d %s=%.6f mean=%.6f max=%.6f (%s, taus=%s, repeats=%d)",
@@ -609,13 +596,13 @@ def main(args: DictConfig):
                         val_score,
                         val_score_mean,
                         val_score_max,
-                        sel_world,
+                        val_prefix,
                         em_val_tau_list,
                         em_val_repeats,
                     )
-                    val_log_metrics[f"val/{sel_world}/{selection_metric_key}"] = val_score
-                    val_log_metrics[f"val/{sel_world}/mean_{val_metric_key}_tau_list"] = val_score_mean
-                    val_log_metrics[f"val/{sel_world}/max_{val_metric_key}_tau_list"] = val_score_max
+                    val_log_metrics[f"val/{val_prefix}/{selection_metric_key}"] = val_score
+                    val_log_metrics[f"val/{val_prefix}/mean_{val_metric_key}_tau_list"] = val_score_mean
+                    val_log_metrics[f"val/{val_prefix}/max_{val_metric_key}_tau_list"] = val_score_max
                 mlf.log_metrics(val_log_metrics, step=outer)
                 if em_save_every_eval_checkpoint:
                     save_em_checkpoint(

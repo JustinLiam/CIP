@@ -1,0 +1,74 @@
+# @package _global_
+dataset:
+  _target_: src.data.EpiABMDatasetCollection
+  name: epi_abm_multi
+  seed: ${exp.seed}
+  county: "01045"
+  counties_from_epicf_csv: external_repos/epi-diff-abm/data/multi_policy_data.csv
+  date_tag: "202010-202104"
+  epi_root: external_repos/epi-diff-abm
+  processed_data_dir: data/processed/epi_abm/multi_county
+  generate_if_missing: false
+  force_regenerate: false
+  device: ${exp.device}
+  action_hold_days: 7
+  max_seq_length: 182
+  projection_horizon: 14
+  min_history_length: 28
+  val_batch_size: 64
+  split_by: county
+  treatment_mode: continuous
+  intervention_mode: continuous_freeze
+  behavior_policy_subset: factual_only
+  random_policy_mode: continuous_weekly
+  cache_version: daily_v2_continuous_factual
+  static_size: 4
+  treatment_size: 2
+  one_hot_treatment_size: 4
+  input_size: 8
+  output_size: 1
+  predict_X: true
+  autoregressive: true
+  num_random_policies: 0
+  split:
+    val: 0.15
+    test: 0.15
+
+model:
+  dim_treatments: 2
+  dim_vitals: 8
+  dim_static_features: 4
+  dim_outcomes: 1
+  input_size: 8
+  output_size: 1
+  treatment_size: 2
+  one_hot_treatment_size: 4
+  static_size: 4
+
+exp:
+  unscale_rmse: false
+  percentage_rmse: false
+  processed_data_dir: data/processed/epi_abm/multi_county/${model.name}
+  log_dir: my_outputs/epi_abm_multi/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
+  device: cuda
+  gpus: 1
+  weights_ema: true
+  beta: 0.99
+  clear_tf: true
+  logging: false
+  current_date: ${now:%Y-%m-%d}
+  current_time: ${now:%H-%M-%S}
+  mode: train
+  gpu_resources: 0.3
+  cpu_resources: 2
+  csv_dir: csvs/epi_abm_multi
+  max_epochs: 10
+  global_seed: 22
+  sam: true
+  load_data: true
+  iql_decision_interval_days: 7
+  seed: 10
+  tau: 14
+  repeats: 3
+  test: false
+  rank: true
