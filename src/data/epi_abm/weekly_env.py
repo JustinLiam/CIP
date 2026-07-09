@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import fcntl
 import random
 import sys
 from contextlib import contextmanager
@@ -112,22 +113,27 @@ class EpiABMWeeklyEnv:
     @contextmanager
     def _temporary_config(self):
         config_path = self.epi_root / "covid_abm" / "yamls" / "config.yaml"
-        backup_text = config_path.read_text()
-        cfg = yaml.safe_load(backup_text)
-        meta = cfg["simulation_metadata"]
-        meta["POPULATION"] = self.county
-        meta["DATE"] = self.date_tag
-        meta["num_steps_per_episode"] = self.num_steps
-        meta["NUM_WEEKS"] = self.num_weeks
-        meta["NUM_WEEKS_TO_EVAL"] = self.num_weeks_to_eval
-        meta["device"] = self.device
-        meta["GENERATING_COUNTERFACTUAL"] = False
-        meta["calibration"] = True
-        config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
-        try:
-            yield
-        finally:
-            config_path.write_text(backup_text)
+        lock_path = config_path.with_name(f"{config_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            backup_text = config_path.read_text()
+            cfg = yaml.safe_load(backup_text)
+            meta = cfg["simulation_metadata"]
+            meta["POPULATION"] = self.county
+            meta["DATE"] = self.date_tag
+            meta["num_steps_per_episode"] = self.num_steps
+            meta["NUM_WEEKS"] = self.num_weeks
+            meta["NUM_WEEKS_TO_EVAL"] = self.num_weeks_to_eval
+            meta["device"] = self.device
+            meta["GENERATING_COUNTERFACTUAL"] = False
+            meta["calibration"] = True
+            config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+            try:
+                yield
+            finally:
+                config_path.write_text(backup_text)
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _new_runner(self):
         if not self._external_loaded:

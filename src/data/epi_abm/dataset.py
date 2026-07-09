@@ -491,45 +491,65 @@ class EpiABMDatasetCollection(SyntheticDatasetCollection):
         static_features = []
         episode_id = 0
         for county in self.counties:
-            env = self.simulator_cache.get_env(county)
-            schedules = self._policy_schedules(env, county)
-            for policy_name, schedule in schedules:
-                seed = self.seed + episode_id
-                trajectory = self.simulator_cache.precompute_behavior(
-                    county=county,
-                    episode_id=episode_id,
-                    seed=seed,
-                    actions=schedule,
-                )
-                static = env.static_features()
-                outputs, deaths, covariates = [], [], []
-                for day, (y, agg) in enumerate(trajectory):
-                    outputs.append([y])
-                    deaths.append(float(agg["daily_deaths"][0]))
-                    day_norm = float(day) / max(float(self.max_seq_length - 1), 1.0)
-                    cov = np.concatenate(
-                        [
-                            agg["stage_proportions"],
-                            np.asarray([deaths[-1], day_norm, float(day % self.action_hold_days == 0)], dtype=np.float32),
-                        ],
-                        axis=0,
+            print(json.dumps({
+                "event": "epi_abm_generate_county_start",
+                "county": county,
+                "episode_id": int(episode_id),
+            }), flush=True)
+            try:
+                env = self.simulator_cache.get_env(county)
+                schedules = self._policy_schedules(env, county)
+                for policy_name, schedule in schedules:
+                    seed = self.seed + episode_id
+                    trajectory = self.simulator_cache.precompute_behavior(
+                        county=county,
+                        episode_id=episode_id,
+                        seed=seed,
+                        actions=schedule,
                     )
-                    covariates.append(cov)
-                rows.append(
-                    {
-                        "episode_id": episode_id,
-                        "county": county,
-                        "policy_name": f"{county}:{policy_name}",
-                        "seed": seed,
-                        "outputs": np.asarray(outputs, dtype=np.float32),
-                        "current_treatments": schedule.astype(np.float32),
-                        "current_covariates": np.asarray(covariates, dtype=np.float32),
-                    }
-                )
-                episode_actions[episode_id] = schedule.astype(np.float32)
-                static_features.append(static)
-                episode_id += 1
-            self.simulator_cache.release_county(county)
+                    static = env.static_features()
+                    outputs, deaths, covariates = [], [], []
+                    for day, (y, agg) in enumerate(trajectory):
+                        outputs.append([y])
+                        deaths.append(float(agg["daily_deaths"][0]))
+                        day_norm = float(day) / max(float(self.max_seq_length - 1), 1.0)
+                        cov = np.concatenate(
+                            [
+                                agg["stage_proportions"],
+                                np.asarray([deaths[-1], day_norm, float(day % self.action_hold_days == 0)], dtype=np.float32),
+                            ],
+                            axis=0,
+                        )
+                        covariates.append(cov)
+                    rows.append(
+                        {
+                            "episode_id": episode_id,
+                            "county": county,
+                            "policy_name": f"{county}:{policy_name}",
+                            "seed": seed,
+                            "outputs": np.asarray(outputs, dtype=np.float32),
+                            "current_treatments": schedule.astype(np.float32),
+                            "current_covariates": np.asarray(covariates, dtype=np.float32),
+                        }
+                    )
+                    episode_actions[episode_id] = schedule.astype(np.float32)
+                    static_features.append(static)
+                    episode_id += 1
+                print(json.dumps({
+                    "event": "epi_abm_generate_county_done",
+                    "county": county,
+                    "episode_id_next": int(episode_id),
+                }), flush=True)
+            except Exception as exc:
+                print(json.dumps({
+                    "event": "epi_abm_generate_county_failed",
+                    "county": county,
+                    "episode_id": int(episode_id),
+                    "error": repr(exc),
+                }), flush=True)
+                raise
+            finally:
+                self.simulator_cache.release_county(county)
 
         data = self._stack_rows(rows, np.asarray(static_features, dtype=np.float32))
         policy_names = [str(r["policy_name"]) for r in rows]
