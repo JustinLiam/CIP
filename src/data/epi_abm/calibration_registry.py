@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Dict, Optional
 import math
@@ -11,7 +12,9 @@ def project_root() -> Path:
 
 
 def default_epi_abm_root() -> Path:
-    return project_root() / "external_repos" / "epi-diff-abm"
+    raw = os.environ.get("EPI_DIFF_ABM_ROOT", "data_generation/epi_diff_abm")
+    path = Path(raw)
+    return path if path.is_absolute() else project_root() / path
 
 
 @dataclass(frozen=True)

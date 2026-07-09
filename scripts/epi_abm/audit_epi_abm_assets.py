@@ -99,10 +99,10 @@ def audit_county(epi_root: Path, county: str, date_tag: str, num_steps: int) -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit per-county upstream epi-diff-abm assets.")
-    parser.add_argument("--epi-root", default="external_repos/epi-diff-abm")
+    parser.add_argument("--epi-root", default="data_generation/epi_diff_abm")
     parser.add_argument("--date-tag", default="202010-202104")
     parser.add_argument("--num-steps", type=int, default=182)
-    parser.add_argument("--from-epicf-csv", default="external_repos/epi-diff-abm/data/multi_policy_data.csv")
+    parser.add_argument("--from-epicf-csv", default="data_generation/epi_diff_abm/data/multi_policy_data.csv")
     parser.add_argument("--counties", nargs="*", default=None, help="County FIPS values or files containing one county per line.")
     parser.add_argument("--json-out", default=None)
     parser.add_argument("--ready-out", default=None)

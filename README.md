@@ -43,9 +43,8 @@ mlflow server \
 Use this command for the current VCIP one-stage CT+IQL EM experiment. It uses the synthetic tumor comparison protocol (`train/val/test=1000/200/200`, `max_seq_length=60`) and evaluates `tau=1,...,6`.
 
 ```bash
-ssh thinkstation
-cd /home/liam/pythonProject/VCIP-ICML-main
-source /home/liam/anaconda3/etc/profile.d/conda.sh
+cd /path/to/VCIP-ICML-main
+source /path/to/conda/etc/profile.d/conda.sh
 conda activate vcip
 
 GRID_ROOT=grid_results/stable_gift_protocol_best_$(date +%Y%m%d) \

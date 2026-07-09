@@ -1,22 +1,25 @@
 # EpiABM Reproducibility Notes
 
-This directory preserves the code-level bridge between CRIPO and the upstream
-`epi-diff-abm` simulator without vendoring upstream code, generated data, or
-local runtime artifacts.
+This directory preserves provenance for the CRIPO changes to the upstream
+`epi-diff-abm` simulator. The modified simulator code used by the paper is
+vendored under `data_generation/epi_diff_abm` so reviewers do not need to clone
+or patch a separate repository.
 
 ## Upstream
 
 - Repository: `https://github.com/complex-ai-lab/epi-diff-abm`
 - Base commit used for the adapter patch: `824ca2a9785038eaec4e277903856d796ac4adb3`
-- Local checkout convention: `external_repos/epi-diff-abm`
+- Bundled CRIPO simulator path: `data_generation/epi_diff_abm`
 
-The upstream repository is not included in this repo. Clone it locally:
+The patch remains useful for auditing the difference from upstream. To verify
+the vendored code against the upstream base, clone the original repository in a
+temporary directory and apply the patch:
 
 ```bash
-git clone https://github.com/complex-ai-lab/epi-diff-abm external_repos/epi-diff-abm
-cd external_repos/epi-diff-abm
+git clone https://github.com/complex-ai-lab/epi-diff-abm /tmp/epi-diff-abm
+cd /tmp/epi-diff-abm
 git checkout 824ca2a9785038eaec4e277903856d796ac4adb3
-git apply ../../reproducibility/epi_abm/patches/epi-diff-abm-vcip-adapter-824ca2a.patch
+git apply /path/to/CRIPO/reproducibility/epi_abm/patches/epi-diff-abm-vcip-adapter-824ca2a.patch
 ```
 
 ## Patch Scope
@@ -42,12 +45,12 @@ The patch intentionally excludes:
 ## Data Policy
 
 Large or licensed datasets are not versioned here. Place them under the
-upstream local checkout following the EpiCF/EpiABM data-preparation README:
+bundled simulator checkout following the EpiCF/EpiABM data-preparation README:
 
 ```text
-external_repos/epi-diff-abm/data/
-external_repos/epi-diff-abm/populations/
-external_repos/epi-diff-abm/result_graphs/
+data_generation/epi_diff_abm/data/
+data_generation/epi_diff_abm/populations/
+data_generation/epi_diff_abm/result_graphs/
 ```
 
 CRIPO-ready processed caches should stay ignored under:

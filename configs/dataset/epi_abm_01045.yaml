@@ -6,7 +6,7 @@ dataset:
   county: "01045"
   counties: ["01045"]
   date_tag: "202010-202104"
-  epi_root: external_repos/epi-diff-abm
+  epi_root: data_generation/epi_diff_abm
   processed_data_dir: data/processed/epi_abm/01045
   generate_if_missing: true
   force_regenerate: false

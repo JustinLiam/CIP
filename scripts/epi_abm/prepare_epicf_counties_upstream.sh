@@ -14,7 +14,7 @@ set -euo pipefail
 
 MODE="${1:-audit}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-EPI_ROOT="${EPI_ROOT:-${ROOT}/external_repos/epi-diff-abm}"
+EPI_ROOT="${EPI_ROOT:-${ROOT}/data_generation/epi_diff_abm}"
 COUNTY_CSV="${COUNTY_CSV:-${EPI_ROOT}/data/multi_policy_data.csv}"
 COUNTY_FILE="${COUNTY_FILE:-}"
 CONDA_ENV="${CONDA_ENV:-torch_309}"
@@ -42,9 +42,9 @@ activate_env() {
       set +u
       ;;
   esac
-  if [[ -f /home/liam/anaconda3/etc/profile.d/conda.sh ]]; then
+  if [[ -n "${CONDA_EXE:-}" && -f "$(dirname "$(dirname "${CONDA_EXE}")")/etc/profile.d/conda.sh" ]]; then
     # shellcheck disable=SC1091
-    source /home/liam/anaconda3/etc/profile.d/conda.sh
+    source "$(dirname "$(dirname "${CONDA_EXE}")")/etc/profile.d/conda.sh"
   elif [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
     # shellcheck disable=SC1091
     source "${HOME}/anaconda3/etc/profile.d/conda.sh"

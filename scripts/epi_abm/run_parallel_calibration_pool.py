@@ -223,8 +223,8 @@ def worker_loop(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epi-root", type=Path, default=Path("external_repos/epi-diff-abm"))
-    parser.add_argument("--county-csv", type=Path, default=Path("external_repos/epi-diff-abm/data/multi_policy_data.csv"))
+    parser.add_argument("--epi-root", type=Path, default=Path("data_generation/epi_diff_abm"))
+    parser.add_argument("--county-csv", type=Path, default=Path("data_generation/epi_diff_abm/data/multi_policy_data.csv"))
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--gpus", default="0,1", help="Comma-separated GPU ids, or cpu.")

@@ -59,7 +59,7 @@ def _copy_tree(src: Path, dst: Path, *, force: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", default="external_repos/epi-diff-abm")
+    parser.add_argument("--source", default="data_generation/epi_diff_abm")
     parser.add_argument("--dest", required=True)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()

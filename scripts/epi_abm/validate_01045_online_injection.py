@@ -32,7 +32,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Validate direct online action injection for EpiABM 01045.")
     parser.add_argument("--county", default="01045")
     parser.add_argument("--date-tag", default="202010-202104")
-    parser.add_argument("--epi-root", default=str(ROOT / "external_repos" / "epi-diff-abm"))
+    parser.add_argument("--epi-root", default=str(ROOT / "data_generation" / "epi_diff_abm"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num-steps", type=int, default=182)
     parser.add_argument("--burn-in-days", type=int, default=28)
@@ -84,7 +84,7 @@ def run_segmented(env: EpiABMWeeklyEnv, actions: np.ndarray, burn_in_days: int, 
 def main():
     args = parse_args()
     run_root = Path(args.run_root) if args.run_root else (
-        ROOT / "external_repos" / "epi-diff-abm" / "online_rollout_runs" / f"01045_online_injection_{time.strftime('%Y%m%d_%H%M%S')}"
+        ROOT / "data_generation" / "epi_diff_abm" / "online_rollout_runs" / f"01045_online_injection_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     run_root.mkdir(parents=True, exist_ok=True)
 

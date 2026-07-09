@@ -4,9 +4,9 @@ dataset:
   name: epi_abm_multi
   seed: ${exp.seed}
   county: "01045"
-  counties_from_epicf_csv: external_repos/epi-diff-abm/data/multi_policy_data.csv
+  counties_from_epicf_csv: data_generation/epi_diff_abm/data/multi_policy_data.csv
   date_tag: "202010-202104"
-  epi_root: external_repos/epi-diff-abm
+  epi_root: data_generation/epi_diff_abm
   processed_data_dir: data/processed/epi_abm/multi_county
   generate_if_missing: false
   force_regenerate: false
