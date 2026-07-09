@@ -8,6 +8,9 @@ checkpoint/
 my_outputs/
 # data/
 data/processed/epi_abm/
+results/epi_abm/
+results/tumor/
+runtime/epi_abm/
 data_generation/epi_diff_abm/data/*
 data_generation/epi_diff_abm/populations/*
 data_generation/epi_diff_abm/result_graphs/*

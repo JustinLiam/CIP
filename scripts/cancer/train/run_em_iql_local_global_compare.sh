@@ -28,7 +28,7 @@ read -r -a METHODS <<< "${METHODS_RAW}"
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "${ROOT}"
 
-GRID_ROOT="${GRID_ROOT:-${ROOT}/grid_results/em_iql_local_global_compare/gamma_${GAMMA}}"
+GRID_ROOT="${GRID_ROOT:-${ROOT}/results/tumor/em_iql_local_global_compare/gamma_${GAMMA}}"
 mkdir -p "${GRID_ROOT}/logs" "${GRID_ROOT}/ckpts" "${GRID_ROOT}/done"
 
 SUMMARY="${GRID_ROOT}/summary.csv"

@@ -121,7 +121,7 @@ def copy_worker_source(epi_root: Path, worker_epi: Path, force: bool = False) ->
         return
 
     def ignore(dir_path: str, names: Sequence[str]) -> Set[str]:
-        ignored = {"data", "populations", "result_graphs", "reproduction_runs", "online_rollout_runs"}
+        ignored = {"data", "populations", "result_graphs", "results", "reproduction_runs", "online_rollout_runs"}
         ignored.update(name for name in names if name == "__pycache__" or name.endswith(".pyc"))
         return ignored.intersection(names)
 
@@ -225,7 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--epi-root", type=Path, default=Path("data_generation/epi_diff_abm"))
     parser.add_argument("--county-csv", type=Path, default=Path("data_generation/epi_diff_abm/data/multi_policy_data.csv"))
-    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path, default=None)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--gpus", default="0,1", help="Comma-separated GPU ids, or cpu.")
     parser.add_argument("--date-tag", default="202010-202104")
@@ -243,6 +243,8 @@ def main() -> None:
     args = parse_args()
     args.epi_root = args.epi_root.resolve()
     args.county_csv = args.county_csv.resolve()
+    if args.run_dir is None:
+        args.run_dir = Path("results") / "epi_abm" / "calibration" / time.strftime("%Y%m%d_%H%M%S")
     args.run_dir = args.run_dir.resolve()
     (args.run_dir / "logs").mkdir(parents=True, exist_ok=True)
     (args.run_dir / "workers").mkdir(parents=True, exist_ok=True)

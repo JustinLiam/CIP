@@ -84,7 +84,7 @@ def run_segmented(env: EpiABMWeeklyEnv, actions: np.ndarray, burn_in_days: int, 
 def main():
     args = parse_args()
     run_root = Path(args.run_root) if args.run_root else (
-        ROOT / "data_generation" / "epi_diff_abm" / "online_rollout_runs" / f"01045_online_injection_{time.strftime('%Y%m%d_%H%M%S')}"
+        ROOT / "results" / "epi_abm" / "smoke" / f"01045_online_injection_{time.strftime('%Y%m%d_%H%M%S')}"
     )
     run_root.mkdir(parents=True, exist_ok=True)
 

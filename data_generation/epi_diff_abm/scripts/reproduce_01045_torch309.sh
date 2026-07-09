@@ -20,8 +20,9 @@ DEVICE="${DEVICE:-cuda}"
 DELPHI_FETCH_MODE="${DELPHI_FETCH_MODE:-direct_http}"  # direct_http | upstream
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "${ROOT}/../.." && pwd)"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-${ROOT}/reproduction_runs/${COUNTY}_torch309_${RUN_ID}}"
+RUN_ROOT="${RUN_ROOT:-${PROJECT_ROOT}/results/epi_abm/upstream_reproduction/${COUNTY}_${RUN_ID}}"
 LOG_DIR="${RUN_ROOT}/logs"
 CONFIG_PATH="${ROOT}/covid_abm/yamls/config.yaml"
 CONFIG_BACKUP="${RUN_ROOT}/config.yaml.before"

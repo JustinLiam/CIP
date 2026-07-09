@@ -47,7 +47,7 @@ cd /path/to/VCIP-ICML-main
 source /path/to/conda/etc/profile.d/conda.sh
 conda activate vcip
 
-GRID_ROOT=grid_results/stable_gift_protocol_best_$(date +%Y%m%d) \
+GRID_ROOT=results/tumor/stable_gift_protocol_best_$(date +%Y%m%d) \
 GRID_SEEDS="20 202 2020 20202 202020" \
 TEST_SPLIT=true \
 FORCE=1 \
@@ -59,7 +59,7 @@ Current default hyperparameters are stored in `configs/model/vcip.yaml`: AWR act
 For a single diagnostic seed, run:
 
 ```bash
-GRID_ROOT=grid_results/stable_gift_protocol_seed2_$(date +%Y%m%d) \
+GRID_ROOT=results/tumor/stable_gift_protocol_seed2_$(date +%Y%m%d) \
 GRID_SEEDS="2" \
 TEST_SPLIT=true \
 IQL_WEIGHT_MAX=5.0 \
@@ -88,8 +88,18 @@ calibration, cache generation, and data-placement rules.
 Generated EpiABM assets remain outside version control:
 raw simulator assets live under `data_generation/epi_diff_abm/`, and the
 CRIPO-ready processed cache lives under `data/processed/epi_abm/`.
+EpiABM run logs, calibration manifests, smoke-test outputs, and policy
+evaluation summaries live under `results/epi_abm/`.
 
-The results will be saved in the `results/all/` directory, matching the experimental results presented in the paper.
+For a reviewer-facing end-to-end check after placing or generating EpiABM
+assets:
+
+```bash
+python scripts/epi_abm/smoke_test_release.py --device cuda
+```
+
+The non-EpiABM results will be saved in the configured `results/` directory,
+matching the experimental results presented in the paper.
 
 ###Experimental Platform
 

@@ -36,22 +36,29 @@ mechanism and adds only the integration hooks needed by CRIPO:
 
 ## Data Layout
 
-Generated or licensed assets are not committed. Put raw/upstream EpiABM assets
-under this directory, and put CRIPO-ready processed caches under the repository
-level `data/processed/` tree:
+Generated or licensed assets are not committed. The release uses the following
+canonical paths:
 
 ```text
-data_generation/epi_diff_abm/data/multi_policy_data.csv
-data_generation/epi_diff_abm/data/full_google_mob_data/
-data_generation/epi_diff_abm/data/delphi_county_data/
-data_generation/epi_diff_abm/data/state_data/
-data_generation/epi_diff_abm/data/population_data/
-data_generation/epi_diff_abm/data/processed_data/
-data_generation/epi_diff_abm/data/networks/
-data_generation/epi_diff_abm/populations/
-data_generation/epi_diff_abm/result_graphs/
+data_generation/epi_diff_abm/data/
+  multi_policy_data.csv                         EpiCF county/policy metadata
+  full_google_mob_data/                         Google mobility CSV files
+  delphi_county_data/                           Delphi/COVIDcast county cases
+  state_data/                                   Census-derived county inputs
+  population_data/                              generated demographic tables
+  processed_data/<county>/<date_tag>/           upstream daily/weekly ABM inputs
+  networks/covid_output_causal/<county>/        network pickle assets
 
-data/processed/epi_abm/
+data_generation/epi_diff_abm/populations/
+  pop<county>/                                  generated population packages
+
+data_generation/epi_diff_abm/result_graphs/
+  <county>/<date_tag>/<calibration_setting>/    calibrated_params.txt and
+                                                upstream calibration diagnostics
+
+data_generation/epi_diff_abm/results/           upstream generated factual/CF CSVs
+data/processed/epi_abm/                         CRIPO-ready dataset caches
+results/epi_abm/                                run logs, smoke tests, evaluation
 ```
 
 This mirrors the existing project convention: Tumor and MIMIC processed datasets
@@ -74,19 +81,35 @@ Run calibration in parallel:
 python scripts/epi_abm/run_parallel_calibration_pool.py
 ```
 
+This writes logs and worker manifests under `results/epi_abm/calibration/` by
+default. Calibrated parameters remain under
+`data_generation/epi_diff_abm/result_graphs/`.
+
 Build the CRIPO dataset cache:
 
 ```bash
 python scripts/epi_abm/build_multi_county_cache.py
 ```
 
+This writes the model-ready cache under `data/processed/epi_abm/multi_county/`
+by default.
+
 Create an isolated EpiABM runtime when running concurrent rollouts:
 
 ```bash
 python scripts/epi_abm/create_isolated_runtime.py \
   --source data_generation/epi_diff_abm \
-  --dest runtime/epi_abm_run
+  --dest runtime/epi_abm/run
 ```
+
+Run the release smoke test after placing or generating the assets:
+
+```bash
+python scripts/epi_abm/smoke_test_release.py --device cuda
+```
+
+The smoke test writes logs under `results/epi_abm/smoke/` and a temporary cache
+under `data/processed/epi_abm/smoke/`.
 
 Use `EPI_DIFF_ABM_ROOT` to point the CRIPO adapter to another local copy of this
 directory when needed:

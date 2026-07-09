@@ -48,7 +48,7 @@ exp:
   unscale_rmse: false
   percentage_rmse: false
   processed_data_dir: data/processed/epi_abm/01045/${model.name}
-  log_dir: my_outputs/epi_abm_01045/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
+  log_dir: results/epi_abm/training/01045/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
   device: cuda
   gpus: 1
   weights_ema: true
@@ -60,7 +60,7 @@ exp:
   mode: train
   gpu_resources: 0.3
   cpu_resources: 2
-  csv_dir: csvs/epi_abm_01045
+  csv_dir: results/epi_abm/csv/01045
   max_epochs: 10
   global_seed: 22
   sam: true

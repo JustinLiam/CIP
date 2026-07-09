@@ -49,7 +49,7 @@ exp:
   unscale_rmse: false
   percentage_rmse: false
   processed_data_dir: data/processed/epi_abm/multi_county/${model.name}
-  log_dir: my_outputs/epi_abm_multi/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
+  log_dir: results/epi_abm/training/multi_county/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
   device: cuda
   gpus: 1
   weights_ema: true
@@ -61,7 +61,7 @@ exp:
   mode: train
   gpu_resources: 0.3
   cpu_resources: 2
-  csv_dir: csvs/epi_abm_multi
+  csv_dir: results/epi_abm/csv/multi_county
   max_epochs: 10
   global_seed: 22
   sam: true
