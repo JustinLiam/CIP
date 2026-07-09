@@ -85,17 +85,37 @@ submodules, or patch application. See
 `data_generation/epi_diff_abm/README.md` for upstream asset preparation,
 calibration, cache generation, and data-placement rules.
 
-Generated EpiABM assets remain outside version control:
-raw simulator assets live under `data_generation/epi_diff_abm/`, and the
-CRIPO-ready processed cache lives under `data/processed/epi_abm/`.
-EpiABM run logs, calibration manifests, smoke-test outputs, and policy
-evaluation summaries live under `results/epi_abm/`.
+Generated EpiABM assets remain outside version control. The canonical layout is:
 
-For a reviewer-facing end-to-end check after placing or generating EpiABM
-assets:
+```text
+data_generation/epi_diff_abm/data/           raw and upstream-prepared assets
+data_generation/epi_diff_abm/populations/    generated population packages
+data_generation/epi_diff_abm/result_graphs/  calibrated_params.txt and diagnostics
+data/processed/epi_abm/                      CRIPO-ready dataset caches
+results/epi_abm/                             logs, smoke tests, and evaluations
+```
+
+Reviewer-facing reproduction flow:
 
 ```bash
+# 1. Place downloaded EpiCF/EpiABM assets under data_generation/epi_diff_abm/.
+# 2. If upstream assets are absent, generate them with API keys in the environment.
+bash scripts/epi_abm/prepare_epicf_counties_upstream.sh prep
+
+# 3. Calibrate counties; outputs stay under data_generation/epi_diff_abm/result_graphs/.
+python scripts/epi_abm/run_parallel_calibration_pool.py
+
+# 4. Build the CRIPO-ready factual-only multi-county cache.
+python scripts/epi_abm/build_multi_county_cache.py
+
+# 5. Run a minimal but end-to-end release smoke test.
 python scripts/epi_abm/smoke_test_release.py --device cuda
+```
+
+For a faster 01045-only smoke check after assets are already present:
+
+```bash
+python scripts/epi_abm/smoke_test_release.py --device cuda --rollout-days 14 --cache-days 14
 ```
 
 The non-EpiABM results will be saved in the configured `results/` directory,

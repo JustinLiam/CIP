@@ -36,8 +36,7 @@ exp:
   unscale_rmse: True
   percentage_rmse: True
   processed_data_dir: data/processed/cancer_sim_cont/${toint:${dataset.coeff}}/${model.name}
-  log_dir: my_outputs/cancer_sim_cont/coeff_${toint:${dataset.coeff}}/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
-#  log_dir: my_outputs/cancer_sim_cont/${exp.global_seed}/coeff_${toint:${dataset.coeff}}/${model.name}/${exp.mode}/${exp.sam}
+  log_dir: results/tumor/cancer_sim_cont/coeff_${toint:${dataset.coeff}}/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
   device: cuda
   gpus: 1
   weights_ema: True
@@ -49,7 +48,7 @@ exp:
   mode: train
   gpu_resources: 0.3
   cpu_resources: 2
-  csv_dir: csvs/cancer_cont/gamma_${toint:${dataset.coeff}}
+  csv_dir: results/tumor/csv/cancer_cont/gamma_${toint:${dataset.coeff}}
   # seed: 10
   max_epochs: 100
   global_seed: 22

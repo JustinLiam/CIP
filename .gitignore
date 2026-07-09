@@ -10,6 +10,7 @@ my_outputs/
 data/processed/epi_abm/
 results/epi_abm/
 results/tumor/
+results/mimic/
 runtime/epi_abm/
 data_generation/epi_diff_abm/data/*
 data_generation/epi_diff_abm/populations/*

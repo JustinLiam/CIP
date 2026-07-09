@@ -189,8 +189,7 @@ model:
 exp:
   unscale_rmse: False
   percentage_rmse: False
-  # log_dir: my_outputs/mimic_cont/${model.name}/${exp.mode}/
-  log_dir: results
+  log_dir: results/mimic/synthetic_gift/${model.name}/${exp.mode}/${exp.current_date}/${exp.current_time}
   processed_data_dir: data/processed/mimic/${model.name}/
   device: cuda
   gpus: 1
@@ -203,7 +202,7 @@ exp:
   mode: train
   gpu_resources: 0.3
   cpu_resources: 2
-  csv_dir: csvs/mimic_cont/
+  csv_dir: results/mimic/csv/synthetic_gift
   # seed: 10
   max_epochs: 100
   global_seed: 22
@@ -216,7 +215,7 @@ exp:
   em_val_metric: rmse_norm
   em_val_tau_list: [1, 2, 3, 4, 5, 6]
   iql_eval_tau_list: [1, 2, 3, 4, 5, 6]
-  repeats: 5
+  repeats: 3
   test: False
   rank: True
   action_selection_strategy: gradient_descent

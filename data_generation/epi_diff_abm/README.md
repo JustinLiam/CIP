@@ -69,10 +69,13 @@ to their generator code.
 
 Run these commands from the repository root unless noted otherwise.
 
-Prepare upstream county assets:
+Prepare upstream county assets after placing external downloads and exporting
+API keys:
 
 ```bash
-bash scripts/epi_abm/prepare_epicf_counties_upstream.sh
+export COVIDCAST_API_KEY=<your_delphi_key>
+export CENSUS_API_KEY=<your_census_key>
+bash scripts/epi_abm/prepare_epicf_counties_upstream.sh prep
 ```
 
 Run calibration in parallel:
@@ -123,9 +126,17 @@ export EPI_DIFF_ABM_ROOT=/path/to/epi_diff_abm
 - Delphi COVIDcast API data, fetched by `scripts/delphi_api.py`.
 - US Census API data, fetched by `scripts/census.py`.
 - Google COVID-19 Community Mobility Reports, placed under
-  `data/full_google_mob_data/`.
+  `data_generation/epi_diff_abm/data/full_google_mob_data/`.
 - EpiCF benchmark county/policy metadata, including `multi_policy_data.csv`.
 - Generated EpiABM networks, population modules, and calibrated parameter files.
 
 The API keys should be provided through local environment variables or a local
 `.env` file. Do not commit API keys or generated data.
+
+## Review Artifact Guidance
+
+For anonymous review, prefer shipping code, this README, the release smoke-test
+script, and optionally a small derived CRIPO-ready cache. Do not include API
+keys. Avoid bundling raw Google/Delphi/Census downloads or large network and
+population intermediates unless their license and attribution requirements have
+been checked for redistribution.
