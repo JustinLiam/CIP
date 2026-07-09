@@ -1,0 +1,16 @@
+{
+  "upstream_repo": "https://github.com/complex-ai-lab/epi-diff-abm",
+  "upstream_commit": "824ca2a9785038eaec4e277903856d796ac4adb3",
+  "patch_file": "epi-diff-abm-vcip-adapter-824ca2a.patch",
+  "patch_sha256": "90592208b44127909430f21b9701549e2383644e8b9e9e6ec379281cd7ac3757",
+  "excluded_from_patch": [
+    "covid_abm/yamls/config.yaml",
+    "data/",
+    "populations/",
+    "result_graphs/",
+    "results/",
+    "online_rollout_runs/",
+    "reproduction_runs/"
+  ],
+  "notes": "Patch preserves code-level CRIPO/EpiABM adapter changes without vendoring upstream code or generated data."
+}

@@ -1,0 +1,551 @@
+diff --git a/abm_nets.py b/abm_nets.py
+index c2e1021..d142d01 100644
+--- a/abm_nets.py
++++ b/abm_nets.py
+@@ -1,4 +1,5 @@
+ import os
++import importlib
+ import numpy as np
+ from constants import *
+ import torch
+@@ -7,9 +8,9 @@ import torch.optim as optim
+ import matplotlib.pyplot as plt
+ import csv
+ import pandas as pd
++import yaml
+ 
+ import covid_abm
+-from populations import pop01045
+ from agent_torch.core.executor import Executor
+ from agent_torch.core.dataloader import LoadPopulation
+ 
+@@ -199,8 +200,21 @@ def execute(sim, runner, Y_actual, epoch, epochs, n_steps=28, loss_cutoff_step=N
+     
+     return total_loss
+ 
++
++def _load_population_from_config():
++    config_path = os.path.join(covid_abm.__path__[0], "yamls", "config.yaml")
++    with open(config_path, "r") as f:
++        cfg = yaml.safe_load(f)
++    population = str(cfg["simulation_metadata"]["POPULATION"]).strip()
++    if population.endswith(".0"):
++        population = population[:-2]
++    population = population.zfill(5)
++    return importlib.import_module(f"populations.pop{population}")
++
++
+ def eval_net():
+-    sim = Executor(covid_abm, pop_loader=LoadPopulation(pop01045))
++    population_module = _load_population_from_config()
++    sim = Executor(covid_abm, pop_loader=LoadPopulation(population_module))
+     test = sim._get_runner
+     runner = test(sim.config)
+     runner.init()
+diff --git a/agent_torch/core/helpers/general.py b/agent_torch/core/helpers/general.py
+index 280c1b8..c634583 100644
+--- a/agent_torch/core/helpers/general.py
++++ b/agent_torch/core/helpers/general.py
+@@ -106,7 +106,7 @@ def read_config(config_file, register_resolvers=True):
+         for name, func in resolvers:
+             try:
+                 OmegaConf.register_new_resolver(name, func)
+-            except AssertionError as e:
++            except (AssertionError, ValueError) as e:
+                 if "is already registered" in str(e):
+                     continue
+                 else:
+diff --git a/covid_abm/substeps/new_transmission/transition.py b/covid_abm/substeps/new_transmission/transition.py
+index cb780db..de676ba 100644
+--- a/covid_abm/substeps/new_transmission/transition.py
++++ b/covid_abm/substeps/new_transmission/transition.py
+@@ -291,7 +291,17 @@ class NewTransmission(SubstepTransitionMessagePassing):
+     def apply_intervention_fast(self, intervention, edges):
+         if edges.size(0) == 0: return edges
+ 
+-        if intervention == 0:
++        if isinstance(intervention, dict) and intervention.get("mode") == "continuous_freeze":
++            value = intervention.get("value", 0.0)
++            if isinstance(value, torch.Tensor):
++                action_value = value.detach().flatten()[0].to(self.device)
++            else:
++                action_value = torch.tensor(float(value), dtype=torch.float, device=self.device)
++            action_value = torch.clamp(action_value, 0.0, 1.0)
++            low = 0.75 * action_value
++            high = 0.25 + 0.75 * action_value
++            sample = low + torch.rand((1,), device=self.device) * (high - low)
++        elif intervention == 0:
+             sample = torch.clamp(torch.normal(0.5, 0.15, (1,)), 0, 0.25).to(self.device)
+         else:
+             sample = torch.clamp(torch.normal(0.5, 0.15, (1,)), 0.75, 1).to(self.device)
+@@ -331,6 +341,46 @@ class NewTransmission(SubstepTransitionMessagePassing):
+ 
+             self.age_proportion_history.append(row)
+ 
++    def _coerce_online_intervention(self, online_intervention):
++        """Return school/occupation intervention if an online action is set."""
++        if online_intervention is None:
++            return None
++
++        mode = "binary_threshold"
++        if isinstance(online_intervention, dict):
++            mode = online_intervention.get("mode", mode)
++            values = online_intervention.get("values")
++            if values is None:
++                school = online_intervention.get("school_intervention", online_intervention.get("school"))
++                occ = online_intervention.get("occ_intervention", online_intervention.get("workplace"))
++                if school is None or occ is None:
++                    return None
++                values = [school, occ]
++        else:
++            values = online_intervention
++
++        if isinstance(values, torch.Tensor):
++            values = values.detach().flatten().to(self.device)
++            if values.numel() < 2:
++                return None
++            school, occ = values[0], values[1]
++            if mode in {"continuous_freeze", "continuous", "freezing_interval"}:
++                return (
++                    {"mode": "continuous_freeze", "value": school},
++                    {"mode": "continuous_freeze", "value": occ},
++                )
++            return int((school >= 0.5).item()), int((occ >= 0.5).item())
++
++        arr = np.asarray(values, dtype=float).reshape(-1)
++        if arr.size < 2:
++            return None
++        if mode in {"continuous_freeze", "continuous", "freezing_interval"}:
++            return (
++                {"mode": "continuous_freeze", "value": float(arr[0])},
++                {"mode": "continuous_freeze", "value": float(arr[1])},
++            )
++        return int(arr[0] >= 0.5), int(arr[1] >= 0.5)
++
+     def forward(self, state, action=None):
+         input_variables = self.input_variables
+         t = int(state["current_step"])
+@@ -345,7 +395,12 @@ class NewTransmission(SubstepTransitionMessagePassing):
+         school_intervention = curr_intervention.iloc[0]['school_intervention']
+         occ_intervention = curr_intervention.iloc[0]['occ_intervention']
+ 
+-        if generating_counterfactual:
++        online_values = self._coerce_online_intervention(
++            state.get("environment", {}).get("online_intervention", None)
++        )
++        if online_values is not None:
++            school_intervention, occ_intervention = online_values
++        elif generating_counterfactual:
+             if (t == 0):
+                 print(f"Counterfactual Type: {cf_type}")
+             
+@@ -522,4 +577,4 @@ class NewTransmission(SubstepTransitionMessagePassing):
+             self.output_variables[2]: updated_infected_times,
+             self.output_variables[3]: daily_infected,
+             self.output_variables[4]: daily_deaths,
+-        }
+\ No newline at end of file
++        }
+diff --git a/networks/initialize_experiment.py b/networks/initialize_experiment.py
+index e9ed9ee..ebcfaee 100644
+--- a/networks/initialize_experiment.py
++++ b/networks/initialize_experiment.py
+@@ -11,11 +11,18 @@ from gen_mob_nw import generate_mobility_networks
+ from custom_population import customize
+ 
+ 
+-state_abbrev = 'AL'
++state_abbrev = os.environ.get("EPI_STATE_ABBREV", "AL")
+ target_counties = [
+     '01045',
+ ]
+ 
++if os.environ.get("EPI_COUNTIES"):
++    target_counties = [
++        county.strip().zfill(5)
++        for county in os.environ["EPI_COUNTIES"].replace(",", " ").split()
++        if county.strip()
++    ]
++
+ 
+ state_dict = {
+     'AL': 1, 'AK': 2, 'AZ': 4, 'AR': 5, 'CA': 6, 'CO': 8, 'CT': 9, 'DE': 10,
+@@ -162,4 +169,4 @@ for fips_code in tqdm(target_counties, desc="Processing Counties", unit="county"
+     print("-----------------------------------------------------------------")
+ 
+ print()
+-print("Initialization of Experiment Finished!")
+\ No newline at end of file
++print("Initialization of Experiment Finished!")
+diff --git a/scripts/census.py b/scripts/census.py
+index e7fe568..aaa8324 100644
+--- a/scripts/census.py
++++ b/scripts/census.py
+@@ -9,15 +9,62 @@ import requests
+ import pandas as pd
+ import json
+ import os
++import time
+ from dotenv import load_dotenv
+ 
+ load_dotenv()
+ 
+-state = 'AL'
++state = os.environ.get("EPI_STATE_ABBREV", "AL")
+ target_counties = [
+     '01045',
+ ]
+ 
++if os.environ.get("EPI_COUNTIES"):
++    target_counties = [
++        county.strip().zfill(5)
++        for county in os.environ["EPI_COUNTIES"].replace(",", " ").split()
++        if county.strip()
++    ]
++
++
++def _env_int(name, default):
++    value = os.environ.get(name)
++    if value is None or str(value).strip() == "":
++        return default
++    return int(value)
++
++
++def _census_get(url, county_fips, label):
++    timeout_seconds = _env_int("EPI_CENSUS_TIMEOUT_SECONDS", 60)
++    retries = max(1, _env_int("EPI_CENSUS_RETRIES", 5))
++    retry_statuses = {429, 500, 502, 503, 504}
++    for attempt in range(1, retries + 1):
++        try:
++            response = requests.get(url, timeout=timeout_seconds)
++            if response.status_code == 200 or response.status_code not in retry_statuses:
++                return response
++            print(
++                f"Census request returned status={response.status_code} "
++                f"for county={county_fips} label={label} attempt={attempt}/{retries}",
++                flush=True,
++            )
++        except requests.RequestException as exc:
++            print(
++                f"Census request failed for county={county_fips} label={label} "
++                f"attempt={attempt}/{retries}: {type(exc).__name__}",
++                flush=True,
++            )
++            if attempt >= retries:
++                raise RuntimeError(
++                    f"Census request failed for county={county_fips} label={label} "
++                    f"after {retries} attempts"
++                ) from None
++        if attempt < retries:
++            time.sleep(min(5 * attempt, 30))
++    raise RuntimeError(
++        f"Census request failed for county={county_fips} label={label} after {retries} attempts"
++    )
++
+ 
+ def obtain_household_size_distribution(state, county_fips, census_api_key):
+     """ Obtain household size distribution for county from Census data"""
+@@ -53,7 +100,7 @@ def obtain_household_size_distribution(state, county_fips, census_api_key):
+     variables_str = ",".join(household_variables)
+     url = f"{base_url}?get=NAME,{variables_str}&for=county:{county_fips[2:]}&in=state:{county_fips[:2]}&key={census_api_key}"
+ 
+-    response = requests.get(url)
++    response = _census_get(url, county_fips, "household")
+ 
+     # Check the response status code
+     if response.status_code == 200:
+@@ -144,7 +191,7 @@ def obtain_age_distribution(state, county_fips, census_api_key):
+     variables_str = ",".join(age_variables)
+     url = f"{base_url}?get=NAME,{variables_str}&for=county:{county_fips[2:]}&in=state:{county_fips[:2]}&key={census_api_key}"
+ 
+-    response = requests.get(url)
++    response = _census_get(url, county_fips, "age")
+ 
+     # Check the response status code
+     if response.status_code == 200:
+@@ -231,7 +278,7 @@ def obtain_occupation_distribution(state, county_fips, census_api_key):
+             # print(naics_sector, naics_sector_code)
+             url = f"{base_url}?get=NAICS2017_LABEL,EMP,NAME,GEO_ID&for=county:{county_fips[2:]}&in=state:{county_fips[:2]}&NAICS2017={naics_sector_code}&key={census_api_key}"
+             # Make the API request
+-            response = requests.get(url)
++            response = _census_get(url, county_fips, f"occupation_{naics_sector_code}")
+             # Check the response status code
+             if response.status_code == 200:
+                 # The request was successful, so parse the JSON response
+diff --git a/scripts/delphi_api.py b/scripts/delphi_api.py
+index c27c4eb..a7d297d 100644
+--- a/scripts/delphi_api.py
++++ b/scripts/delphi_api.py
+@@ -1,6 +1,12 @@
+ import covidcast
+-from datetime import date
++from contextlib import contextmanager
++from datetime import date, timedelta
+ import os
++import signal
++import time
++
++import pandas as pd
++import requests
+ from dotenv import load_dotenv
+ 
+ load_dotenv()
+@@ -13,6 +19,13 @@ target_counties = [
+     '01045',
+ ]
+ 
++if os.environ.get("EPI_COUNTIES"):
++    target_counties = [
++        county.strip().zfill(5)
++        for county in os.environ["EPI_COUNTIES"].replace(",", " ").split()
++        if county.strip()
++    ]
++
+ # query covidcast API for data
+ # Note:
+ #   smoothed_adj_cli is https://cmu-delphi.github.io/delphi-epidata/api/covidcast-signals/doctor-visits.html
+@@ -21,23 +34,204 @@ target_counties = [
+ covidcast.use_api_key(os.environ.get("COVIDCAST_API_KEY"))
+ start_date, end_date = date(2020, 6, 1), date(2021, 7, 31)
+ 
++
++class _CovidcastTimeout(TimeoutError):
++    pass
++
++
++def _env_int(name, default):
++    value = os.environ.get(name)
++    if value is None or str(value).strip() == "":
++        return default
++    return int(value)
++
++
++def _env_bool(name, default=False):
++    value = os.environ.get(name)
++    if value is None or str(value).strip() == "":
++        return bool(default)
++    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
++
++
++def _api_date(day):
++    return day.strftime("%Y%m%d")
++
++
++@contextmanager
++def _time_limit(seconds):
++    seconds = int(seconds or 0)
++    if seconds <= 0:
++        yield
++        return
++
++    def _raise_timeout(signum, frame):
++        raise _CovidcastTimeout(f"covidcast request exceeded {seconds}s")
++
++    previous_handler = signal.signal(signal.SIGALRM, _raise_timeout)
++    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
++    try:
++        yield
++    finally:
++        signal.setitimer(signal.ITIMER_REAL, 0)
++        signal.signal(signal.SIGALRM, previous_handler)
++        if previous_timer[0] > 0:
++            signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
++
++
++def _date_chunks(start, end, chunk_days):
++    if int(chunk_days or 0) <= 0:
++        yield start, end
++        return
++    current = start
++    delta = timedelta(days=int(chunk_days) - 1)
++    while current <= end:
++        chunk_end = min(current + delta, end)
++        yield current, chunk_end
++        current = chunk_end + timedelta(days=1)
++
++
++def _county_batches(counties, batch_size):
++    batch_size = int(batch_size or 0)
++    if batch_size <= 0 or batch_size >= len(counties):
++        yield counties
++        return
++    for i in range(0, len(counties), batch_size):
++        yield counties[i:i + batch_size]
++
++
++def _fetch_signal_direct_range(signal_name):
++    county_batch_size = _env_int("EPI_DELPHI_COUNTY_BATCH_SIZE", 1)
++    timeout_seconds = _env_int("EPI_DELPHI_TIMEOUT_SECONDS", 120)
++    retries = max(1, _env_int("EPI_DELPHI_RETRIES", 1))
++    url = "https://api.delphi.cmu.edu/epidata/api.php"
++    frames = []
++
++    for counties in _county_batches(target_counties, county_batch_size):
++        params = {
++            "source": "covidcast",
++            "data_source": "indicator-combination",
++            "signals": signal_name,
++            "time_type": "day",
++            "geo_type": "county",
++            "time_values": f"{_api_date(start_date)}-{_api_date(end_date)}",
++            "geo_value": ",".join(counties),
++        }
++        api_key = os.environ.get("COVIDCAST_API_KEY")
++        if api_key:
++            params["api_key"] = api_key
++        for attempt in range(1, retries + 1):
++            try:
++                print(
++                    f"Fetching Delphi direct {signal_name}: {params['time_values']}, "
++                    f"counties={params['geo_value']}, attempt={attempt}/{retries}",
++                    flush=True,
++                )
++                t0 = time.time()
++                response = requests.get(url, params=params, timeout=timeout_seconds)
++                response.raise_for_status()
++                payload = response.json()
++                message = payload.get("message")
++                if message not in {"success", "no results"}:
++                    raise RuntimeError(f"Delphi API returned message={message!r}")
++                rows = payload.get("epidata") or []
++                print(
++                    f"Fetched Delphi direct {signal_name}: rows={len(rows)} "
++                    f"seconds={time.time() - t0:.2f}",
++                    flush=True,
++                )
++                if rows:
++                    frames.append(pd.DataFrame.from_records(rows))
++                break
++            except Exception as exc:
++                print(
++                    f"Delphi direct fetch failed for {signal_name} "
++                    f"counties={params['geo_value']} attempt={attempt}/{retries}: {exc}",
++                    flush=True,
++                )
++                if attempt >= retries:
++                    raise
++                time.sleep(min(5 * attempt, 30))
++
++    if not frames:
++        raise RuntimeError(f"No Delphi rows returned for {signal_name}")
++    out = pd.concat(frames, ignore_index=True)
++    out["time_value"] = pd.to_datetime(out["time_value"].astype(str), format="%Y%m%d")
++    out["issue"] = pd.to_datetime(out["issue"].astype(str), format="%Y%m%d", errors="coerce")
++    out["geo_type"] = "county"
++    out["data_source"] = "indicator-combination"
++    out["signal"] = signal_name
++    return out
++
++
++def _fetch_signal(signal_name):
++    if _env_bool("EPI_DELPHI_DIRECT_RANGE", False):
++        return _fetch_signal_direct_range(signal_name)
++
++    chunk_days = _env_int("EPI_DELPHI_CHUNK_DAYS", 0)
++    county_batch_size = _env_int("EPI_DELPHI_COUNTY_BATCH_SIZE", 0)
++    timeout_seconds = _env_int("EPI_DELPHI_TIMEOUT_SECONDS", 0)
++    retries = max(1, _env_int("EPI_DELPHI_RETRIES", 1))
++
++    # Keep the original full-range, all-county request path unless chunking or
++    # county batching is explicitly enabled by the caller.
++    if chunk_days <= 0 and county_batch_size <= 0 and timeout_seconds <= 0 and retries <= 1:
++        return covidcast.signal(
++            "indicator-combination",
++            signal_name,
++            start_date,
++            end_date,
++            "county",
++            geo_values=target_counties
++        )
++
++    frames = []
++    total_chunks = 0
++    for counties in _county_batches(target_counties, county_batch_size):
++        for start, end in _date_chunks(start_date, end_date, chunk_days):
++            total_chunks += 1
++            for attempt in range(1, retries + 1):
++                try:
++                    print(
++                        f"Fetching Delphi {signal_name}: {start}..{end}, "
++                        f"counties={','.join(counties)}, attempt={attempt}/{retries}",
++                        flush=True,
++                    )
++                    t0 = time.time()
++                    with _time_limit(timeout_seconds):
++                        frame = covidcast.signal(
++                            "indicator-combination",
++                            signal_name,
++                            start,
++                            end,
++                            "county",
++                            geo_values=counties
++                        )
++                    print(
++                        f"Fetched Delphi {signal_name}: rows={0 if frame is None else len(frame)} "
++                        f"seconds={time.time() - t0:.2f}",
++                        flush=True,
++                    )
++                    if frame is not None and len(frame) > 0:
++                        frames.append(frame)
++                    break
++                except Exception as exc:
++                    print(
++                        f"Delphi fetch failed for {signal_name} {start}..{end} "
++                        f"counties={','.join(counties)} attempt={attempt}/{retries}: {exc}",
++                        flush=True,
++                    )
++                    if attempt >= retries:
++                        raise
++                    time.sleep(min(5 * attempt, 30))
++
++    if not frames:
++        raise RuntimeError(f"No Delphi rows returned for {signal_name} across {total_chunks} chunks")
++    return pd.concat(frames, ignore_index=True)
++
++
+ def process_daily_data():
+-    deaths = covidcast.signal(
+-        "indicator-combination",
+-        "deaths_incidence_num",
+-        start_date,
+-        end_date,
+-        "county",
+-        geo_values=target_counties
+-    )
+-    cases = covidcast.signal(
+-        "indicator-combination",
+-        "confirmed_incidence_num",
+-        start_date,
+-        end_date,
+-        "county",
+-        geo_values=target_counties
+-    )
++    deaths = _fetch_signal("deaths_incidence_num")
++    cases = _fetch_signal("confirmed_incidence_num")
+ 
+     data = covidcast.aggregate_signals([cases, deaths])
+ 
+diff --git a/scripts/process_counties.py b/scripts/process_counties.py
+index 09f4542..50fd01b 100644
+--- a/scripts/process_counties.py
++++ b/scripts/process_counties.py
+@@ -5,11 +5,18 @@ import json
+ import requests
+ from io import StringIO
+ 
+-state = 'AL'
++state = os.environ.get("EPI_STATE_ABBREV", "AL")
+ target_counties = [
+     '01045',
+ ]
+ 
++if os.environ.get("EPI_COUNTIES"):
++    target_counties = [
++        county.strip().zfill(5)
++        for county in os.environ["EPI_COUNTIES"].replace(",", " ").split()
++        if county.strip()
++    ]
++
+ def process_fips_data(fips_code):
+     # Define paths
+     project_root = os.path.join(os.path.dirname(__file__), "..")
