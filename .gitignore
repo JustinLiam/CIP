@@ -9,11 +9,8 @@ my_outputs/
 # data/
 data/processed/epi_abm/
 data_generation/epi_diff_abm/data/*
-!data_generation/epi_diff_abm/data/README.md
 data_generation/epi_diff_abm/populations/*
-!data_generation/epi_diff_abm/populations/README.md
 data_generation/epi_diff_abm/result_graphs/*
-!data_generation/epi_diff_abm/result_graphs/README.md
 data_generation/epi_diff_abm/results/
 data_generation/epi_diff_abm/online_rollout_runs/
 data_generation/epi_diff_abm/reproduction_runs/

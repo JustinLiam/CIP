@@ -76,6 +76,9 @@ def main() -> None:
     if not (src / "covid_abm" / "yamls" / "config.yaml").exists():
         raise FileNotFoundError(f"Source does not look like epi-diff-abm: {src}")
 
+    for name in SYMLINK_NAMES:
+        (src / name).mkdir(parents=True, exist_ok=True)
+
     _copy_tree(src, dst, force=bool(args.force))
 
     config_path = dst / "covid_abm" / "yamls" / "config.yaml"

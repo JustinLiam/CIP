@@ -77,6 +77,17 @@ bash scripts/cancer/train/train_ct_iql_em.sh 0 4 10
 
 For MIMIC synthetic experiments, use `+dataset=mimic3_synthetic_gift`, which is the GIFT-aligned semi-synthetic MIMIC data path. The legacy `mimic3_real` and two-stage `train_iql_planner.py` workflows have been removed from the supported experiment surface because they do not implement the current one-stage CT+IQL EM method.
 
+### EpiABM / EpiCF Data Generation
+
+The modified EpiABM simulator used by the CRIPO experiments is bundled under
+`data_generation/epi_diff_abm`; reviewers do not need `external_repos`, git
+submodules, or patch application. See
+`data_generation/epi_diff_abm/README.md` for upstream asset preparation,
+calibration, cache generation, and data-placement rules.
+
+Generated EpiABM assets remain outside version control:
+raw simulator assets live under `data_generation/epi_diff_abm/`, and the
+CRIPO-ready processed cache lives under `data/processed/epi_abm/`.
 
 The results will be saved in the `results/all/` directory, matching the experimental results presented in the paper.
 
