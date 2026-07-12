@@ -139,6 +139,38 @@ def _scale_outputs_np(y_uns: np.ndarray, scaling_params) -> np.ndarray:
     return ((np.asarray(y_uns, dtype=np.float64) - means) / stds).astype(np.float32)
 
 
+def _outcome_transform(scaling_params) -> str:
+    if isinstance(scaling_params, dict):
+        value = str(scaling_params.get("outcome_transform", "raw_cases_zscore")).strip().lower()
+        if value in {"per10k", "per_10k", "per10k_cases", "per_10k_cases", "per10k_cases_zscore", "per_10k_cases_zscore"}:
+            return "per10k_cases_zscore"
+    return "raw_cases_zscore"
+
+
+def _model_units_to_raw_cases(values: np.ndarray, scaling_params, population: float | None) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if _outcome_transform(scaling_params) == "per10k_cases_zscore":
+        if population is None or population <= 0:
+            return np.full_like(arr, np.nan, dtype=np.float64)
+        return arr * float(population) / 10000.0
+    return arr
+
+
+def _model_units_to_per_capita(
+    values: np.ndarray,
+    scaling_params,
+    population: float | None,
+    base: float,
+) -> float | None:
+    arr = np.asarray(values, dtype=np.float64)
+    if _outcome_transform(scaling_params) == "per10k_cases_zscore":
+        scale = float(base) / 10000.0
+        return float(arr.reshape(-1).mean()) * scale
+    if population is None or population <= 0:
+        return None
+    return float(arr.reshape(-1).mean()) / float(population) * float(base)
+
+
 def _population_from_row(data: dict, row_idx: int) -> float | None:
     if "static_features" not in data:
         return None
@@ -353,14 +385,26 @@ def _metric_row(
     factual_final = factual_norm_daily[:, -1, :]
     target_final = np.asarray(target_norm_final, dtype=np.float32)
 
-    pred_daily_uns = _unscale_outputs_np(pred_norm_daily, scaling_params)
-    true_daily_uns = _unscale_outputs_np(true_norm_daily, scaling_params)
-    factual_daily_uns = _unscale_outputs_np(factual_norm_daily, scaling_params)
-    pred_uns = _unscale_outputs_np(pred_final, scaling_params)
-    true_uns = _unscale_outputs_np(true_final, scaling_params)
-    factual_uns = _unscale_outputs_np(factual_final, scaling_params)
-    target_uns = _unscale_outputs_np(target_final, scaling_params)
+    transform = _outcome_transform(scaling_params)
+    pred_daily_model = _unscale_outputs_np(pred_norm_daily, scaling_params)
+    true_daily_model = _unscale_outputs_np(true_norm_daily, scaling_params)
+    factual_daily_model = _unscale_outputs_np(factual_norm_daily, scaling_params)
+    pred_model = _unscale_outputs_np(pred_final, scaling_params)
+    true_model = _unscale_outputs_np(true_final, scaling_params)
+    factual_model = _unscale_outputs_np(factual_final, scaling_params)
+    target_model = _unscale_outputs_np(target_final, scaling_params)
 
+    pred_daily_uns = _model_units_to_raw_cases(pred_daily_model, scaling_params, population)
+    true_daily_uns = _model_units_to_raw_cases(true_daily_model, scaling_params, population)
+    factual_daily_uns = _model_units_to_raw_cases(factual_daily_model, scaling_params, population)
+    pred_uns = _model_units_to_raw_cases(pred_model, scaling_params, population)
+    true_uns = _model_units_to_raw_cases(true_model, scaling_params, population)
+    factual_uns = _model_units_to_raw_cases(factual_model, scaling_params, population)
+    target_uns = _model_units_to_raw_cases(target_model, scaling_params, population)
+
+    pred_cum_model = pred_daily_model.sum(axis=1)
+    true_cum_model = true_daily_model.sum(axis=1)
+    factual_cum_model = factual_daily_model.sum(axis=1)
     pred_cum_uns = pred_daily_uns.sum(axis=1)
     true_cum_uns = true_daily_uns.sum(axis=1)
     factual_cum_uns = factual_daily_uns.sum(axis=1)
@@ -368,15 +412,17 @@ def _metric_row(
     def _scalar(value: np.ndarray) -> float:
         return float(np.asarray(value, dtype=np.float64).reshape(-1).mean())
 
-    def _per_capita(value: np.ndarray, base: float) -> float | None:
-        if population is None or population <= 0:
-            return None
-        return _scalar(value) / float(population) * float(base)
+    def _per_capita_model(value: np.ndarray, base: float) -> float | None:
+        return _model_units_to_per_capita(value, scaling_params, population, base)
 
     target_distance = np.abs(pred_uns - target_uns)
     factual_target_distance = np.abs(factual_uns - target_uns)
+    target_distance_model = np.abs(pred_model - target_model)
+    factual_target_distance_model = np.abs(factual_model - target_model)
     policy_vs_factual_final_improvement = factual_uns - pred_uns
     policy_vs_factual_cum_improvement = factual_cum_uns - pred_cum_uns
+    policy_vs_factual_final_improvement_model = factual_model - pred_model
+    policy_vs_factual_cum_improvement_model = factual_cum_model - pred_cum_model
     return {
         "event": "county_done",
         "split": split,
@@ -384,6 +430,7 @@ def _metric_row(
         "county": county,
         "label": label,
         "population": float(population) if population is not None else None,
+        "outcome_transform": transform,
         "rmse_norm": float(np.sqrt(((pred_final - true_final) ** 2).mean())),
         "mae_norm": float(np.abs(pred_final - true_final).mean()),
         "rmse_uns": float(np.sqrt(((pred_uns - true_uns) ** 2).mean())),
@@ -405,37 +452,46 @@ def _metric_row(
         "target_improvement_uns": _scalar(factual_target_distance - target_distance),
         "policy_vs_factual_final_improvement_uns": _scalar(policy_vs_factual_final_improvement),
         "policy_vs_factual_cumulative_improvement_uns": _scalar(policy_vs_factual_cum_improvement),
-        "pred_final_per_10k": _per_capita(pred_uns, 10000.0),
-        "true_final_per_10k": _per_capita(true_uns, 10000.0),
-        "factual_final_per_10k": _per_capita(factual_uns, 10000.0),
-        "target_final_per_10k": _per_capita(target_uns, 10000.0),
-        "pred_cumulative_per_10k": _per_capita(pred_cum_uns, 10000.0),
-        "true_cumulative_per_10k": _per_capita(true_cum_uns, 10000.0),
-        "factual_cumulative_per_10k": _per_capita(factual_cum_uns, 10000.0),
-        "target_distance_per_10k": _per_capita(target_distance, 10000.0),
-        "factual_target_distance_per_10k": _per_capita(factual_target_distance, 10000.0),
-        "target_improvement_per_10k": _per_capita(factual_target_distance - target_distance, 10000.0),
-        "policy_vs_factual_final_improvement_per_10k": _per_capita(
-            policy_vs_factual_final_improvement, 10000.0
+        "pred_final_model_units": _scalar(pred_model),
+        "true_final_model_units": _scalar(true_model),
+        "factual_final_model_units": _scalar(factual_model),
+        "target_final_model_units": _scalar(target_model),
+        "target_distance_model_units": _scalar(target_distance_model),
+        "factual_target_distance_model_units": _scalar(factual_target_distance_model),
+        "target_improvement_model_units": _scalar(factual_target_distance_model - target_distance_model),
+        "policy_vs_factual_final_improvement_model_units": _scalar(policy_vs_factual_final_improvement_model),
+        "policy_vs_factual_cumulative_improvement_model_units": _scalar(policy_vs_factual_cum_improvement_model),
+        "pred_final_per_10k": _per_capita_model(pred_model, 10000.0),
+        "true_final_per_10k": _per_capita_model(true_model, 10000.0),
+        "factual_final_per_10k": _per_capita_model(factual_model, 10000.0),
+        "target_final_per_10k": _per_capita_model(target_model, 10000.0),
+        "pred_cumulative_per_10k": _per_capita_model(pred_cum_model, 10000.0),
+        "true_cumulative_per_10k": _per_capita_model(true_cum_model, 10000.0),
+        "factual_cumulative_per_10k": _per_capita_model(factual_cum_model, 10000.0),
+        "target_distance_per_10k": _per_capita_model(target_distance_model, 10000.0),
+        "factual_target_distance_per_10k": _per_capita_model(factual_target_distance_model, 10000.0),
+        "target_improvement_per_10k": _per_capita_model(factual_target_distance_model - target_distance_model, 10000.0),
+        "policy_vs_factual_final_improvement_per_10k": _per_capita_model(
+            policy_vs_factual_final_improvement_model, 10000.0
         ),
-        "policy_vs_factual_cumulative_improvement_per_10k": _per_capita(
-            policy_vs_factual_cum_improvement, 10000.0
+        "policy_vs_factual_cumulative_improvement_per_10k": _per_capita_model(
+            policy_vs_factual_cum_improvement_model, 10000.0
         ),
-        "pred_final_per_100k": _per_capita(pred_uns, 100000.0),
-        "true_final_per_100k": _per_capita(true_uns, 100000.0),
-        "factual_final_per_100k": _per_capita(factual_uns, 100000.0),
-        "target_final_per_100k": _per_capita(target_uns, 100000.0),
-        "pred_cumulative_per_100k": _per_capita(pred_cum_uns, 100000.0),
-        "true_cumulative_per_100k": _per_capita(true_cum_uns, 100000.0),
-        "factual_cumulative_per_100k": _per_capita(factual_cum_uns, 100000.0),
-        "target_distance_per_100k": _per_capita(target_distance, 100000.0),
-        "factual_target_distance_per_100k": _per_capita(factual_target_distance, 100000.0),
-        "target_improvement_per_100k": _per_capita(factual_target_distance - target_distance, 100000.0),
-        "policy_vs_factual_final_improvement_per_100k": _per_capita(
-            policy_vs_factual_final_improvement, 100000.0
+        "pred_final_per_100k": _per_capita_model(pred_model, 100000.0),
+        "true_final_per_100k": _per_capita_model(true_model, 100000.0),
+        "factual_final_per_100k": _per_capita_model(factual_model, 100000.0),
+        "target_final_per_100k": _per_capita_model(target_model, 100000.0),
+        "pred_cumulative_per_100k": _per_capita_model(pred_cum_model, 100000.0),
+        "true_cumulative_per_100k": _per_capita_model(true_cum_model, 100000.0),
+        "factual_cumulative_per_100k": _per_capita_model(factual_cum_model, 100000.0),
+        "target_distance_per_100k": _per_capita_model(target_distance_model, 100000.0),
+        "factual_target_distance_per_100k": _per_capita_model(factual_target_distance_model, 100000.0),
+        "target_improvement_per_100k": _per_capita_model(factual_target_distance_model - target_distance_model, 100000.0),
+        "policy_vs_factual_final_improvement_per_100k": _per_capita_model(
+            policy_vs_factual_final_improvement_model, 100000.0
         ),
-        "policy_vs_factual_cumulative_improvement_per_100k": _per_capita(
-            policy_vs_factual_cum_improvement, 100000.0
+        "policy_vs_factual_cumulative_improvement_per_100k": _per_capita_model(
+            policy_vs_factual_cum_improvement_model, 100000.0
         ),
         "action_mean": float(planned_actions.mean()) if planned_actions is not None and planned_actions.size else None,
         "action_std": float(planned_actions.std()) if planned_actions is not None and planned_actions.size else None,
@@ -618,6 +674,12 @@ def main() -> None:
     parser.add_argument("--force-regenerate", action="store_true", help="Regenerate dataset cache before eval.")
     parser.add_argument("--cache-version", default=None, help="Override cfg.dataset.cache_version.")
     parser.add_argument("--dataset-seed", type=int, default=None, help="Override cfg.dataset.seed.")
+    parser.add_argument(
+        "--outcome-transform",
+        choices=["raw_cases_zscore", "per10k_cases_zscore"],
+        default=None,
+        help="Override cfg.dataset.outcome_transform.",
+    )
     parser.add_argument("--max-counties", type=int, default=None)
     parser.add_argument("--row-start", type=int, default=0, help="Inclusive row offset within each split.")
     parser.add_argument("--row-end", type=int, default=None, help="Exclusive row offset within each split.")
@@ -654,6 +716,8 @@ def main() -> None:
         cfg.dataset.cache_version = args.cache_version
     if args.dataset_seed is not None:
         cfg.dataset.seed = int(args.dataset_seed)
+    if args.outcome_transform is not None:
+        cfg.dataset.outcome_transform = args.outcome_transform
     cfg.dataset.device = args.abm_device
     cfg.exp.device = args.model_device
     cfg.exp.iql_eval_action_selector = args.selector
@@ -707,6 +771,12 @@ def main() -> None:
         "force_regenerate": bool(cfg.dataset.force_regenerate),
         "cache_version": cfg.dataset.get("cache_version", None),
         "dataset_seed": int(cfg.dataset.seed),
+        "outcome_transform": cfg.dataset.get("outcome_transform", "raw_cases_zscore"),
+        "scaling_outcome_transform": (
+            dataset_collection.train_scaling_params.get("outcome_transform", "raw_cases_zscore")
+            if isinstance(dataset_collection.train_scaling_params, dict)
+            else None
+        ),
         "row_start": args.row_start,
         "row_end": args.row_end,
         "max_counties": args.max_counties,

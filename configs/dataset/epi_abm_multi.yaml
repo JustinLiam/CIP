@@ -19,6 +19,7 @@ dataset:
   split_by: county
   treatment_mode: continuous
   intervention_mode: continuous_freeze
+  outcome_transform: raw_cases_zscore
   behavior_policy_subset: factual_only
   random_policy_mode: continuous_weekly
   cache_version: daily_v2_continuous_factual

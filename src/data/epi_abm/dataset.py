@@ -41,6 +41,47 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
+def _normalize_outcome_transform(value: str) -> str:
+    value = str(value or "raw_cases_zscore").strip().lower()
+    aliases = {
+        "raw": "raw_cases_zscore",
+        "raw_cases": "raw_cases_zscore",
+        "raw_cases_zscore": "raw_cases_zscore",
+        "cases": "raw_cases_zscore",
+        "per10k": "per10k_cases_zscore",
+        "per_10k": "per10k_cases_zscore",
+        "per10k_cases": "per10k_cases_zscore",
+        "per_10k_cases": "per10k_cases_zscore",
+        "per10k_cases_zscore": "per10k_cases_zscore",
+        "per_10k_cases_zscore": "per10k_cases_zscore",
+    }
+    if value not in aliases:
+        raise ValueError(
+            f"Unknown EpiABM outcome_transform={value!r}; expected raw_cases_zscore "
+            "or per10k_cases_zscore."
+        )
+    return aliases[value]
+
+
+def _population_from_static(static_features: Any, *, n_rows: int) -> np.ndarray:
+    static = _to_numpy(static_features).astype(np.float32)
+    if static.ndim == 3:
+        pop_scaled = static[:, 0, 0]
+    elif static.ndim == 2:
+        pop_scaled = static[:, 0]
+    elif static.ndim == 1:
+        pop_scaled = static[:1]
+    else:
+        raise ValueError(f"static_features must have shape [B, F] or [B, T, F], got {static.shape}")
+    population = np.asarray(pop_scaled, dtype=np.float32).reshape(-1, 1, 1) * 100000.0
+    if population.shape[0] == 1 and n_rows != 1:
+        population = np.repeat(population, n_rows, axis=0)
+    if population.shape[0] != n_rows:
+        raise ValueError(f"population rows {population.shape[0]} do not match outputs rows {n_rows}")
+    population = np.where(population > 0, population, 1.0)
+    return population.astype(np.float32)
+
+
 class EpiABMDataset(Dataset):
     """Daily EpiABM trajectories with a MIMIC-style simulator oracle."""
 
@@ -56,6 +97,7 @@ class EpiABMDataset(Dataset):
         episode_actions: Dict[int, np.ndarray],
         simulator_cache: Optional[EpiABMSimulatorCache] = None,
         intervention_mode: str = "binary_threshold",
+        outcome_transform: str = "raw_cases_zscore",
         base_seed: int = 0,
         device: str = "cuda",
     ) -> None:
@@ -67,6 +109,7 @@ class EpiABMDataset(Dataset):
         self.action_hold_days = int(action_hold_days)
         self.episode_actions = {int(k): np.asarray(v, dtype=np.float32) for k, v in episode_actions.items()}
         self.intervention_mode = str(intervention_mode or "binary_threshold")
+        self.outcome_transform = _normalize_outcome_transform(outcome_transform)
         self.base_seed = int(base_seed)
         self.device = str(device)
         self.processed = False
@@ -88,8 +131,21 @@ class EpiABMDataset(Dataset):
     def __getitem__(self, index) -> dict:
         return {k: v[index] for k, v in self.data.items()}
 
+    def _to_model_output_scale(
+        self,
+        raw_outputs: Any,
+        static_features: Optional[Any] = None,
+    ) -> np.ndarray:
+        raw = _to_numpy(raw_outputs).astype(np.float32)
+        if self.outcome_transform == "raw_cases_zscore":
+            return raw
+        if static_features is None:
+            static_features = self.data["static_features"]
+        population = _population_from_static(static_features, n_rows=raw.shape[0])
+        return (raw / population * 10000.0).astype(np.float32)
+
     def get_scaling_params(self) -> Dict[str, np.ndarray]:
-        outputs = self.data["unscaled_outputs"]
+        outputs = self._to_model_output_scale(self.data["unscaled_outputs"])
         mask = self.data["active_entries"].astype(bool)
         valid = outputs[mask.reshape(outputs.shape[0], outputs.shape[1])]
         if valid.size == 0:
@@ -97,7 +153,12 @@ class EpiABMDataset(Dataset):
         mean = valid.reshape(-1, outputs.shape[-1]).mean(axis=0)
         std = valid.reshape(-1, outputs.shape[-1]).std(axis=0)
         std = np.where(std < 1e-6, 1.0, std)
-        return {"output_means": mean.astype(np.float32), "output_stds": std.astype(np.float32)}
+        return {
+            "output_means": mean.astype(np.float32),
+            "output_stds": std.astype(np.float32),
+            "outcome_transform": self.outcome_transform,
+            "output_space": "raw_cases" if self.outcome_transform == "raw_cases_zscore" else "cases_per_10k",
+        }
 
     def process_data(self, scaling_params):
         if self.processed:
@@ -105,8 +166,12 @@ class EpiABMDataset(Dataset):
         self.scaling_params = scaling_params
         mean = np.asarray(scaling_params["output_means"], dtype=np.float32)
         std = np.asarray(scaling_params["output_stds"], dtype=np.float32)
-        self.data["outputs"] = ((self.data["unscaled_outputs"] - mean) / std).astype(np.float32)
-        self.data["prev_outputs"] = ((self.data["prev_unscaled_outputs"] - mean) / std).astype(np.float32)
+        outputs = self._to_model_output_scale(self.data["unscaled_outputs"])
+        prev_outputs = self._to_model_output_scale(self.data["prev_unscaled_outputs"])
+        self.data["outputs"] = ((outputs - mean) / std).astype(np.float32)
+        self.data["prev_outputs"] = ((prev_outputs - mean) / std).astype(np.float32)
+        self.data["model_unscaled_outputs"] = outputs.astype(np.float32)
+        self.data["prev_model_unscaled_outputs"] = prev_outputs.astype(np.float32)
         self.processed = True
         return self.data
 
@@ -249,11 +314,13 @@ class EpiABMDataset(Dataset):
             daily_counties.append(np.full((actions_np.shape[1], 1), float(int(meta["county"])), dtype=np.float32))
 
         daily_arr = np.stack(daily_outputs, axis=0).astype(np.float32)
-        norm_daily = ((daily_arr - mean) / std).astype(np.float32)
+        model_daily = self._to_model_output_scale(daily_arr, H.get("static_features"))
+        norm_daily = ((model_daily - mean) / std).astype(np.float32)
         treatments = actions_np.astype(np.float32)
         return {
             "outputs": norm_daily,
             "unscaled_outputs": daily_arr,
+            "model_unscaled_outputs": model_daily,
             "current_treatments": treatments,
             "current_covariates": np.stack(daily_covariates, axis=0).astype(np.float32),
             "vitals": np.stack(daily_covariates, axis=0).astype(np.float32),
@@ -318,6 +385,7 @@ class EpiABMDatasetCollection(SyntheticDatasetCollection):
         treatment_mode: str = "binary",
         intervention_mode: Optional[str] = None,
         random_policy_mode: Optional[str] = None,
+        outcome_transform: str = "raw_cases_zscore",
         cache_version: Optional[str] = None,
         **kwargs,
     ) -> None:
@@ -346,6 +414,7 @@ class EpiABMDatasetCollection(SyntheticDatasetCollection):
         self.num_random_policies = int(num_random_policies)
         self.behavior_policy_subset = str(behavior_policy_subset or "factual_only").strip().lower()
         self.treatment_mode = str(treatment_mode or "binary")
+        self.outcome_transform = _normalize_outcome_transform(outcome_transform)
         if intervention_mode is None:
             intervention_mode = "continuous_freeze" if self.treatment_mode == "continuous" else "binary_threshold"
         self.intervention_mode = str(intervention_mode)
@@ -381,6 +450,7 @@ class EpiABMDatasetCollection(SyntheticDatasetCollection):
             "episode_actions": self.episode_actions,
             "simulator_cache": self.simulator_cache,
             "intervention_mode": self.intervention_mode,
+            "outcome_transform": self.outcome_transform,
             "base_seed": self.seed,
             "device": self.device,
         }
@@ -448,6 +518,7 @@ class EpiABMDatasetCollection(SyntheticDatasetCollection):
                 "split_by": self.split_by,
                 "treatment_mode": self.treatment_mode,
                 "intervention_mode": self.intervention_mode,
+                "outcome_transform": self.outcome_transform,
                 "random_policy_mode": self.random_policy_mode,
                 "cache_version": self.cache_version,
                 "cache_path": str(self._cache_path()),
