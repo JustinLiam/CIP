@@ -187,7 +187,7 @@ def _extend_h_work_after_one_step(
     if "static_features" in H:
         sf = H["static_features"]
         if sf.dim() == 3:
-            last = sf[:, -1:, :].expand(-1, 1, -1)
+            last = gather_last_valid(sf, active).unsqueeze(1)
             H["static_features"] = torch.cat([sf, last], dim=1)
 
     if "vitals" in H and "future_vitals" in H and H["future_vitals"].size(1) > 0:
@@ -204,8 +204,9 @@ def _extend_h_work_after_one_step(
 
     if "current_covariates" in H:
         cc = H["current_covariates"]
-        ext = cc[:, -1:, :].clone()
-        ext[:, :, 0:y_step.size(-1)] = y_ch
+        # Keep covariates separate from the outcome channel. The outcome is
+        # already present in H["outputs"]/H["prev_outputs"].
+        ext = gather_last_valid(cc, active).unsqueeze(1).clone()
         H["current_covariates"] = torch.cat([cc, ext], dim=1)
 
 

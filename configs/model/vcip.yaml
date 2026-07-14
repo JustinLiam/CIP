@@ -11,6 +11,8 @@ exp:
   batch_size: 1024
   batch_size_val: 128
   dropout: 0.0
+  ct_use_weight_net: true
+  ct_align_loss: sinkhorn  # sinkhorn | mmd
   tau: 6
   log_config: false
   use_mlflow: true

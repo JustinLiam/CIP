@@ -16,10 +16,18 @@ def _active_2d(active_entries: torch.Tensor) -> torch.Tensor:
 
 
 def last_valid_indices(active_entries: torch.Tensor) -> torch.Tensor:
-    """Return [B] indices of the last active timestep, clamped for empty rows."""
+    """Return [B] indices of the rightmost active timestep, clamped for empty rows.
+
+    Uses the rightmost ``active > 0.5`` position rather than ``sum(active) - 1``,
+    so contiguous prefix padding (``[1,1,0,0]``) and non-contiguous masks
+    (``[1,1,0,0,1]``) are both handled correctly.
+    """
     active = _active_2d(active_entries)
-    lengths = (active > 0.5).long().sum(dim=1)
-    return (lengths - 1).clamp(min=0)
+    is_active = active > 0.5
+    positions = torch.arange(active.size(1), device=active.device, dtype=torch.long)
+    positions = positions.unsqueeze(0).expand_as(is_active)
+    # Inactive -> -1 so max yields the rightmost active index; empty rows -> -1 -> 0.
+    return torch.where(is_active, positions, positions.new_full(positions.shape, -1)).max(dim=1).values.clamp(min=0)
 
 
 def last_valid_mask(active_entries: torch.Tensor) -> torch.Tensor:

@@ -309,7 +309,7 @@ def simulate_factual(simulation_params, seq_length, assigned_actions=None, rando
         # Setup cell volume
         b_death = False
         b_recover = False
-        for t in range(1, seq_length - 1):
+        for t in range(1, seq_length):
 
             cancer_volume[i, t] = cancer_volume[i, t - 1] *\
                 (1 + rho * np.log(K / cancer_volume[i, t - 1]) - beta_c * chemo_dosage[i, t - 1] -
@@ -375,7 +375,7 @@ def simulate_factual(simulation_params, seq_length, assigned_actions=None, rando
                 break
 
         # Package outputs
-        sequence_lengths[i] = int(t + 1)
+        sequence_lengths[i] = int(t)
         death_flags[i, t] = 1 if b_death else 0
         recovery_flags[i, t] = 1 if b_recover else 0
 
@@ -1008,4 +1008,3 @@ if __name__ == "__main__":
 
     # Plot patient
     plot_treatments(training_data, 572)
-

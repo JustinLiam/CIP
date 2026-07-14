@@ -37,6 +37,17 @@ GPU_WAIT_SECONDS="${GPU_WAIT_SECONDS:-60}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-em_iql_local_global_gift_protocol}"
 MLFLOW_URI="${MLFLOW_URI:-}"
 FORCE="${FORCE:-0}"
+CT_USE_WEIGHT_NET="${CT_USE_WEIGHT_NET:-true}"
+CT_ALIGN_LOSS="${CT_ALIGN_LOSS:-sinkhorn}"
+
+if [[ "${CT_USE_WEIGHT_NET}" != "true" && "${CT_USE_WEIGHT_NET}" != "false" ]]; then
+  echo "ERROR: CT_USE_WEIGHT_NET must be true or false, got ${CT_USE_WEIGHT_NET}" >&2
+  exit 2
+fi
+if [[ "${CT_ALIGN_LOSS}" != "sinkhorn" && "${CT_ALIGN_LOSS}" != "mmd" ]]; then
+  echo "ERROR: CT_ALIGN_LOSS must be sinkhorn or mmd, got ${CT_ALIGN_LOSS}" >&2
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "${ROOT}"
@@ -248,6 +259,8 @@ run_one() {
     exp.seed="${seed}" dataset.coeff="${GAMMA}" "dataset.seed=${dataset_seed}" \
     "${data_overrides[@]}" \
     exp.load_data=false \
+    "exp.ct_use_weight_net=${CT_USE_WEIGHT_NET}" \
+    "exp.ct_align_loss=${CT_ALIGN_LOSS}" \
     "+exp.em_ckpt_dir=${em_dir}" \
     "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
     "exp.mlflow_combo_id=${combo_id}" \
@@ -266,6 +279,8 @@ run_one() {
     exp.test="${TEST_SPLIT}" \
     "${data_overrides[@]}" \
     exp.load_data=false \
+    "exp.ct_use_weight_net=${CT_USE_WEIGHT_NET}" \
+    "exp.ct_align_loss=${CT_ALIGN_LOSS}" \
     "+exp.em_eval_ckpt=${em_ckpt}" \
     "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
     "exp.mlflow_combo_id=${combo_id}" \
@@ -293,6 +308,8 @@ run_one() {
     echo "dataset_val=${DATASET_VAL}"
     echo "dataset_test=${DATASET_TEST}"
     echo "max_seq_length=${MAX_SEQ_LENGTH}"
+    echo "ct_use_weight_net=${CT_USE_WEIGHT_NET}"
+    echo "ct_align_loss=${CT_ALIGN_LOSS}"
     echo "em_ckpt=${em_ckpt}"
     echo "train_log=${train_log}"
     echo "eval_log=${eval_log}"
@@ -304,6 +321,7 @@ echo "[tumor-protocol] one-stage local/global CT+IQL EM"
 echo "[tumor-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
 echo "[tumor-protocol] seeds=(${SEEDS[*]}) dataset_seed_mode=${DATASET_SEED_MODE} dataset_seed=${DATASET_SEED}"
 echo "[tumor-protocol] data train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST} max_seq_length=${MAX_SEQ_LENGTH}"
+echo "[tumor-protocol] weight_net=${CT_USE_WEIGHT_NET} align_loss=${CT_ALIGN_LOSS}"
 echo "[tumor-protocol] grid_root=${GRID_ROOT}"
 
 for seed in "${SEEDS[@]}"; do

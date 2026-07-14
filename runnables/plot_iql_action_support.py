@@ -53,6 +53,7 @@ from src.evaluation.iql_action_support import (  # noqa: E402
     q_grid_argmax_action,
 )
 from src.evaluation.iql_planner_eval import (  # noqa: E402
+    _build_decision_history_view,
     _extend_h_work_after_one_step,
     _iql_augmented_state,
     _policy_to_sim_interval_torch,
@@ -402,7 +403,6 @@ def collect_same_state_panel_diagnostics(
     device: str,
     tau: int,
     max_tau: float,
-    world: str,
     batch_size: int,
     max_eval_samples: int,
     q_chunk_size: int,
@@ -410,7 +410,6 @@ def collect_same_state_panel_diagnostics(
     data = fold.data
     dataloader = _make_eval_dataloader(args, data, batch_size, tau)
     scaling_params = dataset_collection.train_scaling_params
-    mean_ser, std_ser = scaling_params
     max_action = float(planner.cfg.max_action)
     selector_kwargs = _action_selector_kwargs(args)
     r = float(OmegaConf.select(args, "exp.action_support_r", default=0.075))
@@ -451,7 +450,8 @@ def collect_same_state_panel_diagnostics(
         batch_steps: Dict[str, List[np.ndarray]] = {k: [] for k in arrays}
         for step in range(int(tau)):
             H_work = align_h_t_static_to_history(H_work)
-            z, _, _ = inference_model.ct_hidden_history(H_work)
+            H_policy = align_h_t_static_to_history(_build_decision_history_view(H_work))
+            z, _, _ = inference_model.ct_hidden_history(H_policy)
             a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
             obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
             ours_raw = select_iql_policy_action(planner, obs, **selector_kwargs)
@@ -495,15 +495,13 @@ def collect_same_state_panel_diagnostics(
             batch_steps["panel_local_median_min_distance"].append(median_metrics["knn_min_distance"])
 
             y_norm = _rollout_one_step_y(
-                world,
                 H_work,
                 ours_sim,
                 fold=fold,
                 scaling_params=scaling_params,
-                inference_model=inference_model,
                 device=device,
             )
-            _extend_h_work_after_one_step(H_work, ours_sim, y_norm, mean_ser, std_ser, torch.device(device))
+            _extend_h_work_after_one_step(H_work, ours_sim, y_norm, scaling_params, torch.device(device))
             a_prev_sim = ours_sim
 
         for key, value in batch_steps.items():
@@ -533,7 +531,6 @@ def evaluate_method_closed_loop(
     device: str,
     tau: int,
     max_tau: float,
-    world: str,
     batch_size: int,
     max_eval_samples: int,
     q_chunk_size: int,
@@ -586,7 +583,8 @@ def evaluate_method_closed_loop(
 
         for step in range(int(tau)):
             H_work = align_h_t_static_to_history(H_work)
-            z, _, _ = inference_model.ct_hidden_history(H_work)
+            H_policy = align_h_t_static_to_history(_build_decision_history_view(H_work))
+            z, _, _ = inference_model.ct_hidden_history(H_policy)
             a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
             obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
             context_raw = _support_context_from_state(
@@ -630,15 +628,13 @@ def evaluate_method_closed_loop(
             step_min_dist.append(metrics["knn_min_distance"])
 
             y_last = _rollout_one_step_y(
-                world,
                 H_work,
                 action_sim,
                 fold=fold,
                 scaling_params=scaling_params,
-                inference_model=inference_model,
                 device=device,
             )
-            _extend_h_work_after_one_step(H_work, action_sim, y_last, mean_ser, std_ser, torch.device(device))
+            _extend_h_work_after_one_step(H_work, action_sim, y_last, scaling_params, torch.device(device))
             a_prev_sim = action_sim
 
         assert y_last is not None
@@ -715,7 +711,6 @@ def _diagnostic_cache_metadata(
     original_cwd: Path,
     split_name: str,
     tau: int,
-    world: str,
     external_actions_path: str,
 ) -> Dict[str, Any]:
     return {
@@ -726,7 +721,7 @@ def _diagnostic_cache_metadata(
         "eval_split": split_name,
         "tau": int(tau),
         "seed": int(args.exp.seed),
-        "world": world,
+        "rollout": "closed_loop_simulator",
         "rmse_metric": str(OmegaConf.select(args, "exp.action_support_rmse_metric", default="rmse_norm")),
         "eval_batch_size": int(OmegaConf.select(args, "exp.action_support_eval_batch_size", default=128)),
         "max_eval_samples": int(OmegaConf.select(args, "exp.action_support_max_eval_samples", default=512)),
@@ -754,7 +749,6 @@ def _run_or_load_diagnostics(
     device: str,
     split_name: str,
     tau: int,
-    world: str,
     cache_enabled: bool,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any], Path]:
     rmse_metric = str(OmegaConf.select(args, "exp.action_support_rmse_metric", default="rmse_norm")).strip()
@@ -780,7 +774,6 @@ def _run_or_load_diagnostics(
         original_cwd=original_cwd,
         split_name=split_name,
         tau=tau,
-        world=world,
         external_actions_path=external_path,
     )
     diag_key = _hash_json(diag_meta)
@@ -807,7 +800,6 @@ def _run_or_load_diagnostics(
         device=device,
         tau=tau,
         max_tau=max_tau,
-        world=world,
         batch_size=eval_batch_size,
         max_eval_samples=max_eval_samples,
         q_chunk_size=q_chunk_size,
@@ -839,7 +831,6 @@ def _run_or_load_diagnostics(
             device=device,
             tau=tau,
             max_tau=max_tau,
-            world=world,
             batch_size=eval_batch_size,
             max_eval_samples=max_eval_samples,
             q_chunk_size=q_chunk_size,
@@ -861,7 +852,6 @@ def _run_or_load_diagnostics(
             device=device,
             tau=tau,
             max_tau=max_tau,
-            world=world,
             batch_size=eval_batch_size,
             max_eval_samples=max_eval_samples,
             q_chunk_size=q_chunk_size,
@@ -1097,9 +1087,6 @@ def main(args: DictConfig) -> None:
         )
 
     tau = int(OmegaConf.select(args, "exp.tau", default=6))
-    world = str(OmegaConf.select(args, "exp.action_support_world", default="sim")).strip()
-    if world not in ("sim", "predictor"):
-        raise ValueError("exp.action_support_world must be one of: sim, predictor")
     rmse_metric = str(OmegaConf.select(args, "exp.action_support_rmse_metric", default="rmse_norm")).strip()
     if rmse_metric not in ("rmse_norm", "rmse_uns"):
         raise ValueError("exp.action_support_rmse_metric must be one of: rmse_norm, rmse_uns")
@@ -1130,7 +1117,6 @@ def main(args: DictConfig) -> None:
         device=device,
         split_name=split_name,
         tau=tau,
-        world=world,
         cache_enabled=cache_enabled,
     )
     method_summaries = diag_meta["method_summaries"]
@@ -1150,7 +1136,7 @@ def main(args: DictConfig) -> None:
         "caption": _caption_text(rmse_metric),
         "split": split_name,
         "tau": int(tau),
-        "world": world,
+        "rollout": "closed_loop_simulator",
         "seed": seed,
         "device": device,
         "use_em_checkpoint": bool(use_em),

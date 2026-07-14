@@ -53,8 +53,12 @@ def _build_H_slice(data: Dict[str, np.ndarray], i: int, tp1: int) -> Dict[str, t
 
 class CTTransitionDataset(Dataset):
     """
-    One sample = one time index t with history [0..t], target Y_{t+1}.
-    t runs from 1 .. length-2 so that outputs[t+1] exists.
+    One sample = one processed-row decision index t with history [0..t].
+
+    Across Tumor/MIMIC/EpiCF, the processed-row contract is:
+    ``prev_outputs[t]`` and ``prev_treatments[t]`` encode the pre-action state,
+    ``current_treatments[t]`` is the action, and ``outputs[t]`` is the outcome
+    immediately after that action.
     """
 
     def __init__(
@@ -83,7 +87,7 @@ class CTTransitionDataset(Dataset):
         tp1 = t + 1
         H = _build_H_slice(self.data, i, tp1)
 
-        y_next = torch.tensor(self.data["outputs"][i, t + 1, :], dtype=torch.float32)
+        y_next = torch.tensor(self.data["outputs"][i, t, :], dtype=torch.float32)
         out: Dict = {"H_t": H, "y_next": y_next}
         if self.include_next_prefix:
             out["H_t_next"] = _build_H_slice(self.data, i, t + 2)

@@ -9,10 +9,13 @@ RUN_ROOT="${1:?Usage: $0 <run_root>}"
 RUN_ROOT="${RUN_ROOT%/}"
 CONFIG="${CONFIG:-$RUN_ROOT/configs/epi_abm_multi_daily_seed100.yaml}"
 EVAL_PARALLEL="${EVAL_PARALLEL:-8}"
+EVAL_SHARDS="${EVAL_SHARDS:-$EVAL_PARALLEL}"
+THREADS_PER_WORKER="${THREADS_PER_WORKER:-8}"
 VAL_ROWS="${VAL_ROWS:-23}"
 TEST_ROWS="${TEST_ROWS:-23}"
 SEEDS=(${SEEDS:-10 101 1010 10101 101010})
 TAUS=(7 14 21)
+TEST_TAUS=(${TEST_TAUS:-7 14 21})
 ERRPAT='Traceback|RuntimeError|ValueError|IndexError|OutOfMemoryError|CUDA out|Error executing job|Killed'
 
 mkdir -p "$RUN_ROOT/logs" "$RUN_ROOT/aggregate"
@@ -68,21 +71,30 @@ run_limited(){
 }
 
 val_shard(){
-  local seed="$1" row="$2"
-  local runtime="$RUN_ROOT/runtime/seed_${seed}_epi_diff_abm"
-  local out="$RUN_ROOT/val_selection_parallel/seed_${seed}/row_$(printf '%02d' "$row")"
-  local expected=36
+  local seed="$1" shard="$2" row_start="$3" row_end="$4"
+  local runtime="$RUN_ROOT/runtime_eval/val_seed_${seed}_shard_$(printf '%02d' "$shard")"
+  local out="$RUN_ROOT/val_selection_parallel_county_major/seed_${seed}/shard_$(printf '%02d' "$shard")_${row_start}_${row_end}"
+  local expected=$(((row_end - row_start) * 36))
   if [[ -f "$out/county_metrics.jsonl" ]] && [[ "$(wc -l < "$out/county_metrics.jsonl")" -eq "$expected" ]]; then
     return 0
   fi
   rm -rf "$out"
   mkdir -p "$out"
+  python scripts/epi_abm/create_isolated_runtime.py \
+    --source data_generation/epi_diff_abm \
+    --dest "$runtime" \
+    --force \
+    > "$out/runtime_create.log" 2>&1
   local ckpt_args=()
   for outer in $(seq -w 1 12); do
     local label="outer00${outer}"
     ckpt_args+=(--ckpt "${label}=${RUN_ROOT}/train/seed_${seed}/em_ckpt/ct_iql_em_${label}.pt")
   done
-  python -u scripts/epi_abm/evaluate_county_last_window_iql.py \
+  env OMP_NUM_THREADS="$THREADS_PER_WORKER" \
+    MKL_NUM_THREADS="$THREADS_PER_WORKER" \
+    OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS="$THREADS_PER_WORKER" \
+    python -u scripts/epi_abm/evaluate_county_last_window_iql.py \
     --config "$CONFIG" \
     "${ckpt_args[@]}" \
     --out-dir "$out" \
@@ -104,8 +116,8 @@ val_shard(){
     --cache-version "$CACHE_VERSION" \
     --dataset-seed 100 \
     --outcome-transform "$OUTCOME_TRANSFORM" \
-    --row-start "$row" \
-    --row-end "$((row + 1))" \
+    --row-start "$row_start" \
+    --row-end "$row_end" \
     > "$out/eval.log" 2>&1
   if rg -n "$ERRPAT|external_repos/epi-diff-abm" "$out/eval.log" > "$out/eval_errors.txt"; then
     return 1
@@ -115,23 +127,32 @@ val_shard(){
 }
 
 test_shard(){
-  local seed="$1" row="$2"
-  local runtime="$RUN_ROOT/runtime/seed_${seed}_epi_diff_abm"
+  local seed="$1" shard="$2" row_start="$3" row_end="$4"
+  local runtime="$RUN_ROOT/runtime_eval/test_seed_${seed}_shard_$(printf '%02d' "$shard")"
   local ckpt="$RUN_ROOT/train/seed_${seed}/em_ckpt/selected_best_by_val_target_rmse.pt"
-  local out="$RUN_ROOT/eval_parallel/seed_${seed}/row_$(printf '%02d' "$row")"
-  local expected=3
+  local out="$RUN_ROOT/eval_parallel_county_major/seed_${seed}/shard_$(printf '%02d' "$shard")_${row_start}_${row_end}"
+  local expected=$(((row_end - row_start) * ${#TEST_TAUS[@]}))
   [[ -f "$ckpt" ]] || return 1
   if [[ -f "$out/county_metrics.jsonl" ]] && [[ "$(wc -l < "$out/county_metrics.jsonl")" -eq "$expected" ]]; then
     return 0
   fi
   rm -rf "$out"
   mkdir -p "$out"
-  python -u scripts/epi_abm/evaluate_county_last_window_iql.py \
+  python scripts/epi_abm/create_isolated_runtime.py \
+    --source data_generation/epi_diff_abm \
+    --dest "$runtime" \
+    --force \
+    > "$out/runtime_create.log" 2>&1
+  env OMP_NUM_THREADS="$THREADS_PER_WORKER" \
+    MKL_NUM_THREADS="$THREADS_PER_WORKER" \
+    OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS="$THREADS_PER_WORKER" \
+    python -u scripts/epi_abm/evaluate_county_last_window_iql.py \
     --config "$CONFIG" \
     --ckpt "selected=${ckpt}" \
     --out-dir "$out" \
     --splits test \
-    --taus 7 14 21 \
+    --taus "${TEST_TAUS[@]}" \
     --window-mode fixed-start \
     --decision-day 161 \
     --target-mode factual_final \
@@ -148,8 +169,8 @@ test_shard(){
     --cache-version "$CACHE_VERSION" \
     --dataset-seed 100 \
     --outcome-transform "$OUTCOME_TRANSFORM" \
-    --row-start "$row" \
-    --row-end "$((row + 1))" \
+    --row-start "$row_start" \
+    --row-end "$row_end" \
     > "$out/eval.log" 2>&1
   if rg -n "$ERRPAT|external_repos/epi-diff-abm" "$out/eval.log" > "$out/eval_errors.txt"; then
     return 1
@@ -177,15 +198,18 @@ def rms(xs):
 
 for seed in seeds:
     rows = []
-    shard_root = run / "val_selection_parallel" / f"seed_{seed}"
-    for row_idx in range(val_rows):
-        path = shard_root / f"row_{row_idx:02d}" / "county_metrics.jsonl"
-        if not path.exists():
-            raise SystemExit(f"missing val shard seed={seed} row={row_idx}: {path}")
+    shard_root = run / "val_selection_parallel_county_major" / f"seed_{seed}"
+    paths = sorted(shard_root.glob("shard_*/county_metrics.jsonl"))
+    if not paths:
+        raise SystemExit(f"missing val shards for seed={seed}: {shard_root}")
+    for path in paths:
         rows.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
     expected = val_rows * 3 * 12
     if len(rows) != expected:
         raise SystemExit(f"seed {seed} val rows {len(rows)} != {expected}")
+    row_ids = sorted({int(row["row_idx"]) for row in rows})
+    if row_ids != list(range(val_rows)):
+        raise SystemExit(f"seed {seed} val row coverage mismatch: {row_ids}")
     merged = run / "val_selection" / f"seed_{seed}" / "parallel_merged"
     merged.mkdir(parents=True, exist_ok=True)
     (merged / "county_metrics.jsonl").write_text(
@@ -231,7 +255,9 @@ PY
 }
 
 aggregate_test(){
-  python - "$RUN_ROOT" "$VAL_ROWS" "$TEST_ROWS" "${SEEDS[@]}" <<'PY'
+  local test_taus_csv
+  test_taus_csv="$(IFS=,; echo "${TEST_TAUS[*]}")"
+  python - "$RUN_ROOT" "$VAL_ROWS" "$TEST_ROWS" "$test_taus_csv" "${SEEDS[@]}" <<'PY'
 from pathlib import Path
 import csv
 import json
@@ -242,8 +268,8 @@ import sys
 run = Path(sys.argv[1])
 val_rows_count = int(sys.argv[2])
 test_rows = int(sys.argv[3])
-seeds = [int(x) for x in sys.argv[4:]]
-taus = [7, 14, 21]
+taus = [int(x) for x in sys.argv[4].split(",") if x]
+seeds = [int(x) for x in sys.argv[5:]]
 agg = run / "aggregate"
 agg.mkdir(exist_ok=True)
 
@@ -261,15 +287,18 @@ def rms(xs):
 
 for seed in seeds:
     rows = []
-    shard_root = run / "eval_parallel" / f"seed_{seed}"
-    for row_idx in range(test_rows):
-        path = shard_root / f"row_{row_idx:02d}" / "county_metrics.jsonl"
-        if not path.exists():
-            raise SystemExit(f"missing test shard seed={seed} row={row_idx}: {path}")
+    shard_root = run / "eval_parallel_county_major" / f"seed_{seed}"
+    paths = sorted(shard_root.glob("shard_*/county_metrics.jsonl"))
+    if not paths:
+        raise SystemExit(f"missing test shards for seed={seed}: {shard_root}")
+    for path in paths:
         rows.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
-    expected = test_rows * 3
+    expected = test_rows * len(taus)
     if len(rows) != expected:
         raise SystemExit(f"seed {seed} test rows {len(rows)} != {expected}")
+    row_ids = sorted({int(row["row_idx"]) for row in rows})
+    if row_ids != list(range(test_rows)):
+        raise SystemExit(f"seed {seed} test row coverage mismatch: {row_ids}")
     merged = run / "eval" / f"seed_{seed}" / "test_selected_best"
     merged.mkdir(parents=True, exist_ok=True)
     (merged / "county_metrics.jsonl").write_text(
@@ -359,16 +388,25 @@ for row in across:
 manifest = json.loads((run / "manifest.json").read_text())
 manifest["status"] = "parallel_eval_complete"
 manifest["aggregate_dir"] = str(agg)
-manifest["parallel_eval"] = {"val_rows_per_seed": val_rows_count, "test_rows_per_seed": test_rows}
+manifest["parallel_eval"] = {
+    "val_rows_per_seed": val_rows_count,
+    "val_selection_taus": [7, 14, 21],
+    "test_rows_per_seed": test_rows,
+    "test_taus": taus,
+}
 (run / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 print(json.dumps({"status": "complete", "aggregate_dir": str(agg)}, indent=2))
 PY
 }
 
-log "parallel val eval start run_root=$RUN_ROOT workers=$EVAL_PARALLEL"
+log "county-major parallel val eval start run_root=$RUN_ROOT workers=$EVAL_PARALLEL shards=$EVAL_SHARDS threads_per_worker=$THREADS_PER_WORKER"
 for seed in "${SEEDS[@]}"; do
-  for row in $(seq 0 "$((VAL_ROWS - 1))"); do
-    run_limited "val seed=$seed row=$row" val_shard "$seed" "$row"
+  for shard in $(seq 0 "$((EVAL_SHARDS - 1))"); do
+    row_start=$((shard * VAL_ROWS / EVAL_SHARDS))
+    row_end=$(((shard + 1) * VAL_ROWS / EVAL_SHARDS))
+    [[ "$row_start" -lt "$row_end" ]] || continue
+    run_limited "val seed=$seed shard=$shard rows=$row_start:$row_end" \
+      val_shard "$seed" "$shard" "$row_start" "$row_end"
   done
 done
 wait_pool
@@ -378,8 +416,12 @@ log "parallel val selection done"
 
 log "parallel test eval start"
 for seed in "${SEEDS[@]}"; do
-  for row in $(seq 0 "$((TEST_ROWS - 1))"); do
-    run_limited "test seed=$seed row=$row" test_shard "$seed" "$row"
+  for shard in $(seq 0 "$((EVAL_SHARDS - 1))"); do
+    row_start=$((shard * TEST_ROWS / EVAL_SHARDS))
+    row_end=$(((shard + 1) * TEST_ROWS / EVAL_SHARDS))
+    [[ "$row_start" -lt "$row_end" ]] || continue
+    run_limited "test seed=$seed shard=$shard rows=$row_start:$row_end" \
+      test_shard "$seed" "$shard" "$row_start" "$row_end"
   done
 done
 wait_pool

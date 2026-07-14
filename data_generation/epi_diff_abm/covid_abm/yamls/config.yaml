@@ -17,7 +17,7 @@ simulation_metadata:
   NUM_WEEKS_TO_EVAL: 24
   OPENAI_API_KEY: None
   POLICY: weak
-  POPULATION: '01045'
+  POPULATION: '19113'
   RECOVERED_TO_SUSCEPTIBLE_TIME: 100
   RECOVERED_VAR: 3
   RESCALE_CONFIG: 0
@@ -31,7 +31,7 @@ simulation_metadata:
   WITH_VACC: false
   age_group_file: ${simulation_metadata.population_dir}/age.pickle
   calibration: true
-  device: cuda
+  device: cpu
   disease_stage_file: ${simulation_metadata.population_dir}/disease_stages.csv
   infection_network_file: ${simulation_metadata.population_dir}/mobility_networks/0.csv
   initial_infection_ratio: 0.04
@@ -43,11 +43,11 @@ simulation_metadata:
     lr_gamma: 0.9999
     model_path: saved_model.pth
   mapping_path: ${simulation_metadata.population_dir}/population_mapping.json
-  num_agents: 44933
+  num_agents: 215271
   num_episodes: 5
   num_steps_per_episode: 182
   num_substeps_per_step: 1
-  population_dir: populations/pop01045
+  population_dir: /home/liam/pythonProject/VCIP-ICML-main/data_generation/epi_diff_abm/populations/pop19113
   quarantine_days: 12
   test_ineligible_days: 2
   test_result_delay_days: 3

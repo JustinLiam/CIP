@@ -51,6 +51,24 @@ def alignment_loss(
         perm = torch.randperm(b, device=Z_t.device)
     joint_rep = torch.cat([Z_t, A_t], dim=-1)
     marginal_rep = torch.cat([Z_t, A_t[perm]], dim=-1)
+    return alignment_loss_from_representations(
+        joint_rep,
+        marginal_rep,
+        logits_w,
+        mode,
+        sinkhorn_blur,
+    )
+
+
+def alignment_loss_from_representations(
+    joint_rep: torch.Tensor,
+    marginal_rep: torch.Tensor,
+    logits_w: torch.Tensor,
+    mode: str,
+    sinkhorn_blur: float,
+) -> torch.Tensor:
+    """Compute the selected WeightNet alignment loss on fixed joint/marginal pairs."""
+    b = joint_rep.size(0)
     if mode == "mmd":
         w = F.softmax(logits_w.reshape(-1), dim=0) * float(b)
         return compute_mmd_weighted(joint_rep, marginal_rep, w)
@@ -66,26 +84,50 @@ def _weight_health(
     active_mask: Optional[torch.Tensor],
 ) -> Tuple[float, float]:
     """ESS fraction and weight std on active samples (mean(w)=1 per batch)."""
+    diagnostics = _weight_diagnostics(logits_w, active_mask)
+    return diagnostics["w_ess_frac"], diagnostics["w_std"]
+
+
+def _weight_diagnostics(
+    logits_w: torch.Tensor,
+    active_mask: Optional[torch.Tensor],
+) -> Dict[str, float]:
+    """Weight concentration diagnostics on active samples."""
     b = logits_w.numel()
     w = F.softmax(logits_w.reshape(-1), dim=0) * float(b)
     if active_mask is not None and active_mask.numel() == b:
         act = active_mask.reshape(-1) > 0.5
-        w_act = w[act]
-        if w_act.numel() == 0:
-            return 1.0, 0.0
-        w_det = w_act.detach()
-        n_act = float(w_det.numel())
-        w_sum = float(w_det.sum())
-        w_sq = float((w_det * w_det).sum())
-        ess = (w_sum * w_sum) / (w_sq * n_act + 1e-12)
-        w_std = float(w_det.std(unbiased=False)) if n_act > 1 else 0.0
-        return ess, w_std
+        w = w[act]
     w_det = w.detach()
+    if w_det.numel() == 0:
+        return {
+            "w_ess_frac": 1.0,
+            "w_std": 0.0,
+            "w_var": 0.0,
+            "w_max": 1.0,
+            "w_p50": 1.0,
+            "w_p90": 1.0,
+            "w_p95": 1.0,
+            "w_p99": 1.0,
+        }
+    n = float(w_det.numel())
     w_sum = float(w_det.sum())
     w_sq = float((w_det * w_det).sum())
-    ess = (w_sum * w_sum) / (w_sq * float(b) + 1e-12) if b > 0 else 1.0
-    w_std = float(w_det.std(unbiased=False)) if b > 1 else 0.0
-    return ess, w_std
+    w_std = float(w_det.std(unbiased=False)) if n > 1 else 0.0
+    quantiles = torch.quantile(
+        w_det,
+        w_det.new_tensor([0.50, 0.90, 0.95, 0.99]),
+    )
+    return {
+        "w_ess_frac": (w_sum * w_sum) / (w_sq * n + 1e-12),
+        "w_std": w_std,
+        "w_var": w_std * w_std,
+        "w_max": float(w_det.max()),
+        "w_p50": float(quantiles[0]),
+        "w_p90": float(quantiles[1]),
+        "w_p95": float(quantiles[2]),
+        "w_p99": float(quantiles[3]),
+    }
 
 
 class CTEncoderWeightModel(nn.Module):
@@ -210,8 +252,12 @@ class CTEncoderWeightModel(nn.Module):
             end = min(start + chunk_size, n)
             idx = slice(start, end)
             logits = self.weight_net(joint_rep[idx])
-            loss = compute_weighted_wasserstein_joint_marginal_flat(
-                joint_rep[idx], marginal_rep[idx], logits, blur=sinkhorn_blur
+            loss = alignment_loss_from_representations(
+                joint_rep[idx],
+                marginal_rep[idx],
+                logits,
+                align_mode,
+                sinkhorn_blur,
             )
             total += float(loss.detach())
             n_chunks += 1
@@ -234,8 +280,10 @@ class CTEncoderWeightModel(nn.Module):
         CTD-style E-step: encode full train set, fit WeightNet on fixed joint vs shuffled-marginal
         pairs for ``e_epochs`` passes (batched), then leave weights for detached M-step use.
         """
-        if align_mode != "sinkhorn":
-            raise ValueError(f"EM E-step supports sinkhorn only, got {align_mode!r}")
+        if align_mode not in {"sinkhorn", "mmd"}:
+            raise ValueError(
+                f"EM E-step supports align_mode='sinkhorn' or 'mmd', got {align_mode!r}"
+            )
 
         Z_det, A_all, active_all = self._encode_full_dataset(loader, device)
         n_total = Z_det.size(0)
@@ -280,8 +328,12 @@ class CTEncoderWeightModel(nn.Module):
                 marg_b = marginal_rep[idx]
                 optimizer_w.zero_grad(set_to_none=True)
                 logits = self.weight_net(joint_b)
-                loss_align = compute_weighted_wasserstein_joint_marginal_flat(
-                    joint_b, marg_b, logits, blur=sinkhorn_blur
+                loss_align = alignment_loss_from_representations(
+                    joint_b,
+                    marg_b,
+                    logits,
+                    align_mode,
+                    sinkhorn_blur,
                 )
                 loss_align.backward()
                 if w_clip is not None and w_clip > 0:
@@ -301,13 +353,12 @@ class CTEncoderWeightModel(nn.Module):
 
         with torch.no_grad():
             logits_all = self.weight_net(joint_rep)
-        w_ess, w_std = _weight_health(logits_all, active_all)
+        weight_diagnostics = _weight_diagnostics(logits_all, active_all)
 
         return {
             "align_pre": align_pre,
             "align_post": align_post,
-            "w_ess_frac": w_ess,
-            "w_std": w_std,
+            **weight_diagnostics,
             "n_samples": float(n),
             "n_samples_total": float(n_total),
         }

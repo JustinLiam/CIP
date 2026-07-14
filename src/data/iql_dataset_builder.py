@@ -35,8 +35,13 @@ def horizon_remaining_distance_reward_np(
     t: int,
     t_target: int,
 ) -> float:
-    """Distance-to-goal reward scaled by remaining horizon after the transition."""
-    h_next = max(int(t_target) - (int(t) + 1), 0)
+    """Distance-to-goal reward scaled by remaining horizon after the transition.
+
+    ``t`` is the processed-row decision index. ``t_target`` is the processed-row
+    output index for the goal. Thus horizon 1 has ``t_target == t`` and no
+    bootstrap horizon remains after applying ``current_treatments[t]``.
+    """
+    h_next = max(int(t_target) - int(t), 0)
     d_next = float(np.sqrt(np.mean((y_next - y_target) ** 2)))
     return -d_next / np.sqrt(float(h_next + 1))
 
@@ -87,26 +92,26 @@ def _sample_target_indices(
     target_sampling: str,
     target_horizons: Optional[Iterable[int]],
 ) -> List[int]:
-    hi = min(t + int(max_tau), last_idx)
-    if hi <= t:
+    hi = min(t + int(max_tau) - 1, last_idx)
+    if hi < t:
         return []
 
     mode = str(target_sampling).strip().lower()
     if mode in ("random", "random_future", "future"):
-        return [int(np.random.randint(low=t + 1, high=hi + 1)) for _ in range(samples_per_transition)]
+        return [int(np.random.randint(low=t, high=hi + 1)) for _ in range(samples_per_transition)]
 
     if mode in ("horizon_aligned", "aligned", "fixed_horizon"):
         horizons = [
             h
             for h in _coerce_target_horizons(target_horizons, max_tau)
-            if h <= int(max_tau) and t + h <= last_idx
+            if h <= int(max_tau) and t + h - 1 <= last_idx
         ]
         if not horizons:
             return []
         replace = len(horizons) < samples_per_transition
         size = samples_per_transition if replace else min(samples_per_transition, len(horizons))
         chosen = np.random.choice(horizons, size=size, replace=replace)
-        return [t + int(h) for h in sorted(np.asarray(chosen, dtype=np.int64).tolist())]
+        return [t + int(h) - 1 for h in sorted(np.asarray(chosen, dtype=np.int64).tolist())]
 
     raise ValueError(
         f"Unknown target_sampling={target_sampling!r}; expected 'random_future' or 'horizon_aligned'."
@@ -159,14 +164,20 @@ def build_iql_transitions_from_ct(
 
     ``max_tau`` scales time-to-go; must match evaluation (``exp.max_tau``).
 
+    The processed-row contract is shared by Tumor/MIMIC/EpiCF:
+    ``prev_outputs[t]`` / ``prev_treatments[t]`` encode the state before the
+    logged action, ``current_treatments[t]`` is that action, and ``outputs[t]``
+    is the immediate post-action outcome. Horizon ``h`` therefore targets
+    ``outputs[t + h - 1]``.
+
     Reward design (the 2026-04 fix for q_loss spikes + long-τ regressions):
 
     ``reward_type`` selects the per-step scalar:
-      * ``"negative_outcome_mse"``  (legacy)      r = -mean((y_{t+1} - y_target)^2)
-      * ``"negative_outcome_huber"`` (Huber)      r = -mean(Huber(y_{t+1} - y_target))
-      * ``"negative_outcome"``      (L1)          r = -mean(|y_{t+1} - y_target|)
-      * ``"horizon_remaining"``                   r = -RMSE(y_{t+1}, y_target) / sqrt(h_next + 1)
-      * ``"progress"`` (RECOMMENDED, new default) r = |y_t - y_target| - |y_{t+1} - y_target|
+      * ``"negative_outcome_mse"``  (legacy)      r = -mean((y_next - y_target)^2)
+      * ``"negative_outcome_huber"`` (Huber)      r = -mean(Huber(y_next - y_target))
+      * ``"negative_outcome"``      (L1)          r = -mean(|y_next - y_target|)
+      * ``"horizon_remaining"``                   r = -RMSE(y_next, y_target) / sqrt(h_next + 1)
+      * ``"progress"`` (RECOMMENDED, new default) r = |y_cur - y_target| - |y_next - y_target|
         Progress reward. Σ_t r_t telescopes to ``|y_t - y_target| - |y_T - y_target|``, so
         V*(s_t) is the expected *remaining* distance improvement under the policy —
         the exact quantity a long-horizon planner wants. Action-sensitive, zero-mean
@@ -201,7 +212,8 @@ def build_iql_transitions_from_ct(
             # history valid length from active entries
             active = data["active_entries"][i]  # [T, 1]
             length = int(active.sum())
-            # need at least three steps: t, t+1 for Y_{t+1}, and a future t_target > t
+            # need at least three rows: decision row t, next-state row t+1, and
+            # an outcome label outputs[t] aligned with current_treatments[t].
             if length < 3:
                 continue
 
@@ -267,14 +279,14 @@ def build_iql_transitions_from_ct(
 
                 z_next, _, _ = inference_model.ct_hidden_history(H_next)
                 z_next_vec = z_next.squeeze(0).detach().cpu().numpy()
-                y_next = data["outputs"][i, t + 1, :].astype(np.float32)
-                y_cur = data["outputs"][i, t, :].astype(np.float32)
+                y_next = data["outputs"][i, t, :].astype(np.float32)
+                y_cur = data["prev_outputs"][i, t, :].astype(np.float32)
 
                 for t_target in target_indices:
                     y_target = data["outputs"][i, t_target, :].astype(np.float32)
-                    delta_t = float(t_target - t)
-                    delta_t_norm = max(0.0, delta_t / max_tau)
-                    delta_t_next_norm = max(0.0, (delta_t - 1.0) / max_tau)
+                    horizon = float(t_target - t + 1)
+                    delta_t_norm = max(0.0, horizon / max_tau)
+                    delta_t_next_norm = max(0.0, (horizon - 1.0) / max_tau)
 
                     # At t+1 the "previous action" feature is a_t (behavior action at t), i.e. this transition's a.
                     s_next = np.concatenate(
@@ -282,7 +294,7 @@ def build_iql_transitions_from_ct(
                     )
 
                     done = 1.0 if (t + 1) >= last_idx else 0.0
-                    if horizon_terminal_done and (t + 1) >= t_target:
+                    if horizon_terminal_done and horizon <= 1.0:
                         done = 1.0
                     # See docstring for the reward design rationale. The default
                     # "progress" signal telescopes so V(s) encodes remaining distance
@@ -318,29 +330,6 @@ def build_iql_transitions_from_ct(
                     next_states.append(s_next)
                     dones.append([done])
                 
-
-                # # 4. 恢复最朴素的密集误差奖励 (逼迫模型给药，消除 33.6 飙升)
-                # y_next = data["outputs"][i, t + 1, :].astype(np.float32)
-                # if reward_type == "negative_outcome_mse":
-                #     r_target = -float(np.mean((y_next - y_target) ** 2))
-                # else:
-                #     r_target = -float(np.mean(np.abs(y_next - y_target)))
-                
-                # # B. 动作平滑度惩罚 (衡量用药的震荡程度) TODO 加入了平滑度
-                # # 提取当前动作和上一步动作 (因为 t>=1, 所以 t-1 安全)
-                # a_curr = data["current_treatments"][i, t, :].astype(np.float32)
-                # a_prev = data["current_treatments"][i, t - 1, :].astype(np.float32)
-                
-                # # 如果做过归一化映射，为了算真实平滑度误差，建议用原值算。
-                # # alpha_smoothness 是惩罚权重。如果你觉得平滑度不够，可以适当调大 (比如 0.5, 1.0)
-                # alpha_smoothness = 0.2 
-                # r_smoothness = -alpha_smoothness * float(np.mean((a_curr - a_prev) ** 2))
-
-                # # 综合奖励：既要努力靠近目标，又不能剧烈改变药量
-                # r = r_target + r_smoothness
-
-                # # 5. 取消任何提前终止，严格走完患者的历史
-                # done = 1.0 if (t + 1) >= last_idx else 0.0
     rewards_arr = np.asarray(rewards, dtype=np.float32)
     if str(reward_scale).lower() == "auto":
         r_std = float(rewards_arr.std()) + 1e-8

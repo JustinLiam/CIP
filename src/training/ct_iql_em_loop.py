@@ -16,6 +16,7 @@ from src.planners.iql_planner import IQLPlanner
 
 @dataclass
 class EMTrainConfig:
+    use_weight_net: bool = True
     align_mode: str = "sinkhorn"
     sinkhorn_blur: float = 0.01
     w_clip: Optional[float] = 1.0
@@ -69,8 +70,8 @@ def run_m_step_steps(
     planner.qf.train()
     planner.vf.train()
 
-    # Warmup: uniform w in M-step only; encoder still updated via Q-loss.
-    uniform = outer_iter <= cfg.warmup_outer_iters
+    # The uniform ablation keeps the complete M-step but never reads WeightNet.
+    uniform = (not cfg.use_weight_net) or outer_iter <= cfg.warmup_outer_iters
     keys = ("value_loss", "q_loss", "actor_loss", "w_mean", "w_std")
     sums = {k: 0.0 for k in keys}
     counts = {k: 0 for k in keys}

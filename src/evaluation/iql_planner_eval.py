@@ -88,6 +88,62 @@ def _unscale_outputs_torch(y_norm: torch.Tensor, scaling_params, device: torch.d
     return y_norm * std_t + mean_t
 
 
+def _build_decision_history_view(H: dict) -> dict:
+    """
+    Encoder-only view for the next closed-loop decision.
+
+    ``H`` stores completed rows: ``current_treatments[-1]`` produced
+    ``outputs[-1]``. To choose the next action, the CT encoder needs a new
+    active row whose pre-action state is that latest output/action. The returned
+    view appends that open decision row without mutating the simulator-facing
+    history used by ``simulate_*``.
+    """
+    required = ("prev_treatments", "current_treatments", "prev_outputs", "outputs")
+    if any(key not in H for key in required):
+        return H
+
+    out = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H.items()}
+    active = H.get("active_entries")
+    ref = H["current_treatments"]
+    device = ref.device
+    dtype = ref.dtype
+    last_action = gather_last_valid(H["current_treatments"], active).unsqueeze(1).clone()
+    last_output = gather_last_valid(H["outputs"], active).unsqueeze(1).clone()
+    zero_action = torch.zeros_like(last_action)
+
+    out["prev_treatments"] = torch.cat([H["prev_treatments"], last_action], dim=1)
+    out["current_treatments"] = torch.cat([H["current_treatments"], zero_action], dim=1)
+    out["prev_outputs"] = torch.cat([H["prev_outputs"], last_output], dim=1)
+    out["outputs"] = torch.cat([H["outputs"], last_output], dim=1)
+
+    if active is None:
+        ones = torch.ones(ref.size(0), ref.size(1) + 1, 1, device=device, dtype=dtype)
+        out["active_entries"] = ones
+    else:
+        out["active_entries"] = torch.cat([active, torch.ones_like(active[:, :1, :])], dim=1)
+
+    def _append_like_last(key: str, replacement: torch.Tensor | None = None) -> None:
+        if key not in H or not isinstance(H[key], torch.Tensor) or H[key].dim() != 3:
+            return
+        ext = replacement if replacement is not None else gather_last_valid(H[key], active).unsqueeze(1).clone()
+        out[key] = torch.cat([H[key], ext.to(device=H[key].device, dtype=H[key].dtype)], dim=1)
+
+    future_vitals = H.get("future_vitals")
+    next_cov = None
+    if isinstance(future_vitals, torch.Tensor) and future_vitals.dim() == 3 and future_vitals.size(1) > 0:
+        next_cov = future_vitals[:, :1, :].clone()
+
+    if next_cov is None and "current_covariates" in H and isinstance(H["current_covariates"], torch.Tensor):
+        # Outcome is carried by ``prev_outputs`` above. Covariates are a separate
+        # simulator stream and must not be overwritten with the outcome.
+        next_cov = gather_last_valid(H["current_covariates"], active).unsqueeze(1).clone()
+
+    _append_like_last("current_covariates", next_cov)
+    _append_like_last("vitals", next_cov)
+    _append_like_last("static_features")
+    return out
+
+
 def _fingerprint_np(arr: np.ndarray, max_items: int = 64) -> str:
     flat = np.asarray(arr, dtype=np.float64).reshape(-1)
     if flat.size > max_items:
@@ -142,14 +198,14 @@ def _extend_h_work_after_one_step(
     if "sim_day" in H and next_sim_day is not None:
         H["sim_day"] = torch.cat([H["sim_day"], next_sim_day], dim=1)
     elif "sim_day" in H:
-        last = H["sim_day"][:, -1:, :].clone()
+        last = gather_last_valid(H["sim_day"], active).unsqueeze(1).clone()
         H["sim_day"] = torch.cat([H["sim_day"], last + 1.0], dim=1)
     for meta_key in ("sim_episode_id", "sim_seed", "sim_county_id"):
         next_meta = _next_tensor(meta_key)
         if meta_key in H and next_meta is not None:
             H[meta_key] = torch.cat([H[meta_key], next_meta], dim=1)
         elif meta_key in H:
-            last = H[meta_key][:, -1:, :].clone()
+            last = gather_last_valid(H[meta_key], active).unsqueeze(1).clone()
             H[meta_key] = torch.cat([H[meta_key], last], dim=1)
 
     if "cancer_volume" in H:
@@ -172,7 +228,7 @@ def _extend_h_work_after_one_step(
     if "static_features" in H:
         sf = H["static_features"]
         if sf.dim() == 3:
-            last = sf[:, -1:, :].expand(-1, 1, -1)
+            last = gather_last_valid(sf, active).unsqueeze(1)
             H["static_features"] = torch.cat([sf, last], dim=1)
 
     next_cov = _next_tensor("current_covariates")
@@ -201,8 +257,9 @@ def _extend_h_work_after_one_step(
 
     if "current_covariates" in H:
         cc = H["current_covariates"]
-        ext = cc[:, -1:, :].clone()
-        ext[:, :, 0:y_step.size(-1)] = y_ch
+        # The new outcome is already appended to ``outputs`` and will enter the
+        # next encoder call through ``prev_outputs``. Preserve covariate semantics.
+        ext = gather_last_valid(cc, active).unsqueeze(1).clone()
         H["current_covariates"] = torch.cat([cc, ext], dim=1)
         if "vitals" in H:
             H["vitals"] = torch.cat([H["vitals"], ext], dim=1)
@@ -562,7 +619,8 @@ def aggregate_iql_planner_metrics(
                 closed_loop_output_after_actions = None
                 for step in range(tau):
                     H_work = align_h_t_static_to_history(H_work)
-                    z, _, _ = inference_model.ct_hidden_history(H_work)
+                    H_policy = align_h_t_static_to_history(_build_decision_history_view(H_work))
+                    z, _, _ = inference_model.ct_hidden_history(H_policy)
                     pre_len = None
                     prev_out = None
                     z_before = None
@@ -615,14 +673,21 @@ def aggregate_iql_planner_metrics(
                             H_work["prev_outputs"][:, -1, :], prev_out, atol=1e-6, rtol=1e-5
                         ))
                         H_probe = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in H_work.items()}
-                        H_probe = align_h_t_static_to_history(H_probe)
+                        H_probe = align_h_t_static_to_history(_build_decision_history_view(H_probe))
                         z_after, _, _ = inference_model.ct_hidden_history(H_probe)
                         z_delta = float(torch.norm(z_after - z_before, dim=-1).mean().item())
+                        decision_prev_output_ok = bool(torch.allclose(
+                            H_probe["prev_outputs"][:, -1, :],
+                            y_norm.view(y_norm.size(0), -1),
+                            atol=1e-6,
+                            rtol=1e-5,
+                        ))
                         ok = bool(
                             (post_len == pre_len + 1)
                             and appended_action_ok
                             and appended_output_ok
                             and prev_output_ok
+                            and decision_prev_output_ok
                         )
                         history_checks.append({
                             "step": int(step),
@@ -631,6 +696,7 @@ def aggregate_iql_planner_metrics(
                             "appended_action_ok": appended_action_ok,
                             "appended_output_ok": appended_output_ok,
                             "prev_output_ok": prev_output_ok,
+                            "decision_prev_output_ok": decision_prev_output_ok,
                             "z_delta_mean_l2": z_delta,
                             "ok": ok,
                         })
@@ -644,7 +710,8 @@ def aggregate_iql_planner_metrics(
                         history_checks and all(bool(item["ok"]) for item in history_checks)
                     )
             else:
-                z, _, _ = inference_model.ct_hidden_history(H_t)
+                H_policy = align_h_t_static_to_history(_build_decision_history_view(H_t))
+                z, _, _ = inference_model.ct_hidden_history(H_policy)
                 z_np = z.detach().cpu().numpy()
                 eval_target_np = targets["outputs"][:, -1, :].detach().cpu().numpy()
                 a_prev_raw = gather_last_valid(

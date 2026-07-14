@@ -44,26 +44,26 @@ def _sample_target_indices(
     target_sampling: str,
     target_horizons: Optional[Iterable[int]],
 ) -> List[int]:
-    hi = min(t + int(max_tau), last_idx)
-    if hi <= t:
+    hi = min(t + int(max_tau) - 1, last_idx)
+    if hi < t:
         return []
 
     mode = str(target_sampling).strip().lower()
     if mode in ("random", "random_future", "future"):
-        return [int(rng.randint(low=t + 1, high=hi + 1)) for _ in range(samples_per_transition)]
+        return [int(rng.randint(low=t, high=hi + 1)) for _ in range(samples_per_transition)]
 
     if mode in ("horizon_aligned", "aligned", "fixed_horizon"):
         horizons = [
             h
             for h in _coerce_target_horizons(target_horizons, max_tau)
-            if h <= int(max_tau) and t + h <= last_idx
+            if h <= int(max_tau) and t + h - 1 <= last_idx
         ]
         if not horizons:
             return []
         replace = len(horizons) < samples_per_transition
         size = samples_per_transition if replace else min(samples_per_transition, len(horizons))
         chosen = rng.choice(horizons, size=size, replace=replace)
-        return [t + int(h) for h in sorted(np.asarray(chosen, dtype=np.int64).tolist())]
+        return [t + int(h) - 1 for h in sorted(np.asarray(chosen, dtype=np.int64).tolist())]
 
     raise ValueError(
         f"Unknown target_sampling={target_sampling!r}; expected 'random_future' or 'horizon_aligned'."
@@ -179,15 +179,16 @@ def build_iql_raw_transitions(
             else:
                 a_policy = a
 
-            y_next = data["outputs"][i, t + 1, :].astype(np.float32)
-            y_cur = data["outputs"][i, t, :].astype(np.float32)
+            y_next = data["outputs"][i, t, :].astype(np.float32)
+            y_cur = data["prev_outputs"][i, t, :].astype(np.float32)
 
             for t_target in target_indices:
                 y_target_np = data["outputs"][i, t_target, :].astype(np.float32)
-                delta_t_norm = max(0.0, float(t_target - t) / max_tau)
-                delta_t_next_norm = max(0.0, float(t_target - t - 1) / max_tau)
+                horizon = float(t_target - t + 1)
+                delta_t_norm = max(0.0, horizon / max_tau)
+                delta_t_next_norm = max(0.0, (horizon - 1.0) / max_tau)
                 done = 1.0 if (t + 1) >= last_idx else 0.0
-                if horizon_terminal_done and (t + 1) >= t_target:
+                if horizon_terminal_done and horizon <= 1.0:
                     done = 1.0
 
                 if reward_type == "negative_outcome_mse":

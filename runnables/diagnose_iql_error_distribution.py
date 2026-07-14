@@ -32,6 +32,7 @@ from eval_iql_planner import (  # noqa: E402
 )
 from src.data.cip_dataset import CIPDataset, get_dataloader  # noqa: E402
 from src.data.iql_dataset_builder import align_h_t_static_to_history  # noqa: E402
+from src.evaluation.iql_planner_eval import _build_decision_history_view  # noqa: E402
 from src.models.inference_model import InferenceModel  # noqa: E402
 from src.models.sequence_utils import gather_last_valid  # noqa: E402
 from src.planners.iql_planner import IQLPlanner  # noqa: E402
@@ -191,7 +192,8 @@ def main(args: DictConfig) -> None:
                         planned = []
                         for step in range(tau):
                             H_work = align_h_t_static_to_history(H_work)
-                            z, _, _ = inference_model.ct_hidden_history(H_work)
+                            H_policy = align_h_t_static_to_history(_build_decision_history_view(H_work))
+                            z, _, _ = inference_model.ct_hidden_history(H_policy)
                             a_prev_tanh = _sim_actions_to_tanh_batch(a_prev_sim, max_action)
                             obs = _iql_augmented_state(planner, z, eval_target, step, tau, max_tau, a_prev_tanh)
                             po = planner.actor(obs)
@@ -209,7 +211,11 @@ def main(args: DictConfig) -> None:
                             )
                             y_norm = torch.as_tensor(y_np, device=device, dtype=torch.float32)
                             _extend_h_work_after_one_step(
-                                H_work, a_sim, y_norm, mean_ser, std_ser, torch.device(device)
+                                H_work,
+                                a_sim,
+                                y_norm,
+                                dataset_collection.train_scaling_params,
+                                torch.device(device),
                             )
                             a_prev_sim = a_sim
                         a_seq = torch.stack(planned, dim=1).contiguous()

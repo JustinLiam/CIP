@@ -5,10 +5,12 @@ import numpy as np
 import pytest
 import torch
 from torch.distributions import Normal
+from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 
 from src.data.cip_dataset import CIPDataset
-from src.data.ct_transition_dataset import _collate_pad_H
+from src.data.cancer_sim_cont.cancer_simulation import simulate_factual
+from src.data.ct_transition_dataset import CTTransitionDataset, _collate_pad_H
 from src.data.iql_dataset_builder import dataset_actions_to_tanh_policy_space
 from src.data.iql_raw_transition_dataset import (
     IQLRawBatch,
@@ -16,7 +18,12 @@ from src.data.iql_raw_transition_dataset import (
     build_iql_raw_transitions,
 )
 from src.evaluation.iql_action_selection import select_iql_policy_action
-from src.evaluation.iql_planner_eval import _make_action_grid, _q_grid_action_diagnostics
+from src.evaluation.iql_planner_eval import (
+    _build_decision_history_view,
+    _extend_h_work_after_one_step,
+    _make_action_grid,
+    _q_grid_action_diagnostics,
+)
 from src.models.ct_deconfound import CTDeconfoundModel
 from src.models.ct_encoder_weight import CTEncoderWeightModel
 from src.models.ct_history_encoder import CTHistoryEncoder
@@ -86,6 +93,38 @@ def _raw_iql_data(length: int = 4):
         "outputs": np.arange(length, dtype=np.float32).reshape(1, length, 1),
         "active_entries": np.ones((1, length, 1), dtype=np.float32),
     }
+
+
+def test_tumor_factual_last_active_outcome_is_simulated():
+    """The final active processed row must not point past the simulated trajectory."""
+    n_patients = 2
+    seq_length = 6
+    params = {
+        "initial_stages": np.zeros(n_patients, dtype=np.float64),
+        "initial_volumes": np.ones(n_patients, dtype=np.float64),
+        "alpha": np.full(n_patients, 0.01, dtype=np.float64),
+        "rho": np.full(n_patients, 0.001, dtype=np.float64),
+        "beta": np.full(n_patients, 0.001, dtype=np.float64),
+        "beta_c": np.full(n_patients, 0.001, dtype=np.float64),
+        "K": np.full(n_patients, 1000.0, dtype=np.float64),
+        "patient_types": np.zeros(n_patients, dtype=np.float64),
+        "window_size": 2,
+        "lag": 0,
+        "chemo_sigmoid_intercepts": np.ones(n_patients, dtype=np.float64),
+        "radio_sigmoid_intercepts": np.ones(n_patients, dtype=np.float64),
+        "chemo_sigmoid_betas": np.ones(n_patients, dtype=np.float64),
+        "radio_sigmoid_betas": np.ones(n_patients, dtype=np.float64),
+    }
+    assigned_actions = np.full((n_patients, seq_length, 2), 0.5, dtype=np.float64)
+
+    np.random.seed(7)
+    data = simulate_factual(params, seq_length, assigned_actions=assigned_actions)
+
+    assert np.all(data["sequence_lengths"] == seq_length - 1)
+    for patient_idx, length in enumerate(data["sequence_lengths"].astype(int)):
+        # Processed outputs are cancer_volume[:, 1:], so processed row length - 1
+        # corresponds to raw cancer_volume index length.
+        assert data["cancer_volume"][patient_idx, length] > 0.0
 
 
 def test_cip_dataset_uses_exp_seed_for_history_lengths():
@@ -179,6 +218,38 @@ def test_last_valid_gather_after_collate_padding():
     assert torch.allclose(A_t[1], torch.tensor([26.0, 27.0]))
 
 
+def test_last_valid_indices_rightmost_active_with_noncontiguous_mask():
+    """Open decision rows appended after padding yield [1,1,0,0,1]; use rightmost 1."""
+    active = torch.tensor([[[1.0], [1.0], [0.0], [0.0], [1.0]]])
+    outputs = torch.tensor([[[1.0], [2.0], [7.0], [6.0], [2.0]]])
+
+    assert torch.equal(last_valid_indices(active), torch.tensor([4]))
+    assert torch.allclose(gather_last_valid(outputs, active), torch.tensor([[2.0]]))
+
+    # Contiguous prefix padding still matches the old sum-based answer.
+    contiguous = torch.tensor([[[1.0], [1.0], [0.0], [0.0]]])
+    assert torch.equal(last_valid_indices(contiguous), torch.tensor([1]))
+
+    H = {
+        "prev_treatments": torch.tensor([[[0.1, 0.2], [0.3, 0.4], [0.0, 0.0], [0.0, 0.0]]]),
+        "current_treatments": torch.tensor([[[1.0, 0.0], [0.5, 0.5], [9.9, 9.9], [8.8, 8.8]]]),
+        "prev_outputs": torch.tensor([[[0.0], [1.0], [0.0], [0.0]]]),
+        "outputs": torch.tensor([[[1.0], [2.0], [7.0], [6.0]]]),
+        "active_entries": torch.tensor([[[1.0], [1.0], [0.0], [0.0]]]),
+    }
+    H_dec = _build_decision_history_view(H)
+    assert torch.equal(
+        H_dec["active_entries"].squeeze(-1),
+        torch.tensor([[1.0, 1.0, 0.0, 0.0, 1.0]]),
+    )
+    assert torch.equal(last_valid_indices(H_dec["active_entries"]), torch.tensor([4]))
+    assert torch.allclose(
+        gather_last_valid(H_dec["outputs"], H_dec["active_entries"]),
+        torch.tensor([[2.0]]),
+    )
+    assert torch.allclose(H_dec["outputs"][:, -1, :], torch.tensor([[2.0]]))
+
+
 def test_ct_models_encode_use_last_valid_action_after_padding():
     cfg = _tiny_cfg()
     H = _variable_padded_batch()
@@ -232,9 +303,79 @@ def test_raw_her_target_reached_sets_done():
     )
     assert transitions
     for transition in transitions:
-        assert transition.t_target == transition.t + 1
+        assert transition.t_target == transition.t
         assert transition.delta_t_next_norm == 0.0
         assert transition.done == 1.0
+
+
+def test_raw_transition_indices_follow_processed_row_contract():
+    data = _raw_iql_data(length=5)
+    data["prev_outputs"][0, :, 0] = np.array([0.0, 10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+    data["outputs"][0, :, 0] = np.array([5.0, 25.0, 80.0, 160.0, 320.0], dtype=np.float32)
+
+    transitions = build_iql_raw_transitions(
+        data,
+        max_tau=3,
+        reward_clip=0.0,
+        reward_scale="none",
+        samples_per_transition=1,
+        target_sampling="horizon_aligned",
+        target_horizons=[2],
+        horizon_terminal_done=True,
+        seed=0,
+    )
+    tr = next(t for t in transitions if t.t == 1)
+
+    assert tr.t_target == 2
+    assert tr.delta_t_norm == pytest.approx(2.0 / 3.0)
+    assert tr.delta_t_next_norm == pytest.approx(1.0 / 3.0)
+    assert tr.done == 0.0
+    assert float(tr.y_target.item()) == pytest.approx(80.0)
+    assert tr.reward == pytest.approx(abs(10.0 - 80.0) - abs(25.0 - 80.0))
+
+
+def test_ct_transition_dataset_uses_same_row_output_after_action():
+    data = _raw_iql_data(length=4)
+    data["outputs"][0, :, 0] = np.array([3.0, 7.0, 11.0, 19.0], dtype=np.float32)
+    ds = CTTransitionDataset(data)
+
+    sample = ds[0]
+    assert ds.index[0] == (0, 1)
+    assert torch.allclose(sample["y_next"], torch.tensor([7.0]))
+
+
+def test_decision_history_view_exposes_latest_outcome_after_closed_rollout():
+    H = {
+        "prev_treatments": torch.tensor([[[0.0, 0.0], [0.1, 0.2]]], dtype=torch.float32),
+        "current_treatments": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+        "prev_outputs": torch.tensor([[[0.0], [1.0]]], dtype=torch.float32),
+        "outputs": torch.tensor([[[1.0], [2.0]]], dtype=torch.float32),
+        "active_entries": torch.ones(1, 2, 1),
+        "static_features": torch.ones(1, 2, 1),
+        "current_covariates": torch.tensor([[[10.0, 11.0], [12.0, 13.0]]]),
+    }
+
+    H_dec = _build_decision_history_view(H)
+    assert H["outputs"].shape[1] == 2
+    assert H_dec["outputs"].shape[1] == 3
+    assert torch.allclose(H_dec["prev_outputs"][0, -1, :], torch.tensor([2.0]))
+    assert torch.allclose(H_dec["prev_treatments"][0, -1, :], torch.tensor([0.3, 0.4]))
+    assert torch.allclose(H_dec["current_covariates"][0, -1, :], torch.tensor([12.0, 13.0]))
+
+    _extend_h_work_after_one_step(
+        H,
+        torch.tensor([[0.7, 0.8]], dtype=torch.float32),
+        torch.tensor([[3.0]], dtype=torch.float32),
+        {"output_means": [0.0], "output_stds": [1.0]},
+        torch.device("cpu"),
+    )
+    assert torch.allclose(H["outputs"][0, -1, :], torch.tensor([3.0]))
+    assert torch.allclose(H["prev_outputs"][0, -1, :], torch.tensor([2.0]))
+    assert torch.allclose(H["current_covariates"][0, -1, :], torch.tensor([12.0, 13.0]))
+
+    H_dec2 = _build_decision_history_view(H)
+    assert torch.allclose(H_dec2["prev_outputs"][0, -1, :], torch.tensor([3.0]))
+    assert torch.allclose(H_dec2["prev_treatments"][0, -1, :], torch.tensor([0.7, 0.8]))
 
 
 def test_empty_replay_sampling_fails_readably():
@@ -291,6 +432,75 @@ def test_e_step_does_not_update_encoder():
     )
     for p0, p1 in zip(enc_before, model.encoder_parameters()):
         assert torch.allclose(p0, p1), "encoder should be frozen in E-step"
+
+
+def test_without_weightnet_uses_exact_unit_weights():
+    model = CTEncoderWeightModel(_tiny_cfg(), x_dim=4).to("cpu")
+    Z_t = torch.randn(8, model.z_dim)
+    A_t = torch.randn(8, model.treatment_dim)
+
+    for parameter in model.weight_net.parameters():
+        parameter.grad = None
+    logits, weights = model.compute_weights(Z_t, A_t, uniform=True)
+
+    assert torch.equal(logits, torch.zeros_like(logits))
+    assert torch.equal(weights, torch.ones_like(weights))
+    assert not logits.requires_grad
+    assert not weights.requires_grad
+    assert all(parameter.grad is None for parameter in model.weight_net.parameters())
+
+
+@pytest.mark.parametrize("align_mode", ["sinkhorn", "mmd"])
+def test_full_dataset_e_step_supports_alignment_modes(align_mode):
+    torch.manual_seed(17)
+    cfg = _tiny_cfg()
+    model = CTEncoderWeightModel(cfg, x_dim=4).to("cpu")
+    optimizer_w = torch.optim.Adam(model.weight_net.parameters(), lr=1e-2)
+    H = _fake_H(8, 3, "cpu")
+    samples = [
+        {"H_t": {key: value[idx] for key, value in H.items()}}
+        for idx in range(H["outputs"].size(0))
+    ]
+
+    metrics = model.e_step_full_dataset(
+        DataLoader(samples, batch_size=4, shuffle=False),
+        optimizer_w,
+        align_mode=align_mode,
+        sinkhorn_blur=0.01,
+        e_epochs=1,
+        train_batch_size=4,
+        w_clip=5.0,
+        device="cpu",
+        outer_seed=23,
+    )
+
+    assert metrics["n_samples"] == 8.0
+    assert np.isfinite(metrics["align_pre"])
+    assert np.isfinite(metrics["align_post"])
+    assert np.isfinite(metrics["w_ess_frac"])
+    assert np.isfinite(metrics["w_std"])
+
+
+def test_full_dataset_e_step_rejects_unknown_alignment_mode():
+    cfg = _tiny_cfg()
+    model = CTEncoderWeightModel(cfg, x_dim=4).to("cpu")
+    optimizer_w = torch.optim.Adam(model.weight_net.parameters(), lr=1e-2)
+    H = _fake_H(2, 3, "cpu")
+    samples = [
+        {"H_t": {key: value[idx] for key, value in H.items()}}
+        for idx in range(H["outputs"].size(0))
+    ]
+
+    with pytest.raises(ValueError, match="sinkhorn.*mmd"):
+        model.e_step_full_dataset(
+            DataLoader(samples, batch_size=2),
+            optimizer_w,
+            align_mode="invalid",
+            sinkhorn_blur=0.01,
+            e_epochs=1,
+            train_batch_size=2,
+            device="cpu",
+        )
 
 
 

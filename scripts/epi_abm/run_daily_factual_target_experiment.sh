@@ -20,6 +20,7 @@ ERRPAT='Traceback|RuntimeError|ValueError|IndexError|OutOfMemoryError|CUDA out|E
 SEEDS=(${SEEDS:-10 101 1010 10101 101010})
 TAUS=(7 14 21)
 TRAIN_PARALLEL="${TRAIN_PARALLEL:-2}"
+STOP_AFTER_TRAIN="${STOP_AFTER_TRAIN:-0}"
 
 mkdir -p "$RUN_ROOT"/{configs,logs,train,val_selection,eval,aggregate,runtime}
 log(){ printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$RUN_ROOT/logs/driver.log"; }
@@ -247,6 +248,11 @@ m = json.loads((run / "manifest.json").read_text())
 m["status"] = "training_done"
 (run / "manifest.json").write_text(json.dumps(m, indent=2, sort_keys=True) + "\n")
 PY
+
+if [[ "$STOP_AFTER_TRAIN" == "1" ]]; then
+  log "STOP_AFTER_TRAIN=1; training complete, leaving validation/test to the parallel evaluator"
+  exit 0
+fi
 
 for seed in "${SEEDS[@]}"; do
   sdir="$RUN_ROOT/train/seed_${seed}"

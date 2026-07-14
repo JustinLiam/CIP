@@ -808,125 +808,129 @@ def main() -> None:
             if args.max_counties is not None:
                 row_indices = row_indices[:int(args.max_counties)]
 
-            for tau in args.taus:
-                cfg.exp.tau = int(tau)
+            for local_idx, row_idx in enumerate(row_indices):
+                county = _county_id(data, row_idx)
                 print(json.dumps({
-                    "event": "split_tau_start",
+                    "event": "county_start",
                     "split": split,
-                    "tau": int(tau),
-                    "n_counties": len(row_indices),
+                    "county": county,
+                    "row_idx": int(row_idx),
+                    "taus": [int(tau) for tau in args.taus],
                     "labels": list(models),
                     "window_mode": args.window_mode,
                     "decision_day": args.decision_day,
                     "target_mode": args.target_mode,
                 }), flush=True)
-                for local_idx, row_idx in enumerate(row_indices):
-                    county = _county_id(data, row_idx)
-                    H, targets, decision_day = _slice_county_window(
-                        data,
-                        row_idx,
-                        int(tau),
-                        window_mode=args.window_mode,
-                        decision_day=args.decision_day,
-                    )
-                    true_norm_daily = targets["outputs"].detach().cpu().numpy().astype(np.float32)
-                    target_norm_final, _ = _make_eval_target_norm(
-                        H,
-                        targets,
-                        dataset_collection.train_scaling_params,
-                        target_mode=args.target_mode,
-                        target_scale=args.target_scale,
-                        target_value=args.target_value,
-                    )
-                    population = _population_from_row(data, row_idx)
-                    factual_norm_daily = _rollout_factual(fold, dataset_collection, H, targets, int(tau))
-                    if args.factual_only or args.include_factual_row:
-                        row = _metric_row(
-                            split=split,
-                            tau=int(tau),
-                            county=county,
-                            label="factual_replay",
-                            pred_norm_daily=factual_norm_daily,
-                            true_norm_daily=true_norm_daily,
-                            factual_norm_daily=factual_norm_daily,
-                            target_norm_final=target_norm_final,
-                            planned_actions=None,
-                            scaling_params=dataset_collection.train_scaling_params,
-                            population=population,
+                try:
+                    for tau in args.taus:
+                        cfg.exp.tau = int(tau)
+                        H, targets, decision_day = _slice_county_window(
+                            data,
+                            row_idx,
+                            int(tau),
+                            window_mode=args.window_mode,
+                            decision_day=args.decision_day,
                         )
-                        row.update({
-                            "idx": int(local_idx),
-                            "row_idx": int(row_idx),
-                            "decision_day": int(decision_day),
-                            "window_mode": args.window_mode,
-                            "target_mode": args.target_mode,
-                            "target_scale": float(args.target_scale),
-                            "target_value": args.target_value,
-                            "elapsed_sec": 0.0,
-                        })
-                        all_rows.append(row)
-                        metrics_f.write(json.dumps(row, sort_keys=True) + "\n")
-                        metrics_f.flush()
-                        summary_path.write_text(json.dumps(_summarize(all_rows), indent=2, sort_keys=True) + "\n")
-                        print(json.dumps(row, sort_keys=True), flush=True)
-                    if args.factual_only:
-                        _release_county_cache(fold, county)
-                        continue
+                        true_norm_daily = targets["outputs"].detach().cpu().numpy().astype(np.float32)
+                        target_norm_final, _ = _make_eval_target_norm(
+                            H,
+                            targets,
+                            dataset_collection.train_scaling_params,
+                            target_mode=args.target_mode,
+                            target_scale=args.target_scale,
+                            target_value=args.target_value,
+                        )
+                        population = _population_from_row(data, row_idx)
+                        factual_norm_daily = _rollout_factual(fold, dataset_collection, H, targets, int(tau))
+                        if args.factual_only or args.include_factual_row:
+                            row = _metric_row(
+                                split=split,
+                                tau=int(tau),
+                                county=county,
+                                label="factual_replay",
+                                pred_norm_daily=factual_norm_daily,
+                                true_norm_daily=true_norm_daily,
+                                factual_norm_daily=factual_norm_daily,
+                                target_norm_final=target_norm_final,
+                                planned_actions=None,
+                                scaling_params=dataset_collection.train_scaling_params,
+                                population=population,
+                            )
+                            row.update({
+                                "idx": int(local_idx),
+                                "row_idx": int(row_idx),
+                                "decision_day": int(decision_day),
+                                "window_mode": args.window_mode,
+                                "target_mode": args.target_mode,
+                                "target_scale": float(args.target_scale),
+                                "target_value": args.target_value,
+                                "elapsed_sec": 0.0,
+                            })
+                            all_rows.append(row)
+                            metrics_f.write(json.dumps(row, sort_keys=True) + "\n")
+                            metrics_f.flush()
+                            summary_path.write_text(json.dumps(_summarize(all_rows), indent=2, sort_keys=True) + "\n")
+                            print(json.dumps(row, sort_keys=True), flush=True)
+                        if args.factual_only:
+                            continue
 
-                    for label, (inference_model, planner, _) in models.items():
-                        started = time.time()
-                        pred_norm_daily, planned_actions = _rollout_policy(
-                            fold=fold,
-                            dataset_collection=dataset_collection,
-                            inference_model=inference_model,
-                            planner=planner,
-                            H=H,
-                            eval_target_norm=target_norm_final,
-                            label=label,
-                            county=county,
-                            tau=int(tau),
-                            max_tau=max_tau,
-                            action_hold_days=action_hold_days,
-                            selector=args.selector,
-                            candidate_actions=args.candidate_actions,
-                            q_bc_penalty=args.q_bc_penalty,
-                            candidate_noise_std=args.candidate_noise_std,
-                            eval_seed=args.eval_seed,
-                            device=device,
-                        )
-                        row = _metric_row(
-                            split=split,
-                            tau=int(tau),
-                            county=county,
-                            label=label,
-                            pred_norm_daily=pred_norm_daily,
-                            true_norm_daily=true_norm_daily,
-                            factual_norm_daily=factual_norm_daily,
-                            target_norm_final=target_norm_final,
-                            planned_actions=planned_actions,
-                            scaling_params=dataset_collection.train_scaling_params,
-                            population=population,
-                        )
-                        row.update({
-                            "idx": int(local_idx),
-                            "row_idx": int(row_idx),
-                            "decision_day": int(decision_day),
-                            "window_mode": args.window_mode,
-                            "target_mode": args.target_mode,
-                            "target_scale": float(args.target_scale),
-                            "target_value": args.target_value,
-                            "elapsed_sec": round(time.time() - started, 3),
-                        })
-                        all_rows.append(row)
-                        metrics_f.write(json.dumps(row, sort_keys=True) + "\n")
-                        metrics_f.flush()
-                        summary_path.write_text(json.dumps(_summarize(all_rows), indent=2, sort_keys=True) + "\n")
-                        print(json.dumps(row, sort_keys=True), flush=True)
+                        for label, (inference_model, planner, _) in models.items():
+                            started = time.time()
+                            pred_norm_daily, planned_actions = _rollout_policy(
+                                fold=fold,
+                                dataset_collection=dataset_collection,
+                                inference_model=inference_model,
+                                planner=planner,
+                                H=H,
+                                eval_target_norm=target_norm_final,
+                                label=label,
+                                county=county,
+                                tau=int(tau),
+                                max_tau=max_tau,
+                                action_hold_days=action_hold_days,
+                                selector=args.selector,
+                                candidate_actions=args.candidate_actions,
+                                q_bc_penalty=args.q_bc_penalty,
+                                candidate_noise_std=args.candidate_noise_std,
+                                eval_seed=args.eval_seed,
+                                device=device,
+                            )
+                            row = _metric_row(
+                                split=split,
+                                tau=int(tau),
+                                county=county,
+                                label=label,
+                                pred_norm_daily=pred_norm_daily,
+                                true_norm_daily=true_norm_daily,
+                                factual_norm_daily=factual_norm_daily,
+                                target_norm_final=target_norm_final,
+                                planned_actions=planned_actions,
+                                scaling_params=dataset_collection.train_scaling_params,
+                                population=population,
+                            )
+                            row.update({
+                                "idx": int(local_idx),
+                                "row_idx": int(row_idx),
+                                "decision_day": int(decision_day),
+                                "window_mode": args.window_mode,
+                                "target_mode": args.target_mode,
+                                "target_scale": float(args.target_scale),
+                                "target_value": args.target_value,
+                                "elapsed_sec": round(time.time() - started, 3),
+                            })
+                            all_rows.append(row)
+                            metrics_f.write(json.dumps(row, sort_keys=True) + "\n")
+                            metrics_f.flush()
+                            summary_path.write_text(json.dumps(_summarize(all_rows), indent=2, sort_keys=True) + "\n")
+                            print(json.dumps(row, sort_keys=True), flush=True)
+                finally:
                     _release_county_cache(fold, county)
                 print(json.dumps({
-                    "event": "split_tau_complete",
+                    "event": "county_complete",
                     "split": split,
-                    "tau": int(tau),
+                    "county": county,
+                    "row_idx": int(row_idx),
+                    "taus": [int(tau) for tau in args.taus],
                     "summary": _summarize(all_rows),
                 }), flush=True)
 

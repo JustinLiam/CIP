@@ -145,9 +145,12 @@ def main(args: DictConfig):
     )
     iql_horizon_terminal_done = bool(stable_select(args, "exp.iql_horizon_terminal_done"))
 
+    ct_use_weight_net = bool(stable_select(args, "exp.ct_use_weight_net"))
     ct_align = str(stable_select(args, "exp.ct_align_loss"))
-    if ct_align != "sinkhorn":
-        raise ValueError(f"EM training requires ct_align_loss=sinkhorn, got {ct_align!r}")
+    if ct_align not in {"sinkhorn", "mmd"}:
+        raise ValueError(
+            f"EM training requires ct_align_loss='sinkhorn' or 'mmd', got {ct_align!r}"
+        )
     ct_blur = float(stable_select(args, "exp.ct_sinkhorn_blur"))
     _em_e_w_lr = stable_select(args, "exp.em_e_w_lr")
     w_lr = (
@@ -313,6 +316,7 @@ def main(args: DictConfig):
     )
 
     em_cfg = EMTrainConfig(
+        use_weight_net=ct_use_weight_net,
         align_mode=ct_align,
         sinkhorn_blur=ct_blur,
         w_clip=w_clip,
@@ -329,6 +333,11 @@ def main(args: DictConfig):
             "Encoder diagnostics enabled | every=%d M-steps | metrics=grad/preclip, grad/postclip, update, update_ratio",
             em_encoder_diagnostics_every,
         )
+    logger.info(
+        "WeightNet mode | enabled=%s align_loss=%s",
+        ct_use_weight_net,
+        ct_align if ct_use_weight_net else "none (uniform weights)",
+    )
 
     _ckpt_override = stable_select(args, "exp.em_ckpt_dir")
     if _ckpt_override:
@@ -387,6 +396,14 @@ def main(args: DictConfig):
         "align_post": 0.0,
         "w_ess_frac": 1.0,
         "w_std": 0.0,
+        "w_var": 0.0,
+        "w_max": 1.0,
+        "w_p50": 1.0,
+        "w_p90": 1.0,
+        "w_p95": 1.0,
+        "w_p99": 1.0,
+        "n_samples": 0.0,
+        "n_samples_total": 0.0,
     }
 
     mlf = VCIPMlflowTracker.from_hydra(args, stage="ct_iql_em")
@@ -410,7 +427,9 @@ def main(args: DictConfig):
                     "Replay buffer not initialized; set em_her_refresh_every>0 or refresh at outer=1."
                 )
 
-            if em_e_refresh_every <= 0 or (outer - 1) % em_e_refresh_every == 0:
+            if not ct_use_weight_net:
+                e_metrics = last_e_metrics
+            elif em_e_refresh_every <= 0 or (outer - 1) % em_e_refresh_every == 0:
                 e_seed = base_seed + outer * 10007 + 17
                 e_metrics = run_e_step_full(
                     ct_model,
@@ -435,7 +454,10 @@ def main(args: DictConfig):
             m_metrics = run_m_step_steps(
                 ct_model, planner, optimizer_enc, replay, em_m_steps, em_cfg, outer_iter=outer
             )
-            m_warmup = " (M-warmup)" if outer <= em_warmup else ""
+            if not ct_use_weight_net:
+                m_warmup = " (uniform)"
+            else:
+                m_warmup = " (M-warmup)" if outer <= em_warmup else ""
             logger.info(
                 "EM outer %d/%d | E(x%d): align_pre=%.4f align_post=%.4f w_ess=%.3f w_std=%.4f | "
                 "M%s: q=%.4f v=%.4f pi=%.4f | replay=%d",
@@ -451,6 +473,19 @@ def main(args: DictConfig):
                 m_metrics["value_loss"],
                 m_metrics["actor_loss"],
                 replay.size,
+            )
+            logger.info(
+                "Weight diagnostics outer=%d | mode=%s ess=%.6f max=%.6f var=%.6f "
+                "p50=%.6f p90=%.6f p95=%.6f p99=%.6f",
+                outer,
+                ct_align if ct_use_weight_net else "uniform",
+                e_metrics["w_ess_frac"],
+                e_metrics.get("w_max", 1.0),
+                e_metrics.get("w_var", 0.0),
+                e_metrics.get("w_p50", 1.0),
+                e_metrics.get("w_p90", 1.0),
+                e_metrics.get("w_p95", 1.0),
+                e_metrics.get("w_p99", 1.0),
             )
             if em_encoder_diagnostics:
                 diag_groups = sorted(
@@ -478,6 +513,12 @@ def main(args: DictConfig):
                 "e/align_post": e_metrics["align_post"],
                 "e/w_ess_frac": e_metrics["w_ess_frac"],
                 "e/w_std": e_metrics.get("w_std", 0.0),
+                "e/w_var": e_metrics.get("w_var", 0.0),
+                "e/w_max": e_metrics.get("w_max", 1.0),
+                "e/w_p50": e_metrics.get("w_p50", 1.0),
+                "e/w_p90": e_metrics.get("w_p90", 1.0),
+                "e/w_p95": e_metrics.get("w_p95", 1.0),
+                "e/w_p99": e_metrics.get("w_p99", 1.0),
                 "e/e_epochs": float(em_e_epochs),
                 "e/n_samples": e_metrics.get("n_samples", 0.0),
                 "e/n_samples_total": e_metrics.get("n_samples_total", e_metrics.get("n_samples", 0.0)),
@@ -506,6 +547,12 @@ def main(args: DictConfig):
                         "e_align_post": e_metrics["align_post"],
                         "e_w_ess_frac": e_metrics["w_ess_frac"],
                         "e_w_std": e_metrics.get("w_std", 0.0),
+                        "e_w_var": e_metrics.get("w_var", 0.0),
+                        "e_w_max": e_metrics.get("w_max", 1.0),
+                        "e_w_p50": e_metrics.get("w_p50", 1.0),
+                        "e_w_p90": e_metrics.get("w_p90", 1.0),
+                        "e_w_p95": e_metrics.get("w_p95", 1.0),
+                        "e_w_p99": e_metrics.get("w_p99", 1.0),
                     },
                 )
 

@@ -85,6 +85,7 @@ STABLE_IQL_EM_DEFAULTS: Dict[str, Any] = {
     "exp.em_ckpt_dir": None,
     "exp.em_eval_ckpt": "",
     # E-step WeightNet and encoder alignment
+    "exp.ct_use_weight_net": True,
     "exp.ct_align_loss": "sinkhorn",
     "exp.ct_sinkhorn_blur": 0.01,
     "exp.ct_weight_hidden": 64,
