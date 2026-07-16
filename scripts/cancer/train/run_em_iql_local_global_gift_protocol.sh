@@ -7,14 +7,20 @@
 #
 # Usage from repo root:
 #   GRID_SEEDS="10 101 1010 10101 101010" TEST_SPLIT=true bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
+#   GRID_SEEDS="10 101 1010 10101 101010" TEST_SPLIT=both bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
 #   DATASET_SEED_MODE=exp_seed GRID_SEEDS="10 101 1010 10101 101010" TEST_SPLIT=true bash scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh 0 4
 
 set -euo pipefail
 
-if [[ -f /home/liam/anaconda3/etc/profile.d/conda.sh ]]; then
+if [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
+  source "${HOME}/anaconda3/etc/profile.d/conda.sh"
+elif [[ -f /home/liam/anaconda3/etc/profile.d/conda.sh ]]; then
   source /home/liam/anaconda3/etc/profile.d/conda.sh
-else
+elif command -v conda >/dev/null 2>&1; then
   eval "$(conda shell.bash hook)"
+else
+  echo "ERROR: conda is not available" >&2
+  exit 1
 fi
 conda activate vcip
 
@@ -39,6 +45,11 @@ MLFLOW_URI="${MLFLOW_URI:-}"
 FORCE="${FORCE:-0}"
 CT_USE_WEIGHT_NET="${CT_USE_WEIGHT_NET:-true}"
 CT_ALIGN_LOSS="${CT_ALIGN_LOSS:-sinkhorn}"
+
+if [[ "${TEST_SPLIT}" != "true" && "${TEST_SPLIT}" != "false" && "${TEST_SPLIT}" != "both" ]]; then
+  echo "ERROR: TEST_SPLIT must be true, false, or both, got ${TEST_SPLIT}" >&2
+  exit 2
+fi
 
 if [[ "${CT_USE_WEIGHT_NET}" != "true" && "${CT_USE_WEIGHT_NET}" != "false" ]]; then
   echo "ERROR: CT_USE_WEIGHT_NET must be true or false, got ${CT_USE_WEIGHT_NET}" >&2
@@ -231,7 +242,6 @@ run_one() {
   local em_ckpt="${em_dir}/ct_iql_em_best.pt"
   local log_dir="${GRID_ROOT}/logs/${tag}"
   local train_log="${log_dir}/train.log"
-  local eval_log="${log_dir}/eval.log"
   local done_flag="${GRID_ROOT}/done/${tag}.done"
   local data_overrides=()
   hydra_data_overrides data_overrides
@@ -272,30 +282,45 @@ run_one() {
     return 1
   fi
 
-  wait_for_gpu
-  CUDA_VISIBLE_DEVICES="${GPU}" python -u runnables/eval_iql_planner.py \
-    +dataset=cancer_sim_cont +model=vcip \
-    exp.seed="${seed}" dataset.coeff="${GAMMA}" "dataset.seed=${dataset_seed}" \
-    exp.test="${TEST_SPLIT}" \
-    "${data_overrides[@]}" \
-    exp.load_data=false \
-    "exp.ct_use_weight_net=${CT_USE_WEIGHT_NET}" \
-    "exp.ct_align_loss=${CT_ALIGN_LOSS}" \
-    "+exp.em_eval_ckpt=${em_ckpt}" \
-    "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
-    "exp.mlflow_combo_id=${combo_id}" \
-    "${MLFLOW_URI_ARGS[@]}" \
-    2>&1 | tee "${eval_log}"
-
-  local best_outer best_val_metric best_val_score finished_at split
+  local best_outer best_val_metric best_val_score finished_at split eval_flag eval_log
+  local eval_flags=()
   read -r best_outer best_val_metric best_val_score <<< "$(read_em_metrics "${em_ckpt}")"
-  finished_at="$(date -Iseconds)"
-  if [[ "${TEST_SPLIT}" == "true" ]]; then
-    split="test"
+  if [[ "${TEST_SPLIT}" == "both" ]]; then
+    eval_flags=(false true)
   else
-    split="val"
+    eval_flags=("${TEST_SPLIT}")
   fi
-  append_eval_rows "${combo_id}" "${seed}" "${dataset_seed}" "${split}" "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}"
+
+  for eval_flag in "${eval_flags[@]}"; do
+    if [[ "${eval_flag}" == "true" ]]; then
+      split="test"
+    else
+      split="val"
+    fi
+    if [[ "${TEST_SPLIT}" == "both" ]]; then
+      eval_log="${log_dir}/eval_${split}.log"
+    else
+      eval_log="${log_dir}/eval.log"
+    fi
+
+    wait_for_gpu
+    CUDA_VISIBLE_DEVICES="${GPU}" python -u runnables/eval_iql_planner.py \
+      +dataset=cancer_sim_cont +model=vcip \
+      exp.seed="${seed}" dataset.coeff="${GAMMA}" "dataset.seed=${dataset_seed}" \
+      exp.test="${eval_flag}" \
+      "${data_overrides[@]}" \
+      exp.load_data=false \
+      "exp.ct_use_weight_net=${CT_USE_WEIGHT_NET}" \
+      "exp.ct_align_loss=${CT_ALIGN_LOSS}" \
+      "+exp.em_eval_ckpt=${em_ckpt}" \
+      "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
+      "exp.mlflow_combo_id=${combo_id}" \
+      "${MLFLOW_URI_ARGS[@]}" \
+      2>&1 | tee "${eval_log}"
+
+    finished_at="$(date -Iseconds)"
+    append_eval_rows "${combo_id}" "${seed}" "${dataset_seed}" "${split}" "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}"
+  done
 
   {
     echo "finished_at=${finished_at}"
@@ -303,7 +328,7 @@ run_one() {
     echo "seed=${seed}"
     echo "dataset_seed=${dataset_seed}"
     echo "dataset_seed_mode=${DATASET_SEED_MODE}"
-    echo "split=${split}"
+    echo "split=${TEST_SPLIT}"
     echo "dataset_train=${DATASET_TRAIN}"
     echo "dataset_val=${DATASET_VAL}"
     echo "dataset_test=${DATASET_TEST}"
@@ -312,7 +337,7 @@ run_one() {
     echo "ct_align_loss=${CT_ALIGN_LOSS}"
     echo "em_ckpt=${em_ckpt}"
     echo "train_log=${train_log}"
-    echo "eval_log=${eval_log}"
+    echo "eval_logs=${log_dir}/eval*.log"
   } > "${done_flag}"
   echo "[done] ${tag}"
 }
