@@ -24,6 +24,24 @@ from src.utils.utils import (
 )
 
 
+def _stratified_permutation(
+    strata: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    """Permute rows only within each stratum, preserving its empirical marginal."""
+    strata = strata.reshape(-1)
+    permutation = torch.arange(strata.numel(), device=strata.device)
+    for value in torch.unique(strata, sorted=True):
+        indices = torch.nonzero(strata == value, as_tuple=False).reshape(-1)
+        if indices.numel() > 1:
+            local_order = torch.randperm(
+                indices.numel(), generator=generator, device=strata.device
+            )
+            permutation[indices] = indices[local_order]
+    return permutation
+
+
 def _cfg_sel(cfg, key: str, default):
     if isinstance(cfg, DictConfig):
         return OmegaConf.select(cfg, key, default=default)
@@ -223,18 +241,31 @@ class CTEncoderWeightModel(nn.Module):
         self,
         loader: DataLoader,
         device: str,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Encode all E-step transitions: Z_det, A, active_mask at query step."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode all E-step transitions, retaining their decision-time stratum."""
         self.eval()
-        z_parts, a_parts, act_parts = [], [], []
+        z_parts, a_parts, act_parts, time_parts = [], [], [], []
         for batch in loader:
             H_t = {k: v.to(device) for k, v in batch["H_t"].items()}
             Z_t, A_t = self.encode(H_t)
             active_t = last_valid_mask(H_t["active_entries"])
+            time_index = batch.get("time_index")
+            if time_index is None:
+                # Legacy/custom loaders do not carry metadata. The last valid
+                # row is the decision index under the processed-data contract.
+                time_index = H_t["active_entries"].sum(dim=1).reshape(-1).long() - 1
+            else:
+                time_index = time_index.to(device=device, dtype=torch.long).reshape(-1)
             z_parts.append(Z_t.detach())
             a_parts.append(A_t)
             act_parts.append(active_t)
-        return torch.cat(z_parts, 0), torch.cat(a_parts, 0), torch.cat(act_parts, 0)
+            time_parts.append(time_index)
+        return (
+            torch.cat(z_parts, 0),
+            torch.cat(a_parts, 0),
+            torch.cat(act_parts, 0),
+            torch.cat(time_parts, 0),
+        )
 
     def _mean_align_on_chunks(
         self,
@@ -244,24 +275,62 @@ class CTEncoderWeightModel(nn.Module):
         align_mode: str,
         sinkhorn_blur: float,
         chunk_size: int,
+        strata: Optional[torch.Tensor] = None,
     ) -> float:
         n = joint_rep.size(0)
         total = 0.0
-        n_chunks = 0
-        for start in range(0, n, chunk_size):
-            end = min(start + chunk_size, n)
-            idx = slice(start, end)
+        total_samples = 0
+        if strata is None:
+            groups = [torch.arange(n, device=joint_rep.device)]
+        else:
+            groups = [
+                torch.nonzero(strata == value, as_tuple=False).reshape(-1)
+                for value in torch.unique(strata, sorted=True)
+            ]
+        for group in groups:
+            for start in range(0, group.numel(), chunk_size):
+                idx = group[start : start + chunk_size]
+                if idx.numel() < 2:
+                    continue
+                logits = self.weight_net(joint_rep[idx])
+                loss = alignment_loss_from_representations(
+                    joint_rep[idx],
+                    marginal_rep[idx],
+                    logits,
+                    align_mode,
+                    sinkhorn_blur,
+                )
+                count = int(idx.numel())
+                total += float(loss.detach()) * count
+                total_samples += count
+        return total / max(total_samples, 1)
+
+    def _mean_align_over_time(
+        self,
+        joint_rep: torch.Tensor,
+        marginal_rep: torch.Tensor,
+        time_index: torch.Tensor,
+        *,
+        sinkhorn_blur: float,
+    ) -> float:
+        """CTD-style mean of full-stratum Sinkhorn losses over decision times."""
+        losses = []
+        for time_value in torch.unique(time_index, sorted=True):
+            idx = torch.nonzero(
+                time_index == time_value, as_tuple=False
+            ).reshape(-1)
+            if idx.numel() < 2:
+                continue
             logits = self.weight_net(joint_rep[idx])
             loss = alignment_loss_from_representations(
                 joint_rep[idx],
                 marginal_rep[idx],
                 logits,
-                align_mode,
+                "sinkhorn",
                 sinkhorn_blur,
             )
-            total += float(loss.detach())
-            n_chunks += 1
-        return total / max(n_chunks, 1)
+            losses.append(float(loss.detach()))
+        return sum(losses) / max(len(losses), 1)
 
     def e_step_full_dataset(
         self,
@@ -285,12 +354,13 @@ class CTEncoderWeightModel(nn.Module):
                 f"EM E-step supports align_mode='sinkhorn' or 'mmd', got {align_mode!r}"
             )
 
-        Z_det, A_all, active_all = self._encode_full_dataset(loader, device)
+        Z_det, A_all, active_all, time_all = self._encode_full_dataset(loader, device)
         n_total = Z_det.size(0)
         valid = active_all > 0.5
         Z_det = Z_det[valid]
         A_all = A_all[valid]
         active_all = active_all[valid]
+        time_all = time_all[valid]
         n = Z_det.size(0)
         if n == 0:
             return {
@@ -300,56 +370,115 @@ class CTEncoderWeightModel(nn.Module):
                 "w_std": 0.0,
                 "n_samples": 0.0,
                 "n_samples_total": float(n_total),
+                "n_time_strata": 0.0,
             }
 
         # Generator device must match ``device=`` in randperm (cuda tensors need cuda generator).
         gen = torch.Generator(device=Z_det.device)
         gen.manual_seed(int(outer_seed))
-        perm = torch.randperm(n, generator=gen, device=Z_det.device)
+        # The CTD reference constructs the product-of-marginals surrogate by
+        # shuffling treatments across patients independently at every time.
+        # Mixing all patient-time rows lets WeightNet learn temporal imbalance.
+        perm = _stratified_permutation(time_all, generator=gen)
         joint_rep = torch.cat([Z_det, A_all], dim=-1)
         marginal_rep = torch.cat([Z_det, A_all[perm]], dim=-1)
 
         chunk = max(1, int(train_batch_size))
-        align_pre = self._mean_align_on_chunks(
-            joint_rep,
-            marginal_rep,
-            align_mode=align_mode,
-            sinkhorn_blur=sinkhorn_blur,
-            chunk_size=chunk,
-        )
+        if align_mode == "sinkhorn":
+            align_pre = self._mean_align_over_time(
+                joint_rep,
+                marginal_rep,
+                time_all,
+                sinkhorn_blur=sinkhorn_blur,
+            )
+        else:
+            align_pre = self._mean_align_on_chunks(
+                joint_rep,
+                marginal_rep,
+                align_mode=align_mode,
+                sinkhorn_blur=sinkhorn_blur,
+                chunk_size=chunk,
+                strata=time_all,
+            )
 
         self.weight_net.train()
         n_epochs = max(1, int(e_epochs))
-        for _ in range(n_epochs):
-            order = torch.randperm(n, device=Z_det.device)
-            for start in range(0, n, chunk):
-                idx = order[start : start + chunk]
-                joint_b = joint_rep[idx]
-                marg_b = marginal_rep[idx]
+        optimizer_steps = 0
+        if align_mode == "sinkhorn":
+            time_groups = [
+                torch.nonzero(time_all == time_value, as_tuple=False).reshape(-1)
+                for time_value in torch.unique(time_all, sorted=True)
+            ]
+            time_groups = [group for group in time_groups if group.numel() >= 2]
+            for _ in range(n_epochs):
                 optimizer_w.zero_grad(set_to_none=True)
-                logits = self.weight_net(joint_b)
-                loss_align = alignment_loss_from_representations(
-                    joint_b,
-                    marg_b,
-                    logits,
-                    align_mode,
-                    sinkhorn_blur,
-                )
-                loss_align.backward()
+                for group in time_groups:
+                    logits = self.weight_net(joint_rep[group])
+                    loss_align = alignment_loss_from_representations(
+                        joint_rep[group],
+                        marginal_rep[group],
+                        logits,
+                        align_mode,
+                        sinkhorn_blur,
+                    )
+                    (loss_align / float(len(time_groups))).backward()
                 if w_clip is not None and w_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.weight_net.parameters(), max_norm=float(w_clip)
                     )
                 optimizer_w.step()
+                optimizer_steps += 1
+        else:
+            for _ in range(n_epochs):
+                unique_times = torch.unique(time_all, sorted=True)
+                time_order = unique_times[
+                    torch.randperm(unique_times.numel(), device=Z_det.device)
+                ]
+                for time_value in time_order:
+                    group = torch.nonzero(
+                        time_all == time_value, as_tuple=False
+                    ).reshape(-1)
+                    group = group[torch.randperm(group.numel(), device=Z_det.device)]
+                    for start in range(0, group.numel(), chunk):
+                        idx = group[start : start + chunk]
+                        if idx.numel() < 2:
+                            continue
+                        joint_b = joint_rep[idx]
+                        marg_b = marginal_rep[idx]
+                        optimizer_w.zero_grad(set_to_none=True)
+                        logits = self.weight_net(joint_b)
+                        loss_align = alignment_loss_from_representations(
+                            joint_b,
+                            marg_b,
+                            logits,
+                            align_mode,
+                            sinkhorn_blur,
+                        )
+                        loss_align.backward()
+                        if w_clip is not None and w_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.weight_net.parameters(), max_norm=float(w_clip)
+                            )
+                        optimizer_w.step()
+                        optimizer_steps += 1
 
         self.weight_net.eval()
-        align_post = self._mean_align_on_chunks(
-            joint_rep,
-            marginal_rep,
-            align_mode=align_mode,
-            sinkhorn_blur=sinkhorn_blur,
-            chunk_size=chunk,
-        )
+        if align_mode == "sinkhorn":
+            align_post = self._mean_align_over_time(
+                joint_rep,
+                marginal_rep,
+                time_all,
+                sinkhorn_blur=sinkhorn_blur,
+            )
+        else:
+            align_post = self._mean_align_on_chunks(
+                joint_rep,
+                marginal_rep,
+                align_mode=align_mode,
+                sinkhorn_blur=sinkhorn_blur,
+                chunk_size=chunk,
+                strata=time_all,
+            )
 
         with torch.no_grad():
             logits_all = self.weight_net(joint_rep)
@@ -361,6 +490,8 @@ class CTEncoderWeightModel(nn.Module):
             **weight_diagnostics,
             "n_samples": float(n),
             "n_samples_total": float(n_total),
+            "n_time_strata": float(torch.unique(time_all).numel()),
+            "e_optimizer_steps": float(optimizer_steps),
         }
 
     def e_step_batch(

@@ -170,10 +170,15 @@ class CTEstepDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Dict[str, torch.Tensor]]:
         i, t = self.index[idx]
         H = _build_H_slice(self.data, i, t + 1)
-        return {"H_t": H}
+        return {"H_t": H, "time_index": torch.tensor(t, dtype=torch.long)}
 
 
 def collate_ct_estep_batch(samples: List[Dict]) -> Dict[str, Any]:
     """Collate E-step batches (``H_t`` only)."""
     device_dtype = samples[0]["H_t"]["prev_treatments"].dtype
-    return {"H_t": _collate_pad_H(samples, "H_t", device_dtype)}
+    out = {"H_t": _collate_pad_H(samples, "H_t", device_dtype)}
+    if "time_index" in samples[0]:
+        out["time_index"] = torch.stack(
+            [torch.as_tensor(sample["time_index"], dtype=torch.long) for sample in samples]
+        )
+    return out

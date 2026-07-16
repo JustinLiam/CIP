@@ -442,11 +442,14 @@ def main(args: DictConfig):
                 )
                 last_e_metrics = e_metrics
                 logger.info(
-                    "E-step full fit outer=%d | n_active=%.0f n_total=%.0f epochs=%d w_lr=%.1e",
+                    "E-step full fit outer=%d | n_active=%.0f n_total=%.0f "
+                    "time_strata=%.0f epochs=%d optimizer_steps=%.0f w_lr=%.1e",
                     outer,
                     e_metrics.get("n_samples", 0),
                     e_metrics.get("n_samples_total", e_metrics.get("n_samples", 0)),
+                    e_metrics.get("n_time_strata", 0),
                     em_e_epochs,
+                    e_metrics.get("e_optimizer_steps", 0),
                     w_lr,
                 )
             else:

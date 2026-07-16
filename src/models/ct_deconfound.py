@@ -52,7 +52,7 @@ def build_covariate_x(H_t: Dict[str, torch.Tensor], cfg: Dict[str, Any]) -> torc
 
 
 class WeightNet(nn.Module):
-    """MLP(Z_t, A_t) -> scalar; batch normalization via softmax in training code."""
+    """MLP(Z_t, A_t) -> bounded score; normalization is applied by the loss."""
 
     def __init__(self, z_dim: int, a_dim: int, hidden_dim: int = 64):
         super().__init__()
@@ -64,7 +64,9 @@ class WeightNet(nn.Module):
         )
 
     def forward(self, z_a: torch.Tensor) -> torch.Tensor:
-        return self.net(z_a).squeeze(-1)
+        # Match the reference WeightNetwork: bounded scores are subsequently
+        # normalized exactly once by the existing Sinkhorn/weighting code.
+        return torch.sigmoid(self.net(z_a).squeeze(-1))
 
 
 class OutcomePredictor(nn.Module):

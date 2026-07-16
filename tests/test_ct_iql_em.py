@@ -25,7 +25,7 @@ from src.evaluation.iql_planner_eval import (
     _q_grid_action_diagnostics,
 )
 from src.models.ct_deconfound import CTDeconfoundModel
-from src.models.ct_encoder_weight import CTEncoderWeightModel
+from src.models.ct_encoder_weight import CTEncoderWeightModel, _stratified_permutation
 from src.models.ct_history_encoder import CTHistoryEncoder
 from src.models.sequence_utils import gather_last_valid, last_valid_indices, last_valid_mask
 from src.planners.iql_planner import IQLPlanner, IQLPlannerConfig, _weighted_mean
@@ -448,6 +448,63 @@ def test_without_weightnet_uses_exact_unit_weights():
     assert not logits.requires_grad
     assert not weights.requires_grad
     assert all(parameter.grad is None for parameter in model.weight_net.parameters())
+
+
+def test_estep_marginal_permutation_never_crosses_time_strata():
+    strata = torch.tensor([1, 1, 1, 2, 2, 3, 3, 3, 3])
+    generator = torch.Generator().manual_seed(23)
+    permutation = _stratified_permutation(strata, generator=generator)
+
+    assert torch.equal(strata[permutation], strata)
+    assert sorted(permutation.tolist()) == list(range(strata.numel()))
+    assert any(int(src) != dst for dst, src in enumerate(permutation))
+
+
+def test_weightnet_scores_are_bounded_like_reference_implementation():
+    model = CTEncoderWeightModel(_tiny_cfg(), x_dim=4)
+    scores = model.weight_net(torch.randn(32, model.z_dim + model.treatment_dim))
+
+    assert torch.all(scores > 0.0)
+    assert torch.all(scores < 1.0)
+
+
+def test_sinkhorn_estep_updates_once_per_epoch_after_averaging_time_losses():
+    class CountingAdam(torch.optim.Adam):
+        def __init__(self, params, **kwargs):
+            super().__init__(params, **kwargs)
+            self.step_calls = 0
+
+        def step(self, closure=None):
+            self.step_calls += 1
+            return super().step(closure)
+
+    torch.manual_seed(29)
+    model = CTEncoderWeightModel(_tiny_cfg(), x_dim=4).to("cpu")
+    optimizer_w = CountingAdam(model.weight_net.parameters(), lr=1e-2)
+    H = _fake_H(8, 3, "cpu")
+    samples = [
+        {
+            "H_t": {key: value[idx] for key, value in H.items()},
+            "time_index": torch.tensor(1 if idx < 4 else 2),
+        }
+        for idx in range(H["outputs"].size(0))
+    ]
+
+    metrics = model.e_step_full_dataset(
+        DataLoader(samples, batch_size=4, shuffle=False),
+        optimizer_w,
+        align_mode="sinkhorn",
+        sinkhorn_blur=0.01,
+        e_epochs=3,
+        train_batch_size=2,
+        w_clip=5.0,
+        device="cpu",
+        outer_seed=31,
+    )
+
+    assert optimizer_w.step_calls == 3
+    assert metrics["e_optimizer_steps"] == 3.0
+    assert metrics["n_time_strata"] == 2.0
 
 
 @pytest.mark.parametrize("align_mode", ["sinkhorn", "mmd"])
