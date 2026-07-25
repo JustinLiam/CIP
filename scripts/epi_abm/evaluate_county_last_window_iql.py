@@ -36,6 +36,7 @@ from src.evaluation.iql_planner_eval import (  # noqa: E402
 )
 from src.models.inference_model import InferenceModel  # noqa: E402
 from src.models.sequence_utils import gather_last_valid  # noqa: E402
+from src.data.epi_abm.weekly_env import capture_rng_state, restore_rng_state  # noqa: E402
 from src.utils.em_ckpt import load_em_for_eval  # noqa: E402
 from src.utils.utils import repeat_static, set_seed, to_float  # noqa: E402
 
@@ -283,15 +284,22 @@ def _rollout_policy(
     candidate_noise_std: float,
     eval_seed: int,
     device: str,
+    persistent_abm_session: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     H_work = _to_device_history(H, device)
     eval_target_dev = torch.as_tensor(eval_target_norm, dtype=torch.float32, device=device)
     planned_actions: List[np.ndarray] = []
     pred_norm: List[float] = []
     held_action = None
+    abm_session = None
 
     for step in range(int(tau)):
         if held_action is None or (step % int(action_hold_days)) == 0:
+            rng_state = (
+                capture_rng_state()
+                if persistent_abm_session and abm_session is not None
+                else None
+            )
             held_action = _select_action(
                 label=label,
                 inference_model=inference_model,
@@ -309,12 +317,25 @@ def _rollout_policy(
                 county=county,
                 device=device,
             )
+            if rng_state is not None:
+                restore_rng_state(rng_state)
 
-        next_observation = fold.simulate_next_after_action(
-            _cpu_history(H_work),
-            held_action.detach().cpu(),
-            dataset_collection.train_scaling_params,
-        )
+        if persistent_abm_session:
+            if abm_session is None:
+                # Restoring after the first action selection makes the ABM RNG
+                # state identical to the existing replay-from-snapshot path.
+                abm_session = fold.start_simulation_session(_cpu_history(H_work))
+            next_observation = fold.simulate_next_in_session(
+                abm_session,
+                held_action.detach().cpu(),
+                dataset_collection.train_scaling_params,
+            )
+        else:
+            next_observation = fold.simulate_next_after_action(
+                _cpu_history(H_work),
+                held_action.detach().cpu(),
+                dataset_collection.train_scaling_params,
+            )
         y_norm = torch.as_tensor(
             next_observation["outputs"],
             device=device,
@@ -683,6 +704,18 @@ def main() -> None:
     parser.add_argument("--max-counties", type=int, default=None)
     parser.add_argument("--row-start", type=int, default=0, help="Inclusive row offset within each split.")
     parser.add_argument("--row-end", type=int, default=None, help="Exclusive row offset within each split.")
+    parser.add_argument(
+        "--snapshot-days",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Retain only these ABM day-start snapshots (day zero is always kept).",
+    )
+    parser.add_argument(
+        "--persistent-abm-session",
+        action="store_true",
+        help="Restore ABM once per rollout and advance it in place across the horizon.",
+    )
     args = parser.parse_args()
     if not args.ckpt and not args.factual_only:
         raise ValueError("At least one --ckpt is required unless --factual-only is set.")
@@ -731,6 +764,8 @@ def main() -> None:
     dataset_collection = to_float(dataset_collection)
     if int(cfg.dataset.static_size) > 0 and len(dataset_collection.train_f.data["static_features"].shape) == 2:
         dataset_collection = repeat_static(dataset_collection)
+    if args.snapshot_days is not None:
+        dataset_collection.simulator_cache.configure_snapshot_days(args.snapshot_days)
 
     device = args.model_device if torch.cuda.is_available() and args.model_device.startswith("cuda") else "cpu"
     ckpt_paths = _parse_label_path(args.ckpt)
@@ -780,6 +815,8 @@ def main() -> None:
         "row_start": args.row_start,
         "row_end": args.row_end,
         "max_counties": args.max_counties,
+        "snapshot_days": args.snapshot_days,
+        "persistent_abm_session": bool(args.persistent_abm_session),
         "started_at": time.time(),
     }, indent=2, sort_keys=True) + "\n")
 
@@ -894,6 +931,7 @@ def main() -> None:
                                 candidate_noise_std=args.candidate_noise_std,
                                 eval_seed=args.eval_seed,
                                 device=device,
+                                persistent_abm_session=args.persistent_abm_session,
                             )
                             row = _metric_row(
                                 split=split,

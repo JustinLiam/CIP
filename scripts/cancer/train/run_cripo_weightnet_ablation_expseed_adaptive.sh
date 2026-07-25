@@ -9,14 +9,20 @@ cd "${ROOT}"
 RUN_ID="${RUN_ID:-weightnet_expseed_$(date +%Y%m%d_%H%M%S)}"
 RESULT_ROOT="${RESULT_ROOT:-${ROOT}/results/ablation_studies/tumor/weightnet_alignment/noise0_seq60_expseed/${RUN_ID}}"
 PROTOCOL="scripts/cancer/train/run_em_iql_local_global_gift_protocol.sh"
-SEEDS=(10 101 1010 10101 101010)
-CONDITIONS=(
-  sinkhorn:1 sinkhorn:2 sinkhorn:3 sinkhorn:4
-  mmd:1 mmd:2 mmd:3 mmd:4
-  uniform:1 uniform:2 uniform:3 uniform:4
-)
+SEEDS_RAW="${GRID_SEEDS:-10 101 1010 10101 101010}"
+read -r -a SEEDS <<<"${SEEDS_RAW}"
+DEFAULT_CONDITIONS="sinkhorn:1 sinkhorn:2 sinkhorn:3 sinkhorn:4 mmd:1 mmd:2 mmd:3 mmd:4 uniform:1 uniform:2 uniform:3 uniform:4"
+read -r -a CONDITIONS <<<"${CONDITION_LIST:-${DEFAULT_CONDITIONS}}"
 GPU_FREE_THRESHOLD_MB="${GPU_FREE_THRESHOLD_MB:-1024}"
 GPU_POLL_SECONDS="${GPU_POLL_SECONDS:-30}"
+SEED_PARALLELISM="${SEED_PARALLELISM:-2}"
+EM_E_EPOCHS="${EM_E_EPOCHS:-10}"
+EM_E_W_LR="${EM_E_W_LR:-0.003}"
+EVAL_TAU_LIST="${EVAL_TAU_LIST:-1 2 3 4 5 6 7 8 9 10 11 12}"
+PYTHON_BIN="${PYTHON_BIN:-/home/liam/anaconda3/envs/vcip/bin/python}"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="$(command -v python3)"
+fi
 
 mkdir -p "${RESULT_ROOT}"
 SCHEDULER_LOG="${RESULT_ROOT}/scheduler.log"
@@ -39,7 +45,7 @@ variant_settings() {
 
 merge_condition() {
   local condition_root=$1 variant=$2 gamma=$3
-  /home/hello/anaconda3/envs/vcip/bin/python - "${condition_root}" "${variant}" "${gamma}" "${SEEDS[*]}" <<'PY'
+  "${PYTHON_BIN}" - "${condition_root}" "${variant}" "${gamma}" "${SEEDS[*]}" "${EVAL_TAU_LIST}" <<'PY'
 import csv
 import os
 import statistics
@@ -51,6 +57,7 @@ root = Path(sys.argv[1])
 variant = sys.argv[2]
 gamma = int(sys.argv[3])
 seeds = [int(value) for value in sys.argv[4].split()]
+taus = [int(value) for value in sys.argv[5].split()]
 rows = []
 for seed in seeds:
     path = root / "seeds" / f"seed_{seed}" / "summary.csv"
@@ -66,7 +73,7 @@ for row in rows:
     key = (row["split"], int(row["seed"]), int(row["eval_tau"]))
     latest[key] = row
 
-expected = {(split, seed, tau) for split in ("val", "test") for seed in seeds for tau in range(1, 7)}
+expected = {(split, seed, tau) for split in ("val", "test") for seed in seeds for tau in taus}
 if set(latest) != expected:
     raise RuntimeError(f"Incomplete {variant=} {gamma=}: missing={sorted(expected - set(latest))}")
 
@@ -116,10 +123,13 @@ noise=0.0
 max_seq_length=60
 dataset_seed_mode=exp_seed
 train_val_test=1000/200/200
-exp_seeds=10 101 1010 10101 101010
+exp_seeds=${SEEDS[*]}
+seed_parallelism=${SEED_PARALLELISM}
 eval_splits=val test
-eval_tau=1 2 3 4 5 6
+eval_tau=${EVAL_TAU_LIST}
 checkpoint_selection=max_rmse_uns_tau1_2_3_4_5_6
+em_e_epochs=${EM_E_EPOCHS}
+em_e_w_lr=${EM_E_W_LR}
 code_commit=$(git rev-parse HEAD)
 started_at=$(date -Iseconds)
 META
@@ -134,11 +144,19 @@ META
       DATASET_TRAIN=1000 DATASET_VAL=200 DATASET_TEST=200 \
       MAX_SEQ_LENGTH=60 TEST_SPLIT=both TUMOR_NOISE_SCALE=0.0 \
       CT_USE_WEIGHT_NET="${use_weight_net}" CT_ALIGN_LOSS="${align_loss}" \
+      EM_E_EPOCHS="${EM_E_EPOCHS}" EM_E_W_LR="${EM_E_W_LR}" \
+      EVAL_TAU_LIST="${EVAL_TAU_LIST}" USE_MLFLOW=false \
       GPU_WAIT_MEMORY_MB=76000 GPU_WAIT_SECONDS=30 FORCE=0 \
       MLFLOW_EXPERIMENT="cripo_weightnet_${variant}_kappa${gamma}_expseed" \
       bash "${PROTOCOL}" "${gpu}" "${gamma}" \
       >"${seed_root}/launcher.log" 2>&1 &
     pids+=("$!")
+    if ((${#pids[@]} >= SEED_PARALLELISM)); then
+      for pid in "${pids[@]}"; do
+        if ! wait "${pid}"; then failed=1; fi
+      done
+      pids=()
+    fi
   done
   for pid in "${pids[@]}"; do
     if ! wait "${pid}"; then failed=1; fi

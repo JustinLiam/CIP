@@ -973,14 +973,21 @@ class IQLPlanner:
         self.total_it += 1
         log_dict: Dict[str, float] = {}
 
-        Z_t, A_t = encoder_model.encode(batch.H_t)
+        Z_t, _ = encoder_model.encode(batch.H_t)
         Z_next, _ = encoder_model.encode(batch.H_t_next)
 
-        _, w = encoder_model.compute_weights(
-            Z_t, A_t, detach_z=True, uniform=uniform_weights
-        )
-        w_raw = w.detach()
-        w = _cap_renormalize_weights(w_raw, self.cfg.weight_max)
+        if uniform_weights:
+            w = torch.ones(Z_t.size(0), device=Z_t.device, dtype=Z_t.dtype)
+        else:
+            if batch.sample_weight is None:
+                raise ValueError(
+                    "Weighted M-step requires fixed E-step sample_weight values in replay."
+                )
+            w = batch.sample_weight.reshape(-1).to(
+                device=Z_t.device, dtype=Z_t.dtype
+            ).detach()
+            if not torch.isfinite(w).all() or bool((w <= 0).any()):
+                raise ValueError("Fixed E-step replay weights must be finite and positive.")
 
         s_grad = self.build_state(
             Z_t, batch.y_target, batch.delta_t_norm, batch.a_prev_tanh
@@ -1008,16 +1015,8 @@ class IQLPlanner:
             collect_encoder_diagnostics=collect_encoder_diagnostics,
         )
         self._update_policy_weighted(s_det, batch.action, adv, w, log_dict)
-        _log_weight_stats(log_dict, "w_raw", w_raw)
         _log_weight_stats(log_dict, "w", w)
-        if self.cfg.weight_max is not None and self.cfg.weight_max > 0:
-            log_dict["w_max_config"] = float(self.cfg.weight_max)
-            log_dict["w_clip_frac"] = float(
-                (w_raw > float(self.cfg.weight_max)).float().mean().item()
-            )
-            log_dict["w_at_cap_frac"] = float(
-                (w >= float(self.cfg.weight_max) - 1e-6).float().mean().item()
-            )
+        log_dict["w_fixed_contract"] = 0.0 if uniform_weights else 1.0
         return log_dict
 
     @torch.no_grad()

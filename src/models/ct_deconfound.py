@@ -52,7 +52,7 @@ def build_covariate_x(H_t: Dict[str, torch.Tensor], cfg: Dict[str, Any]) -> torc
 
 
 class WeightNet(nn.Module):
-    """MLP(Z_t, A_t) -> bounded score; normalization is applied by the loss."""
+    """MLP(Z_t, A_t) -> raw log-weight; normalization is applied once per time stratum."""
 
     def __init__(self, z_dim: int, a_dim: int, hidden_dim: int = 64):
         super().__init__()
@@ -64,9 +64,7 @@ class WeightNet(nn.Module):
         )
 
     def forward(self, z_a: torch.Tensor) -> torch.Tensor:
-        # Match the reference WeightNetwork: bounded scores are subsequently
-        # normalized exactly once by the existing Sinkhorn/weighting code.
-        return torch.sigmoid(self.net(z_a).squeeze(-1))
+        return self.net(z_a).squeeze(-1)
 
 
 class OutcomePredictor(nn.Module):

@@ -12,6 +12,12 @@ def _sample_seed(config, sample_seed=None):
 
 
 def planning_repeats(config):
+    override = getattr(config.exp, "iql_eval_repeats_override", None)
+    if override is not None:
+        override = int(override)
+        if override < 1:
+            raise ValueError("exp.iql_eval_repeats_override must be >= 1")
+        return override
     name = str(getattr(config.dataset, "name", "")).lower()
     if "mimic" in name:
         return 3

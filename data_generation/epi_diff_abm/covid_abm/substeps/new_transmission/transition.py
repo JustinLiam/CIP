@@ -6,6 +6,8 @@ import math
 import pandas as pd
 import numpy as np
 import os
+import json
+import time
 
 from agent_torch.core.substep import SubstepTransitionMessagePassing
 from agent_torch.core.helpers import get_by_path
@@ -29,8 +31,16 @@ class NewTransmission(SubstepTransitionMessagePassing):
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
         self.data_dir = os.path.join(project_root, 'data')
 
-        self.networks = self._preload_all_networks()
-        self.household_net = self._load_single_net(f"{self.data_dir}/networks/covid_output_causal/{self.config['simulation_metadata']['POPULATION']}/mobility_networks/HOUSEHOLD_NETWORK.pkl")
+        archive_payload = self._load_network_archive()
+        if archive_payload is None:
+            self.networks = self._preload_all_networks()
+            self.household_net = self._load_single_net(
+                f"{self.data_dir}/networks/covid_output_causal/"
+                f"{self.config['simulation_metadata']['POPULATION']}/"
+                "mobility_networks/HOUSEHOLD_NETWORK.pkl"
+            )
+        else:
+            self.networks, self.household_net = archive_payload
         self.proportion_history = []
         self.age_proportion_history = []
 
@@ -277,6 +287,88 @@ class NewTransmission(SubstepTransitionMessagePassing):
         if hasattr(df, 'edges'):
             df = pd.DataFrame(df.edges(), columns=["node1", "node2"])
         return torch.tensor(df.values, device=self.device, dtype=torch.long)
+
+    def _load_network_archive(self):
+        """Load contiguous, pre-converted county networks when available."""
+        population = str(self.config['simulation_metadata']['POPULATION'])
+        mobility_dir = os.path.join(
+            self.data_dir,
+            "networks",
+            "covid_output_causal",
+            population,
+            "mobility_networks",
+        )
+        archive_path = os.environ.get(
+            "EPI_ABM_NETWORK_ARCHIVE",
+            os.path.join(mobility_dir, "tensor_archive_v1.pt"),
+        )
+        if not os.path.exists(archive_path):
+            if os.environ.get("EPI_ABM_REQUIRE_NETWORK_ARCHIVE", "0") == "1":
+                raise FileNotFoundError(
+                    f"EPI_ABM_REQUIRE_NETWORK_ARCHIVE=1 but archive is missing: "
+                    f"{archive_path}"
+                )
+            return None
+
+        started = time.time()
+        payload = torch.load(archive_path, map_location="cpu")
+        if int(payload.get("format_version", -1)) != 1:
+            raise ValueError(
+                f"Unsupported EpiABM network archive format in {archive_path}: "
+                f"{payload.get('format_version')!r}"
+            )
+        if str(payload.get("county", "")).zfill(5) != population.zfill(5):
+            raise ValueError(
+                f"Network archive county mismatch: archive={payload.get('county')!r}, "
+                f"config={population!r}"
+            )
+        if int(payload.get("num_steps", -1)) != int(self.num_timesteps):
+            raise ValueError(
+                f"Network archive step mismatch: archive={payload.get('num_steps')!r}, "
+                f"config={self.num_timesteps!r}"
+            )
+
+        networks = {}
+        for kind in ("school", "occ", "rand"):
+            edges = payload[f"{kind}_edges"]
+            offsets = payload[f"{kind}_offsets"]
+            if edges.dtype != torch.long or edges.ndim != 2 or edges.shape[1] != 2:
+                raise ValueError(
+                    f"Invalid {kind} edge tensor in {archive_path}: "
+                    f"shape={tuple(edges.shape)}, dtype={edges.dtype}"
+                )
+            offsets_list = [int(value) for value in offsets.tolist()]
+            if len(offsets_list) != self.num_timesteps + 1:
+                raise ValueError(
+                    f"Invalid {kind} offsets in {archive_path}: "
+                    f"expected {self.num_timesteps + 1}, got {len(offsets_list)}"
+                )
+            edges = edges.to(self.device)
+            networks[kind] = [
+                edges[offsets_list[idx]:offsets_list[idx + 1]]
+                for idx in range(self.num_timesteps)
+            ]
+
+        household = payload["household_edges"]
+        if household.dtype != torch.long or household.ndim != 2 or household.shape[1] != 2:
+            raise ValueError(
+                f"Invalid household edge tensor in {archive_path}: "
+                f"shape={tuple(household.shape)}, dtype={household.dtype}"
+            )
+        household = household.to(self.device)
+        print(json.dumps({
+            "event": "epi_abm_network_archive_loaded",
+            "county": population.zfill(5),
+            "archive": archive_path,
+            "device": str(self.device),
+            "elapsed_sec": round(time.time() - started, 3),
+            "edge_counts": {
+                kind: int(payload[f"{kind}_edges"].shape[0])
+                for kind in ("school", "occ", "rand")
+            },
+            "household_edges": int(payload["household_edges"].shape[0]),
+        }), flush=True)
+        return networks, household
 
     def _preload_all_networks(self):
         """Load all time-step networks into a dictionary of tensors on the GPU."""

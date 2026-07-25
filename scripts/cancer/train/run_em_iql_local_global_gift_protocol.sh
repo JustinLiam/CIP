@@ -42,9 +42,16 @@ GPU_WAIT_MEMORY_MB="${GPU_WAIT_MEMORY_MB:-5000}"
 GPU_WAIT_SECONDS="${GPU_WAIT_SECONDS:-60}"
 MLFLOW_EXPERIMENT="${MLFLOW_EXPERIMENT:-em_iql_local_global_gift_protocol}"
 MLFLOW_URI="${MLFLOW_URI:-}"
+USE_MLFLOW="${USE_MLFLOW:-true}"
 FORCE="${FORCE:-0}"
 CT_USE_WEIGHT_NET="${CT_USE_WEIGHT_NET:-true}"
 CT_ALIGN_LOSS="${CT_ALIGN_LOSS:-sinkhorn}"
+IQL_BETA="${IQL_BETA:-2.0}"
+IQL_ADV_MAX="${IQL_ADV_MAX:-100.0}"
+IQL_ACTOR_UPDATE="${IQL_ACTOR_UPDATE:-awr}"
+EM_E_EPOCHS="${EM_E_EPOCHS:-}"
+EM_E_W_LR="${EM_E_W_LR:-}"
+EVAL_TAU_LIST="${EVAL_TAU_LIST:-1 2 3 4 5 6}"
 
 if [[ "${TEST_SPLIT}" != "true" && "${TEST_SPLIT}" != "false" && "${TEST_SPLIT}" != "both" ]]; then
   echo "ERROR: TEST_SPLIT must be true, false, or both, got ${TEST_SPLIT}" >&2
@@ -59,6 +66,14 @@ if [[ "${CT_ALIGN_LOSS}" != "sinkhorn" && "${CT_ALIGN_LOSS}" != "mmd" ]]; then
   echo "ERROR: CT_ALIGN_LOSS must be sinkhorn or mmd, got ${CT_ALIGN_LOSS}" >&2
   exit 2
 fi
+if [[ "${IQL_ACTOR_UPDATE}" != "awr" && "${IQL_ACTOR_UPDATE}" != "bc" && "${IQL_ACTOR_UPDATE}" != "td3bc" && "${IQL_ACTOR_UPDATE}" != "awr_td3bc" ]]; then
+  echo "ERROR: IQL_ACTOR_UPDATE must be awr, bc, td3bc, or awr_td3bc, got ${IQL_ACTOR_UPDATE}" >&2
+  exit 2
+fi
+if [[ "${USE_MLFLOW}" != "true" && "${USE_MLFLOW}" != "false" ]]; then
+  echo "ERROR: USE_MLFLOW must be true or false, got ${USE_MLFLOW}" >&2
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "${ROOT}"
@@ -68,13 +83,22 @@ mkdir -p "${GRID_ROOT}/logs" "${GRID_ROOT}/ckpts" "${GRID_ROOT}/done"
 
 SUMMARY="${GRID_ROOT}/summary.csv"
 if [[ ! -f "${SUMMARY}" ]]; then
-  echo "combo_id,seed,dataset_seed,dataset_seed_mode,split,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,best_outer,best_val_metric,best_val_score,eval_tau,mae_norm,mae_uns,rmse_norm,rmse_norm_x_std,rmse_uns,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
+  echo "combo_id,seed,dataset_seed,dataset_seed_mode,split,dataset_train,dataset_val,dataset_test,max_seq_length,min_seq_length,ct_use_weight_net,ct_align_loss,iql_beta,iql_adv_max,iql_actor_update,em_e_epochs,em_e_w_lr,best_outer,best_val_metric,best_val_score,eval_tau,mae_norm,mae_uns,rmse_norm,rmse_norm_x_std,rmse_uns,em_ckpt,train_log,eval_log,finished_at" > "${SUMMARY}"
 fi
 
 MLFLOW_URI_ARGS=()
 if [[ -n "${MLFLOW_URI}" ]]; then
   MLFLOW_URI_ARGS=("exp.mlflow_uri=${MLFLOW_URI}")
 fi
+EM_E_ARGS=()
+if [[ -n "${EM_E_EPOCHS}" ]]; then
+  EM_E_ARGS+=("+exp.em_e_epochs=${EM_E_EPOCHS}")
+fi
+if [[ -n "${EM_E_W_LR}" ]]; then
+  EM_E_ARGS+=("+exp.em_e_w_lr=${EM_E_W_LR}")
+fi
+EVAL_TAU_CSV="${EVAL_TAU_LIST// /,}"
+EVAL_ARGS=("+exp.iql_eval_tau_list=[${EVAL_TAU_CSV}]")
 
 wait_for_gpu() {
   while true; do
@@ -143,7 +167,7 @@ append_eval_rows() {
   local eval_log="${10}"
   local finished_at="${11}"
 
-  python - "${SUMMARY}" "${combo_id}" "${seed}" "${dataset_seed}" "${DATASET_SEED_MODE}" "${split}"     "${DATASET_TRAIN}" "${DATASET_VAL}" "${DATASET_TEST}" "${MAX_SEQ_LENGTH}" "${MIN_SEQ_LENGTH}"     "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY2'
+  python - "${SUMMARY}" "${combo_id}" "${seed}" "${dataset_seed}" "${DATASET_SEED_MODE}" "${split}"     "${DATASET_TRAIN}" "${DATASET_VAL}" "${DATASET_TEST}" "${MAX_SEQ_LENGTH}" "${MIN_SEQ_LENGTH}"     "${CT_USE_WEIGHT_NET}" "${CT_ALIGN_LOSS}" "${IQL_BETA}" "${IQL_ADV_MAX}" "${IQL_ACTOR_UPDATE}"     "${EM_E_EPOCHS:-code_default}" "${EM_E_W_LR:-code_default}" "${best_outer}" "${best_val_metric}" "${best_val_score}" "${em_ckpt}" "${train_log}" "${eval_log}" "${finished_at}" <<'PY2'
 import csv
 import os
 import re
@@ -152,6 +176,8 @@ import sys
 (
     summary_path, combo_id, seed, dataset_seed, dataset_seed_mode, split,
     dataset_train, dataset_val, dataset_test, max_seq_length, min_seq_length,
+    ct_use_weight_net, ct_align_loss, iql_beta, iql_adv_max, iql_actor_update,
+    em_e_epochs, em_e_w_lr,
     best_outer, best_val_metric, best_val_score, em_ckpt, train_log, eval_log, finished_at,
 ) = sys.argv[1:]
 
@@ -200,6 +226,8 @@ if not rows:
 fieldnames = [
     "combo_id", "seed", "dataset_seed", "dataset_seed_mode", "split",
     "dataset_train", "dataset_val", "dataset_test", "max_seq_length", "min_seq_length",
+    "ct_use_weight_net", "ct_align_loss", "iql_beta", "iql_adv_max", "iql_actor_update",
+    "em_e_epochs", "em_e_w_lr",
     "best_outer", "best_val_metric", "best_val_score", "eval_tau",
     "mae_norm", "mae_uns", "rmse_norm", "rmse_norm_x_std", "rmse_uns",
     "em_ckpt", "train_log", "eval_log", "finished_at",
@@ -218,6 +246,13 @@ with open(summary_path, "a", newline="", encoding="utf-8") as f:
             "dataset_test": dataset_test,
             "max_seq_length": max_seq_length,
             "min_seq_length": min_seq_length,
+            "ct_use_weight_net": ct_use_weight_net,
+            "ct_align_loss": ct_align_loss,
+            "iql_beta": iql_beta,
+            "iql_adv_max": iql_adv_max,
+            "iql_actor_update": iql_actor_update,
+            "em_e_epochs": em_e_epochs,
+            "em_e_w_lr": em_e_w_lr,
             "best_outer": best_outer,
             "best_val_metric": best_val_metric,
             "best_val_score": best_val_score,
@@ -236,7 +271,12 @@ run_one() {
   local seed="$1"
   local dataset_seed
   dataset_seed="$(resolve_dataset_seed "${seed}")"
-  local combo_id="seq${MAX_SEQ_LENGTH}_localglobal_dseed${dataset_seed}"
+  local beta_id="${IQL_BETA//./p}"
+  local adv_id="${IQL_ADV_MAX//./p}"
+  local e_id="${EM_E_EPOCHS:-default}"
+  local wlr_id="${EM_E_W_LR:-default}"
+  wlr_id="${wlr_id//./p}"
+  local combo_id="seq${MAX_SEQ_LENGTH}_localglobal_dseed${dataset_seed}_wn${CT_USE_WEIGHT_NET}_align${CT_ALIGN_LOSS}_e${e_id}_wlr${wlr_id}_beta${beta_id}_adv${adv_id}_actor${IQL_ACTOR_UPDATE}"
   local tag="${combo_id}_seed${seed}"
   local em_dir="${GRID_ROOT}/ckpts/${tag}"
   local em_ckpt="${em_dir}/ct_iql_em_best.pt"
@@ -271,8 +311,13 @@ run_one() {
     exp.load_data=false \
     "exp.ct_use_weight_net=${CT_USE_WEIGHT_NET}" \
     "exp.ct_align_loss=${CT_ALIGN_LOSS}" \
+    "+exp.iql_beta=${IQL_BETA}" \
+    "+exp.iql_adv_max=${IQL_ADV_MAX}" \
+    "+exp.iql_actor_update=${IQL_ACTOR_UPDATE}" \
+    "${EM_E_ARGS[@]}" \
     "+exp.em_ckpt_dir=${em_dir}" \
     "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
+    "exp.use_mlflow=${USE_MLFLOW}" \
     "exp.mlflow_combo_id=${combo_id}" \
     "${MLFLOW_URI_ARGS[@]}" \
     2>&1 | tee "${train_log}"
@@ -312,8 +357,14 @@ run_one() {
       exp.load_data=false \
       "exp.ct_use_weight_net=${CT_USE_WEIGHT_NET}" \
       "exp.ct_align_loss=${CT_ALIGN_LOSS}" \
+      "+exp.iql_beta=${IQL_BETA}" \
+      "+exp.iql_adv_max=${IQL_ADV_MAX}" \
+      "+exp.iql_actor_update=${IQL_ACTOR_UPDATE}" \
+      "${EM_E_ARGS[@]}" \
+      "${EVAL_ARGS[@]}" \
       "+exp.em_eval_ckpt=${em_ckpt}" \
       "exp.mlflow_experiment=${MLFLOW_EXPERIMENT}" \
+      "exp.use_mlflow=${USE_MLFLOW}" \
       "exp.mlflow_combo_id=${combo_id}" \
       "${MLFLOW_URI_ARGS[@]}" \
       2>&1 | tee "${eval_log}"
@@ -335,6 +386,13 @@ run_one() {
     echo "max_seq_length=${MAX_SEQ_LENGTH}"
     echo "ct_use_weight_net=${CT_USE_WEIGHT_NET}"
     echo "ct_align_loss=${CT_ALIGN_LOSS}"
+    echo "iql_beta=${IQL_BETA}"
+    echo "iql_adv_max=${IQL_ADV_MAX}"
+    echo "iql_actor_update=${IQL_ACTOR_UPDATE}"
+    echo "em_e_epochs=${EM_E_EPOCHS:-code_default}"
+    echo "em_e_w_lr=${EM_E_W_LR:-code_default}"
+    echo "eval_tau_list=${EVAL_TAU_LIST}"
+    echo "use_mlflow=${USE_MLFLOW}"
     echo "em_ckpt=${em_ckpt}"
     echo "train_log=${train_log}"
     echo "eval_logs=${log_dir}/eval*.log"
@@ -347,6 +405,10 @@ echo "[tumor-protocol] gamma=${GAMMA} gpu=${GPU} test_split=${TEST_SPLIT}"
 echo "[tumor-protocol] seeds=(${SEEDS[*]}) dataset_seed_mode=${DATASET_SEED_MODE} dataset_seed=${DATASET_SEED}"
 echo "[tumor-protocol] data train/val/test=${DATASET_TRAIN}/${DATASET_VAL}/${DATASET_TEST} max_seq_length=${MAX_SEQ_LENGTH}"
 echo "[tumor-protocol] weight_net=${CT_USE_WEIGHT_NET} align_loss=${CT_ALIGN_LOSS}"
+echo "[tumor-protocol] iql_beta=${IQL_BETA} iql_adv_max=${IQL_ADV_MAX} actor_update=${IQL_ACTOR_UPDATE}"
+echo "[tumor-protocol] em_e_epochs=${EM_E_EPOCHS:-code_default} em_e_w_lr=${EM_E_W_LR:-code_default}"
+echo "[tumor-protocol] eval_tau_list=${EVAL_TAU_LIST}"
+echo "[tumor-protocol] use_mlflow=${USE_MLFLOW}"
 echo "[tumor-protocol] grid_root=${GRID_ROOT}"
 
 for seed in "${SEEDS[@]}"; do

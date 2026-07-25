@@ -20,6 +20,7 @@ class EMTrainConfig:
     align_mode: str = "sinkhorn"
     sinkhorn_blur: float = 0.01
     w_clip: Optional[float] = 1.0
+    weight_max: Optional[float] = None
     m_batch_size: int = 256
     warmup_outer_iters: int = 0
     log_m_every: int = 50
@@ -48,6 +49,7 @@ def run_e_step_full(
         e_epochs=cfg.e_epochs,
         train_batch_size=cfg.e_batch_size,
         w_clip=cfg.w_clip,
+        weight_max=cfg.weight_max,
         device=device,
         outer_seed=outer_seed,
     )

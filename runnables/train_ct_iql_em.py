@@ -320,6 +320,7 @@ def main(args: DictConfig):
         align_mode=ct_align,
         sinkhorn_blur=ct_blur,
         w_clip=w_clip,
+        weight_max=iql_weight_max,
         m_batch_size=m_batch_size,
         warmup_outer_iters=em_warmup,
         log_m_every=em_log_m_every,
@@ -426,6 +427,8 @@ def main(args: DictConfig):
                 raise RuntimeError(
                     "Replay buffer not initialized; set em_her_refresh_every>0 or refresh at outer=1."
                 )
+            if ct_use_weight_net and ct_model.fixed_transition_weights:
+                replay.assign_fixed_weights(ct_model.fixed_transition_weights)
 
             if not ct_use_weight_net:
                 e_metrics = last_e_metrics
@@ -441,9 +444,13 @@ def main(args: DictConfig):
                     outer_seed=e_seed,
                 )
                 last_e_metrics = e_metrics
+                assignment = replay.assign_fixed_weights(
+                    ct_model.fixed_transition_weights
+                )
                 logger.info(
                     "E-step full fit outer=%d | n_active=%.0f n_total=%.0f "
-                    "time_strata=%.0f epochs=%d optimizer_steps=%.0f w_lr=%.1e",
+                    "time_strata=%.0f epochs=%d optimizer_steps=%.0f w_lr=%.1e "
+                    "fixed_weights=%.0f unique_keys=%.0f",
                     outer,
                     e_metrics.get("n_samples", 0),
                     e_metrics.get("n_samples_total", e_metrics.get("n_samples", 0)),
@@ -451,6 +458,8 @@ def main(args: DictConfig):
                     em_e_epochs,
                     e_metrics.get("e_optimizer_steps", 0),
                     w_lr,
+                    assignment["assigned_transitions"],
+                    assignment["unique_replay_keys"],
                 )
             else:
                 e_metrics = last_e_metrics
@@ -462,19 +471,26 @@ def main(args: DictConfig):
             else:
                 m_warmup = " (M-warmup)" if outer <= em_warmup else ""
             logger.info(
-                "EM outer %d/%d | E(x%d): align_pre=%.4f align_post=%.4f w_ess=%.3f w_std=%.4f | "
-                "M%s: q=%.4f v=%.4f pi=%.4f | replay=%d",
+                "EM outer %d/%d | E(x%d): align_pre=%.4f align_post=%.4f reduction=%.4f "
+                "time_ess=%.3f time_w_std=%.4f za_dep=%.4f->%.4f | "
+                "M%s: q=%.4f v=%.4f pi=%.4f w_mean=%.3f w_std=%.4f w_ess=%.3f | replay=%d",
                 outer,
                 em_outer_iters,
                 em_e_epochs,
                 e_metrics["align_pre"],
                 e_metrics["align_post"],
-                e_metrics["w_ess_frac"],
-                e_metrics.get("w_std", 0.0),
+                e_metrics.get("align_reduction", 0.0),
+                e_metrics.get("w_time_ess_mean", e_metrics["w_ess_frac"]),
+                e_metrics.get("w_time_std_mean", e_metrics.get("w_std", 0.0)),
+                e_metrics.get("za_dependence_pre", 0.0),
+                e_metrics.get("za_dependence_post", 0.0),
                 m_warmup,
                 m_metrics["q_loss"],
                 m_metrics["value_loss"],
                 m_metrics["actor_loss"],
+                m_metrics.get("w_mean", 1.0),
+                m_metrics.get("w_std", 0.0),
+                m_metrics.get("w_ess_frac", 1.0),
                 replay.size,
             )
             logger.info(
@@ -514,6 +530,8 @@ def main(args: DictConfig):
             m_log_metrics = {
                 "e/align_pre": e_metrics["align_pre"],
                 "e/align_post": e_metrics["align_post"],
+                "e/align_reduction": e_metrics.get("align_reduction", 0.0),
+                "e/align_relative_reduction": e_metrics.get("align_relative_reduction", 0.0),
                 "e/w_ess_frac": e_metrics["w_ess_frac"],
                 "e/w_std": e_metrics.get("w_std", 0.0),
                 "e/w_var": e_metrics.get("w_var", 0.0),
@@ -522,6 +540,12 @@ def main(args: DictConfig):
                 "e/w_p90": e_metrics.get("w_p90", 1.0),
                 "e/w_p95": e_metrics.get("w_p95", 1.0),
                 "e/w_p99": e_metrics.get("w_p99", 1.0),
+                "e/w_time_ess_mean": e_metrics.get("w_time_ess_mean", 1.0),
+                "e/w_time_ess_min": e_metrics.get("w_time_ess_min", 1.0),
+                "e/w_time_std_mean": e_metrics.get("w_time_std_mean", 0.0),
+                "e/w_time_std_max": e_metrics.get("w_time_std_max", 0.0),
+                "e/za_dependence_pre": e_metrics.get("za_dependence_pre", 0.0),
+                "e/za_dependence_post": e_metrics.get("za_dependence_post", 0.0),
                 "e/e_epochs": float(em_e_epochs),
                 "e/n_samples": e_metrics.get("n_samples", 0.0),
                 "e/n_samples_total": e_metrics.get("n_samples_total", e_metrics.get("n_samples", 0.0)),
@@ -531,7 +555,7 @@ def main(args: DictConfig):
                 "replay/size": float(replay.size),
             }
             for key, value in m_metrics.items():
-                if key.startswith("enc_"):
+                if key.startswith(("enc_", "w_")):
                     m_log_metrics[f"m/{key}"] = float(value)
             mlf.log_metrics(m_log_metrics, step=outer)
             if em_save_every_outer_checkpoint:
@@ -548,6 +572,7 @@ def main(args: DictConfig):
                         "m_actor_loss": m_metrics["actor_loss"],
                         "e_align_pre": e_metrics["align_pre"],
                         "e_align_post": e_metrics["align_post"],
+                        "e_align_reduction": e_metrics.get("align_reduction", 0.0),
                         "e_w_ess_frac": e_metrics["w_ess_frac"],
                         "e_w_std": e_metrics.get("w_std", 0.0),
                         "e_w_var": e_metrics.get("w_var", 0.0),
@@ -556,6 +581,11 @@ def main(args: DictConfig):
                         "e_w_p90": e_metrics.get("w_p90", 1.0),
                         "e_w_p95": e_metrics.get("w_p95", 1.0),
                         "e_w_p99": e_metrics.get("w_p99", 1.0),
+                        "e_w_time_ess_mean": e_metrics.get("w_time_ess_mean", 1.0),
+                        "e_w_time_ess_min": e_metrics.get("w_time_ess_min", 1.0),
+                        "e_w_time_std_mean": e_metrics.get("w_time_std_mean", 0.0),
+                        "e_za_dependence_pre": e_metrics.get("za_dependence_pre", 0.0),
+                        "e_za_dependence_post": e_metrics.get("za_dependence_post", 0.0),
                     },
                 )
 

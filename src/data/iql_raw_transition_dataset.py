@@ -86,6 +86,7 @@ class IQLRawTransition:
     delta_t_norm: float
     delta_t_next_norm: float
     a_prev_tanh: torch.Tensor
+    sample_weight: float = 1.0
 
 
 @dataclass
@@ -99,6 +100,9 @@ class IQLRawBatch:
     delta_t_norm: torch.Tensor
     delta_t_next_norm: torch.Tensor
     a_prev_tanh: torch.Tensor
+    patient_idx: Optional[torch.Tensor] = None
+    t: Optional[torch.Tensor] = None
+    sample_weight: Optional[torch.Tensor] = None
 
 
 def build_iql_raw_transitions(
@@ -274,6 +278,9 @@ def collate_iql_raw_batch(samples: List[IQLRawTransition]) -> IQLRawBatch:
             [[s.delta_t_next_norm] for s in samples], dtype=dtype
         ),
         a_prev_tanh=torch.stack([s.a_prev_tanh for s in samples], dim=0),
+        patient_idx=torch.tensor([s.patient_idx for s in samples], dtype=torch.long),
+        t=torch.tensor([s.t for s in samples], dtype=torch.long),
+        sample_weight=torch.tensor([s.sample_weight for s in samples], dtype=dtype),
     )
 
 
@@ -303,6 +310,35 @@ class IQLRawReplayBuffer:
         batch = collate_iql_raw_batch([self.transitions[i] for i in idx])
         return _batch_to_device(batch, self.device)
 
+    def assign_fixed_weights(
+        self,
+        weights: Dict[tuple, float],
+        *,
+        require_all: bool = True,
+    ) -> Dict[str, float]:
+        """Attach one E-step weight to every HER copy of the same ``(patient, t)`` row."""
+        missing = set()
+        assigned = 0
+        unique_keys = set()
+        for transition in self.transitions:
+            key = (int(transition.patient_idx), int(transition.t))
+            unique_keys.add(key)
+            if key not in weights:
+                missing.add(key)
+                continue
+            transition.sample_weight = float(weights[key])
+            assigned += 1
+        if missing and require_all:
+            preview = sorted(missing)[:10]
+            raise KeyError(
+                f"Missing fixed E-step weights for {len(missing)} replay keys; examples={preview}"
+            )
+        return {
+            "assigned_transitions": float(assigned),
+            "unique_replay_keys": float(len(unique_keys)),
+            "missing_replay_keys": float(len(missing)),
+        }
+
 
 def _batch_to_device(batch: IQLRawBatch, device: str) -> IQLRawBatch:
     def _mv_h(H: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -318,4 +354,7 @@ def _batch_to_device(batch: IQLRawBatch, device: str) -> IQLRawBatch:
         delta_t_norm=batch.delta_t_norm.to(device),
         delta_t_next_norm=batch.delta_t_next_norm.to(device),
         a_prev_tanh=batch.a_prev_tanh.to(device),
+        patient_idx=None if batch.patient_idx is None else batch.patient_idx.to(device),
+        t=None if batch.t is None else batch.t.to(device),
+        sample_weight=None if batch.sample_weight is None else batch.sample_weight.to(device),
     )

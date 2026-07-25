@@ -21,15 +21,21 @@ import numpy as np
 import torch
 from hydra.utils import get_original_cwd, instantiate
 from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.data.ct_transition_dataset import _covariate_stream_dim  # noqa: E402
+from src.data.ct_transition_dataset import (  # noqa: E402
+    _covariate_stream_dim,
+    collate_ct_estep_batch,
+)
 from src.data.iql_raw_transition_dataset import IQLRawReplayBuffer, build_iql_raw_transitions  # noqa: E402
 from src.evaluation.iql_planner_eval import aggregate_iql_planner_metrics  # noqa: E402
-from src.models.ct_encoder_weight import CTEncoderWeightModel  # noqa: E402
+from src.models.ct_encoder_weight import (  # noqa: E402
+    CTEncoderWeightModel,
+    normalize_log_weights_by_stratum,
+)
 from src.models.inference_model import InferenceModel  # noqa: E402
-from src.planners.iql_planner import _cap_renormalize_weights  # noqa: E402
 from src.utils.em_ckpt import load_em_ct_model, load_em_for_eval  # noqa: E402
 from src.utils.stable_iql_em_defaults import stable_select  # noqa: E402
 from src.utils.utils import repeat_static, set_seed, to_float  # noqa: E402
@@ -141,6 +147,67 @@ def _prepare_dataset(args: DictConfig):
     return dataset_collection
 
 
+def _fixed_weight_lookup_for_replay(
+    ct_model: CTEncoderWeightModel,
+    raw,
+    *,
+    device: str,
+    weight_max: Optional[float],
+    batch_size: int = 512,
+):
+    """Recreate the training-time full-stratum weight contract for diagnostics."""
+    unique_rows = {}
+    for transition in raw:
+        key = (int(transition.patient_idx), int(transition.t))
+        unique_rows.setdefault(
+            key,
+            {
+                "H_t": transition.H_t,
+                "patient_index": torch.tensor(key[0], dtype=torch.long),
+                "time_index": torch.tensor(key[1], dtype=torch.long),
+            },
+        )
+    loader = DataLoader(
+        list(unique_rows.values()),
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        collate_fn=collate_ct_estep_batch,
+    )
+    with torch.no_grad():
+        z_t, a_t, active, patient_idx, time_idx = ct_model._encode_full_dataset(
+            loader, device
+        )
+        valid = active > 0.5
+        z_t = z_t[valid]
+        a_t = a_t[valid]
+        patient_idx = patient_idx[valid]
+        time_idx = time_idx[valid]
+        logits = ct_model.weight_net(torch.cat([z_t, a_t], dim=-1))
+        weights = normalize_log_weights_by_stratum(
+            logits,
+            time_idx,
+            weight_max=weight_max,
+        )
+    logit_lookup = {}
+    weight_lookup = {}
+    for patient, time, logit, weight in zip(
+        patient_idx.detach().cpu().tolist(),
+        time_idx.detach().cpu().tolist(),
+        logits.detach().cpu().tolist(),
+        weights.detach().cpu().tolist(),
+    ):
+        key = (int(patient), int(time))
+        logit_lookup[key] = float(logit)
+        weight_lookup[key] = float(weight)
+    if len(weight_lookup) != len(unique_rows):
+        missing = sorted(set(unique_rows) - set(weight_lookup))[:10]
+        raise ValueError(
+            "Could not derive fixed diagnostic weights for all replay keys; "
+            f"missing examples={missing}"
+        )
+    return logit_lookup, weight_lookup
+
+
 def _resolve_ckpt(args: DictConfig, original_cwd: Path, seed: int) -> Path:
     raw = str(stable_select(args, "exp.em_eval_ckpt")).strip()
     if not raw:
@@ -185,12 +252,29 @@ def _replay_diagnostics(args: DictConfig, dataset_collection, ckpt_path: Path, p
     load_em_ct_model(ct_model, str(ckpt_path), device)
     ct_model.eval()
     replay = IQLRawReplayBuffer(raw, device=device)
+    logit_lookup, weight_lookup = _fixed_weight_lookup_for_replay(
+        ct_model,
+        raw,
+        device=device,
+        weight_max=planner.cfg.weight_max,
+    )
+    replay.assign_fixed_weights(weight_lookup)
     batch = replay.sample(min(sample_n, replay.size))
 
     with torch.no_grad():
-        z_t, a_t = ct_model.encode(batch.H_t)
-        _, w_raw = ct_model.compute_weights(z_t, a_t, detach_z=True, uniform=False)
-        w = _cap_renormalize_weights(w_raw.detach(), planner.cfg.weight_max)
+        z_t, _ = ct_model.encode(batch.H_t)
+        if batch.patient_idx is None or batch.t is None or batch.sample_weight is None:
+            raise ValueError("Replay diagnostics require fixed patient/time weights.")
+        sampled_keys = zip(
+            batch.patient_idx.detach().cpu().tolist(),
+            batch.t.detach().cpu().tolist(),
+        )
+        log_w_raw = torch.tensor(
+            [logit_lookup[(int(patient), int(time))] for patient, time in sampled_keys],
+            device=z_t.device,
+            dtype=z_t.dtype,
+        )
+        w = batch.sample_weight.reshape(-1).to(device=z_t.device, dtype=z_t.dtype)
         states = planner.build_state(z_t, batch.y_target, batch.delta_t_norm, batch.a_prev_tanh)
         q = planner.qf(states, batch.action)
         v = planner.vf(states)
@@ -202,7 +286,7 @@ def _replay_diagnostics(args: DictConfig, dataset_collection, ckpt_path: Path, p
     arrays = {
         "adv": adv.detach().cpu().numpy(),
         "exp_adv": exp_adv.detach().cpu().numpy(),
-        "w_raw": w_raw.detach().cpu().numpy(),
+        "log_w_raw": log_w_raw.detach().cpu().numpy(),
         "w": w.detach().cpu().numpy(),
         "reward": batch.reward.detach().cpu().numpy(),
     }
@@ -217,7 +301,7 @@ def _replay_diagnostics(args: DictConfig, dataset_collection, ckpt_path: Path, p
         "action": _stats(action_mean),
         "adv": _stats(arrays["adv"]),
         "exp_adv": _stats(arrays["exp_adv"]),
-        "w_raw": _stats(arrays["w_raw"]),
+        "log_w_raw": _stats(arrays["log_w_raw"]),
         "w": _stats(arrays["w"]),
         "reward": _stats(arrays["reward"]),
         "correlations": correlations,

@@ -8,7 +8,7 @@ from torch.distributions import Normal
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 
-from src.data.cip_dataset import CIPDataset
+from src.data.cip_dataset import CIPDataset, planning_repeats
 from src.data.cancer_sim_cont.cancer_simulation import simulate_factual
 from src.data.ct_transition_dataset import CTTransitionDataset, _collate_pad_H
 from src.data.iql_dataset_builder import dataset_actions_to_tanh_policy_space
@@ -16,6 +16,7 @@ from src.data.iql_raw_transition_dataset import (
     IQLRawBatch,
     IQLRawReplayBuffer,
     build_iql_raw_transitions,
+    collate_iql_raw_batch,
 )
 from src.evaluation.iql_action_selection import select_iql_policy_action
 from src.evaluation.iql_planner_eval import (
@@ -25,7 +26,16 @@ from src.evaluation.iql_planner_eval import (
     _q_grid_action_diagnostics,
 )
 from src.models.ct_deconfound import CTDeconfoundModel
-from src.models.ct_encoder_weight import CTEncoderWeightModel, _stratified_permutation
+from src.models.ct_encoder_weight import (
+    CTEncoderWeightModel,
+    _stratified_permutation,
+    normalize_log_weights_by_stratum,
+)
+from src.evaluation.weightnet_balance import (
+    stratified_balance_metrics,
+    weighted_distance_correlation,
+    weighted_normalized_hsic,
+)
 from src.models.ct_history_encoder import CTHistoryEncoder
 from src.models.sequence_utils import gather_last_valid, last_valid_indices, last_valid_mask
 from src.planners.iql_planner import IQLPlanner, IQLPlannerConfig, _weighted_mean
@@ -60,6 +70,43 @@ def _fake_H(B: int, T: int, device: str):
         "active_entries": torch.ones(B, T, 1, device=device),
         "static_features": torch.randn(B, T, 1, device=device),
     }
+
+
+def test_weighted_balance_metrics_detect_identical_variables():
+    x = torch.linspace(-1.0, 1.0, 32).unsqueeze(-1)
+    weights = torch.ones(32)
+    assert weighted_distance_correlation(x, x, weights) > 0.99
+    assert weighted_normalized_hsic(x, x, weights) > 0.99
+
+
+def test_stratified_balance_uniform_weights_are_identity_and_have_full_ess():
+    generator = torch.Generator().manual_seed(17)
+    z = torch.randn(24, 3, generator=generator)
+    action = torch.randn(24, 2, generator=generator)
+    weights = torch.ones(24)
+    time_index = torch.tensor([1] * 12 + [2] * 12)
+    aggregate, rows = stratified_balance_metrics(
+        z,
+        action,
+        weights,
+        time_index,
+        min_samples=8,
+        shuffle_seed=23,
+    )
+    assert len(rows) == 2
+    assert aggregate["ess_fraction_mean"] == pytest.approx(1.0)
+    assert aggregate["ess_fraction_min"] == pytest.approx(1.0)
+    for metric in (
+        "distance_correlation",
+        "normalized_hsic",
+        "mean_abs_cross_correlation",
+    ):
+        assert aggregate[f"weighted_{metric}"] == pytest.approx(
+            aggregate[f"uniform_{metric}"]
+        )
+        assert aggregate[f"shuffled_{metric}"] == pytest.approx(
+            aggregate[f"uniform_{metric}"]
+        )
 
 
 def _make_variable_history(current_values):
@@ -206,6 +253,22 @@ def test_cip_dataset_uses_fixed_repeats_for_mimic_and_tumor():
     assert CIPDataset(data, tumor_cfg, train=False).repeats == 5
 
 
+def test_cip_dataset_allows_explicit_eval_repeats_override():
+    cfg = OmegaConf.create({
+        "dataset": {"name": "mimic3_synthetic_gift"},
+        "exp": {
+            "repeats": 99,
+            "iql_eval_repeats_override": 5,
+        },
+    })
+
+    assert planning_repeats(cfg) == 5
+
+    cfg.exp.iql_eval_repeats_override = 0
+    with pytest.raises(ValueError, match="must be >= 1"):
+        planning_repeats(cfg)
+
+
 def test_last_valid_gather_after_collate_padding():
     H = _variable_padded_batch()
 
@@ -334,6 +397,54 @@ def test_raw_transition_indices_follow_processed_row_contract():
     assert tr.reward == pytest.approx(abs(10.0 - 80.0) - abs(25.0 - 80.0))
 
 
+def test_replay_preserves_patient_time_and_her_copies_share_fixed_weight():
+    transitions = build_iql_raw_transitions(
+        _raw_iql_data(length=5),
+        max_tau=3,
+        reward_clip=0.0,
+        reward_scale="none",
+        samples_per_transition=2,
+        target_sampling="horizon_aligned",
+        target_horizons=[1, 2, 3],
+        seed=3,
+    )
+    replay = IQLRawReplayBuffer(transitions, device="cpu")
+    keys = {(transition.patient_idx, transition.t) for transition in transitions}
+    lookup = {key: 0.5 + 0.1 * key[1] for key in keys}
+
+    assignment = replay.assign_fixed_weights(lookup)
+    batch = collate_iql_raw_batch(transitions)
+
+    assert assignment["assigned_transitions"] == float(len(transitions))
+    assert batch.patient_idx.tolist() == [transition.patient_idx for transition in transitions]
+    assert batch.t.tolist() == [transition.t for transition in transitions]
+    for transition in transitions:
+        assert transition.sample_weight == pytest.approx(
+            lookup[(transition.patient_idx, transition.t)]
+        )
+    for key in keys:
+        copied = [
+            transition.sample_weight
+            for transition in transitions
+            if (transition.patient_idx, transition.t) == key
+        ]
+        assert len(set(copied)) == 1
+
+
+def test_log_weights_are_normalized_and_capped_once_within_time():
+    logits = torch.tensor([-3.0, 0.0, 3.0, -2.0, 2.0])
+    strata = torch.tensor([1, 1, 1, 2, 2])
+    weights = normalize_log_weights_by_stratum(
+        logits, strata, weight_max=2.0
+    )
+
+    for time_value in (1, 2):
+        group = weights[strata == time_value]
+        assert group.mean().item() == pytest.approx(1.0, abs=1e-6)
+        assert group.max().item() <= 2.0 + 1e-6
+    assert not torch.allclose(weights, torch.ones_like(weights))
+
+
 def test_ct_transition_dataset_uses_same_row_output_after_action():
     data = _raw_iql_data(length=4)
     data["outputs"][0, :, 0] = np.array([3.0, 7.0, 11.0, 19.0], dtype=np.float32)
@@ -460,12 +571,15 @@ def test_estep_marginal_permutation_never_crosses_time_strata():
     assert any(int(src) != dst for dst, src in enumerate(permutation))
 
 
-def test_weightnet_scores_are_bounded_like_reference_implementation():
+def test_weightnet_outputs_raw_log_weights_without_sigmoid():
     model = CTEncoderWeightModel(_tiny_cfg(), x_dim=4)
+    with torch.no_grad():
+        model.weight_net.net[-1].weight.zero_()
+        model.weight_net.net[-1].bias.fill_(3.0)
     scores = model.weight_net(torch.randn(32, model.z_dim + model.treatment_dim))
 
-    assert torch.all(scores > 0.0)
-    assert torch.all(scores < 1.0)
+    assert torch.allclose(scores, torch.full_like(scores, 3.0))
+    assert not any(isinstance(module, torch.nn.Sigmoid) for module in model.weight_net.modules())
 
 
 def test_sinkhorn_estep_updates_once_per_epoch_after_averaging_time_losses():
@@ -485,6 +599,7 @@ def test_sinkhorn_estep_updates_once_per_epoch_after_averaging_time_losses():
     samples = [
         {
             "H_t": {key: value[idx] for key, value in H.items()},
+            "patient_index": torch.tensor(idx),
             "time_index": torch.tensor(1 if idx < 4 else 2),
         }
         for idx in range(H["outputs"].size(0))
@@ -505,6 +620,10 @@ def test_sinkhorn_estep_updates_once_per_epoch_after_averaging_time_losses():
     assert optimizer_w.step_calls == 3
     assert metrics["e_optimizer_steps"] == 3.0
     assert metrics["n_time_strata"] == 2.0
+    assert len(model.fixed_transition_weights) == 8
+    assert np.isfinite(metrics["w_time_ess_mean"])
+    assert np.isfinite(metrics["za_dependence_pre"])
+    assert np.isfinite(metrics["za_dependence_post"])
 
 
 @pytest.mark.parametrize("align_mode", ["sinkhorn", "mmd"])
@@ -911,7 +1030,12 @@ def test_m_step_encoder_grad_only_on_q_step():
         [Z_t, batch.y_target, batch.delta_t_norm, batch.a_prev_tanh], dim=-1
     )
     s_det = s_grad.detach()
-    _, w = ct_model.compute_weights(Z_t, A_t, detach_z=True)
+    _, w = ct_model.compute_weights(
+        Z_t,
+        A_t,
+        detach_z=True,
+        strata=torch.zeros(B, dtype=torch.long),
+    )
     w = w.detach()
 
     planner._update_v_weighted(s_det, batch.action, w, {})
@@ -941,6 +1065,58 @@ def test_m_step_encoder_grad_only_on_q_step():
     planner._update_policy_weighted(s_det, batch.action, adv, w, {})
     for p in ct_model.encoder_parameters():
         assert p.grad is None, "encoder should not get grad from pi-step"
+
+
+def test_m_step_consumes_fixed_replay_weights_without_weightnet_softmax(monkeypatch):
+    device = "cpu"
+    cfg = _tiny_cfg()
+    z_dim, out_dim, act_dim = 4, 1, 2
+    ct_model = CTEncoderWeightModel(cfg, x_dim=4).to(device)
+    enc_opt = torch.optim.Adam(ct_model.encoder_parameters(), lr=1e-3)
+    planner = IQLPlanner(
+        IQLPlannerConfig(
+            state_dim=z_dim + out_dim + 1 + act_dim,
+            action_dim=act_dim,
+            max_action=1.0,
+            hidden_dim=16,
+            n_hidden=1,
+            max_steps=10,
+            device=device,
+        )
+    )
+    batch_size, time_steps = 4, 3
+    fixed_weights = torch.tensor([0.4, 0.8, 1.2, 1.6])
+    batch = IQLRawBatch(
+        H_t=_fake_H(batch_size, time_steps, device),
+        H_t_next=_fake_H(batch_size, time_steps + 1, device),
+        action=torch.clamp(torch.randn(batch_size, act_dim), -1.0, 1.0),
+        reward=torch.randn(batch_size),
+        done=torch.zeros(batch_size),
+        y_target=torch.randn(batch_size, out_dim),
+        delta_t_norm=torch.full((batch_size, 1), 0.5),
+        delta_t_next_norm=torch.full((batch_size, 1), 0.4),
+        a_prev_tanh=torch.randn(batch_size, act_dim),
+        patient_idx=torch.arange(batch_size),
+        t=torch.tensor([1, 1, 2, 2]),
+        sample_weight=fixed_weights,
+    )
+
+    def fail_compute_weights(*args, **kwargs):
+        raise AssertionError("M-step must not recompute or renormalize WeightNet weights")
+
+    monkeypatch.setattr(ct_model, "compute_weights", fail_compute_weights)
+    logs = planner.m_step_weighted(
+        batch,
+        encoder_model=ct_model,
+        encoder_optimizer=enc_opt,
+        uniform_weights=False,
+    )
+
+    assert logs["w_fixed_contract"] == 1.0
+    assert logs["w_mean"] == pytest.approx(float(fixed_weights.mean()))
+    assert logs["w_std"] == pytest.approx(
+        float(fixed_weights.std(unbiased=False))
+    )
 
 
 if __name__ == "__main__":

@@ -343,6 +343,82 @@ class EpiABMDataset(Dataset):
         traj = self.simulate_trajectory_after_actions(H_t, actions_np[:, :1], scaling_params)
         return {key: value[:, 0, :] for key, value in traj.items()}
 
+    def start_simulation_session(self, H_t) -> Dict[str, Any]:
+        """Restore one batch row once for an autoregressive online rollout."""
+        H = {key: _to_numpy(value) for key, value in H_t.items()}
+        if int(H["current_treatments"].shape[0]) != 1:
+            raise ValueError("Persistent EpiABM sessions currently require batch size 1.")
+        meta = self._history_metadata(H, 0)
+        burn_in_actions = self._burn_in_actions_from_history(meta)
+        behavior_actions = self.episode_actions.get(int(meta["episode_id"]))
+        if behavior_actions is None:
+            raise KeyError(
+                f"No behavior action schedule for episode_id={meta['episode_id']}."
+            )
+        env = self.simulator_cache.restore_from_history(
+            county=meta["county"],
+            episode_id=int(meta["episode_id"]),
+            seed=int(meta["seed"]),
+            decision_day=int(meta["decision_day"]),
+            burn_in_actions=burn_in_actions,
+            behavior_actions=behavior_actions,
+        )
+        return {
+            "env": env,
+            "meta": meta,
+            "static_features": H.get("static_features"),
+        }
+
+    def simulate_next_in_session(
+        self,
+        session: Dict[str, Any],
+        action,
+        scaling_params=None,
+    ) -> Dict[str, np.ndarray]:
+        """Advance a restored EpiABM session by one day without replaying history."""
+        scaling_params = scaling_params or self.scaling_params or self.get_scaling_params()
+        mean = np.asarray(scaling_params["output_means"], dtype=np.float32)
+        std = np.asarray(scaling_params["output_stds"], dtype=np.float32)
+        actions_np = _to_numpy(action).astype(np.float32)
+        if actions_np.ndim == 1:
+            actions_np = actions_np[None, :]
+        if actions_np.shape[0] != 1:
+            raise ValueError(
+                f"Persistent EpiABM sessions require one action row, got {actions_np.shape}."
+            )
+
+        env = session["env"]
+        meta = session["meta"]
+        y, agg = env.step_day(actions_np[0])
+        day = int(np.asarray(agg["day"]).reshape(-1)[0])
+        raw_output = np.asarray([[[y]]], dtype=np.float32)
+        model_output = self._to_model_output_scale(
+            raw_output,
+            session.get("static_features"),
+        )
+        norm_output = ((model_output - mean) / std).astype(np.float32)
+        covariates = self._covariates_from_agg(day, agg)[None, None, :]
+        treatments = actions_np[None, :, :]
+
+        trajectory = {
+            "outputs": norm_output,
+            "unscaled_outputs": raw_output,
+            "model_unscaled_outputs": model_output,
+            "current_treatments": treatments.astype(np.float32),
+            "current_covariates": covariates.astype(np.float32),
+            "vitals": covariates.astype(np.float32),
+            "active_entries": np.ones((1, 1, 1), dtype=np.float32),
+            "sim_day": np.asarray([[[float(day)]]], dtype=np.float32),
+            "sim_episode_id": np.asarray(
+                [[[float(meta["episode_id"])]]], dtype=np.float32
+            ),
+            "sim_seed": np.asarray([[[float(meta["seed"])]]], dtype=np.float32),
+            "sim_county_id": np.asarray(
+                [[[float(int(meta["county"]))]]], dtype=np.float32
+            ),
+        }
+        return {key: value[:, 0, :] for key, value in trajectory.items()}
+
     def simulate_output_after_actions(
         self,
         H_t,

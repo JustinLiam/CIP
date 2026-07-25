@@ -14,13 +14,21 @@ THREADS_PER_WORKER="${THREADS_PER_WORKER:-8}"
 VAL_ROWS="${VAL_ROWS:-23}"
 TEST_ROWS="${TEST_ROWS:-23}"
 SEEDS=(${SEEDS:-10 101 1010 10101 101010})
-TAUS=(7 14 21)
+VAL_TAUS=(${VAL_TAUS:-7 14 21})
+VAL_SELECTION_TAUS=(7 14 21)
 TEST_TAUS=(${TEST_TAUS:-7 14 21})
+INTERLEAVE_SEED_EVAL="${INTERLEAVE_SEED_EVAL:-1}"
 ERRPAT='Traceback|RuntimeError|ValueError|IndexError|OutOfMemoryError|CUDA out|Error executing job|Killed'
 
 mkdir -p "$RUN_ROOT/logs" "$RUN_ROOT/aggregate"
 log(){ printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$RUN_ROOT/logs/parallel_eval.log"; }
 fail(){ log "FAILED: $*"; exit 1; }
+
+EVAL_LOCK_FILE="$RUN_ROOT/.parallel_eval.lock"
+exec 9>"$EVAL_LOCK_FILE"
+log "waiting for variant evaluation lock: $EVAL_LOCK_FILE"
+flock -x 9
+log "acquired variant evaluation lock"
 
 read_manifest_field(){
   python - "$RUN_ROOT" "$1" <<'PY'
@@ -74,7 +82,7 @@ val_shard(){
   local seed="$1" shard="$2" row_start="$3" row_end="$4"
   local runtime="$RUN_ROOT/runtime_eval/val_seed_${seed}_shard_$(printf '%02d' "$shard")"
   local out="$RUN_ROOT/val_selection_parallel_county_major/seed_${seed}/shard_$(printf '%02d' "$shard")_${row_start}_${row_end}"
-  local expected=$(((row_end - row_start) * 36))
+  local expected=$(((row_end - row_start) * 12 * ${#VAL_TAUS[@]}))
   if [[ -f "$out/county_metrics.jsonl" ]] && [[ "$(wc -l < "$out/county_metrics.jsonl")" -eq "$expected" ]]; then
     return 0
   fi
@@ -99,7 +107,7 @@ val_shard(){
     "${ckpt_args[@]}" \
     --out-dir "$out" \
     --splits val \
-    --taus 7 14 21 \
+    --taus "${VAL_TAUS[@]}" \
     --window-mode fixed-start \
     --decision-day 161 \
     --target-mode factual_final \
@@ -180,7 +188,14 @@ test_shard(){
 }
 
 aggregate_val(){
-  python - "$RUN_ROOT" "$VAL_ROWS" "${SEEDS[@]}" <<'PY'
+  local val_taus_csv selection_taus_csv
+  local eval_seeds=("$@")
+  if [[ "${#eval_seeds[@]}" -eq 0 ]]; then
+    eval_seeds=("${SEEDS[@]}")
+  fi
+  val_taus_csv="$(IFS=,; echo "${VAL_TAUS[*]}")"
+  selection_taus_csv="$(IFS=,; echo "${VAL_SELECTION_TAUS[*]}")"
+  python - "$RUN_ROOT" "$VAL_ROWS" "$val_taus_csv" "$selection_taus_csv" "${eval_seeds[@]}" <<'PY'
 from pathlib import Path
 import csv
 import json
@@ -190,8 +205,9 @@ import sys
 
 run = Path(sys.argv[1])
 val_rows = int(sys.argv[2])
-seeds = [int(x) for x in sys.argv[3:]]
-taus = [7, 14, 21]
+val_taus = [int(x) for x in sys.argv[3].split(",") if x]
+selection_taus = [int(x) for x in sys.argv[4].split(",") if x]
+seeds = [int(x) for x in sys.argv[5:]]
 
 def rms(xs):
     return math.sqrt(sum(x * x for x in xs) / len(xs)) if xs else None
@@ -204,7 +220,7 @@ for seed in seeds:
         raise SystemExit(f"missing val shards for seed={seed}: {shard_root}")
     for path in paths:
         rows.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
-    expected = val_rows * 3 * 12
+    expected = val_rows * len(val_taus) * 12
     if len(rows) != expected:
         raise SystemExit(f"seed {seed} val rows {len(rows)} != {expected}")
     row_ids = sorted({int(row["row_idx"]) for row in rows})
@@ -217,25 +233,60 @@ for seed in seeds:
         encoding="utf-8",
     )
 
+    by_outer_tau = []
     summary = []
     for label in sorted({r["label"] for r in rows}):
         item = {"seed": seed, "label": label}
         vals_all, fact_vals_all = [], []
-        for tau in taus:
+        for tau in val_taus:
             group = [r for r in rows if r["label"] == label and int(r["tau"]) == tau]
             vals = [float(r["target_distance_per_10k"]) for r in group]
             fact_vals = [float(r["factual_target_distance_per_10k"]) for r in group]
             rmse = rms(vals)
             fact_rmse = rms(fact_vals)
-            item[f"target_RMSE_per_10k_tau{tau}"] = rmse
-            item[f"factual_target_RMSE_per_10k_tau{tau}"] = fact_rmse
-            item[f"target_MAE_per_10k_tau{tau}"] = sum(abs(v) for v in vals) / len(vals)
-            vals_all.append(rmse)
-            fact_vals_all.append(fact_rmse)
+            by_outer_tau.append({
+                "seed": seed,
+                "label": label,
+                "tau": tau,
+                "n_counties": len(group),
+                "target_RMSE_per_10k": rmse,
+                "factual_target_RMSE_per_10k": fact_rmse,
+                "RMSE_improvement_per_10k": fact_rmse - rmse,
+                "target_MAE_per_10k": sum(abs(v) for v in vals) / len(vals),
+                "factual_target_MAE_per_10k": sum(abs(v) for v in fact_vals) / len(fact_vals),
+                "policy_vs_factual_final_improvement_per_10k_mean": (
+                    sum(float(r["policy_vs_factual_final_improvement_per_10k"]) for r in group) / len(group)
+                ),
+                "policy_vs_factual_cumulative_improvement_per_10k_mean": (
+                    sum(float(r["policy_vs_factual_cumulative_improvement_per_10k"]) for r in group) / len(group)
+                ),
+                "action_mean": (
+                    sum(float(r["action_mean"]) for r in group if r.get("action_mean") is not None)
+                    / sum(r.get("action_mean") is not None for r in group)
+                ),
+                "action_std": (
+                    sum(float(r["action_std"]) for r in group if r.get("action_std") is not None)
+                    / sum(r.get("action_std") is not None for r in group)
+                ),
+            })
+            if tau in selection_taus:
+                item[f"target_RMSE_per_10k_tau{tau}"] = rmse
+                item[f"factual_target_RMSE_per_10k_tau{tau}"] = fact_rmse
+                item[f"target_MAE_per_10k_tau{tau}"] = sum(abs(v) for v in vals) / len(vals)
+                vals_all.append(rmse)
+                fact_vals_all.append(fact_rmse)
         item["mean_target_RMSE_per_10k"] = sum(vals_all) / len(vals_all)
         item["mean_factual_target_RMSE_per_10k"] = sum(fact_vals_all) / len(fact_vals_all)
         item["RMSE_improvement_per_10k"] = item["mean_factual_target_RMSE_per_10k"] - item["mean_target_RMSE_per_10k"]
         summary.append(item)
+    tau_fields = list(by_outer_tau[0].keys())
+    with (merged / "outer_target_metrics_by_tau.csv").open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=tau_fields)
+        writer.writeheader()
+        writer.writerows(by_outer_tau)
+    (merged / "outer_target_metrics_by_tau.json").write_text(
+        json.dumps(by_outer_tau, indent=2, sort_keys=True) + "\n"
+    )
     summary.sort(key=lambda x: x["mean_target_RMSE_per_10k"])
     fields = list(summary[0].keys())
     with (merged / "outer_target_rmse_summary.csv").open("w", newline="") as f:
@@ -255,9 +306,14 @@ PY
 }
 
 aggregate_test(){
-  local test_taus_csv
+  local val_taus_csv test_taus_csv
+  local eval_seeds=("$@")
+  if [[ "${#eval_seeds[@]}" -eq 0 ]]; then
+    eval_seeds=("${SEEDS[@]}")
+  fi
+  val_taus_csv="$(IFS=,; echo "${VAL_TAUS[*]}")"
   test_taus_csv="$(IFS=,; echo "${TEST_TAUS[*]}")"
-  python - "$RUN_ROOT" "$VAL_ROWS" "$TEST_ROWS" "$test_taus_csv" "${SEEDS[@]}" <<'PY'
+  python - "$RUN_ROOT" "$VAL_ROWS" "$TEST_ROWS" "$val_taus_csv" "$test_taus_csv" "${eval_seeds[@]}" <<'PY'
 from pathlib import Path
 import csv
 import json
@@ -268,8 +324,9 @@ import sys
 run = Path(sys.argv[1])
 val_rows_count = int(sys.argv[2])
 test_rows = int(sys.argv[3])
-taus = [int(x) for x in sys.argv[4].split(",") if x]
-seeds = [int(x) for x in sys.argv[5:]]
+val_taus = [int(x) for x in sys.argv[4].split(",") if x]
+taus = [int(x) for x in sys.argv[5].split(",") if x]
+seeds = [int(x) for x in sys.argv[6:]]
 agg = run / "aggregate"
 agg.mkdir(exist_ok=True)
 
@@ -390,6 +447,7 @@ manifest["status"] = "parallel_eval_complete"
 manifest["aggregate_dir"] = str(agg)
 manifest["parallel_eval"] = {
     "val_rows_per_seed": val_rows_count,
+    "val_evaluated_taus": val_taus,
     "val_selection_taus": [7, 14, 21],
     "test_rows_per_seed": test_rows,
     "test_taus": taus,
@@ -399,8 +457,8 @@ print(json.dumps({"status": "complete", "aggregate_dir": str(agg)}, indent=2))
 PY
 }
 
-log "county-major parallel val eval start run_root=$RUN_ROOT workers=$EVAL_PARALLEL shards=$EVAL_SHARDS threads_per_worker=$THREADS_PER_WORKER"
-for seed in "${SEEDS[@]}"; do
+run_val_seed(){
+  local seed="$1"
   for shard in $(seq 0 "$((EVAL_SHARDS - 1))"); do
     row_start=$((shard * VAL_ROWS / EVAL_SHARDS))
     row_end=$(((shard + 1) * VAL_ROWS / EVAL_SHARDS))
@@ -408,14 +466,11 @@ for seed in "${SEEDS[@]}"; do
     run_limited "val seed=$seed shard=$shard rows=$row_start:$row_end" \
       val_shard "$seed" "$shard" "$row_start" "$row_end"
   done
-done
-wait_pool
-log "parallel val eval shards done; aggregating selection"
-aggregate_val
-log "parallel val selection done"
+  wait_pool
+}
 
-log "parallel test eval start"
-for seed in "${SEEDS[@]}"; do
+run_test_seed(){
+  local seed="$1"
   for shard in $(seq 0 "$((EVAL_SHARDS - 1))"); do
     row_start=$((shard * TEST_ROWS / EVAL_SHARDS))
     row_end=$(((shard + 1) * TEST_ROWS / EVAL_SHARDS))
@@ -423,8 +478,32 @@ for seed in "${SEEDS[@]}"; do
     run_limited "test seed=$seed shard=$shard rows=$row_start:$row_end" \
       test_shard "$seed" "$shard" "$row_start" "$row_end"
   done
-done
-wait_pool
-log "parallel test eval shards done; aggregating results"
+  wait_pool
+}
+
+log "county-major parallel eval start run_root=$RUN_ROOT workers=$EVAL_PARALLEL shards=$EVAL_SHARDS threads_per_worker=$THREADS_PER_WORKER"
+log "val_taus=${VAL_TAUS[*]} val_selection_taus=${VAL_SELECTION_TAUS[*]} test_taus=${TEST_TAUS[*]} interleave_seed_eval=$INTERLEAVE_SEED_EVAL"
+if [[ "$INTERLEAVE_SEED_EVAL" == "1" ]]; then
+  for seed in "${SEEDS[@]}"; do
+    log "seed=$seed validation start"
+    run_val_seed "$seed"
+    aggregate_val "$seed"
+    log "seed=$seed validation selected best checkpoint; test start"
+    run_test_seed "$seed"
+    log "seed=$seed test shards complete"
+  done
+else
+  for seed in "${SEEDS[@]}"; do
+    run_val_seed "$seed"
+  done
+  log "all validation shards done; aggregating selections"
+  aggregate_val
+  for seed in "${SEEDS[@]}"; do
+    run_test_seed "$seed"
+  done
+fi
+
+log "all seed evaluations done; writing final aggregate results"
+aggregate_val
 aggregate_test
 log "parallel eval complete"
