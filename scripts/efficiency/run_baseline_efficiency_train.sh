@@ -5,6 +5,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-/home/liam/pythonProject/VCIP-ICML-main}"
 GIFT_ROOT="$PROJECT_ROOT/external_repos/GIFT"
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/results/efficiency_kdd26/formal_20260726}"
 TIMING_PATCH="${TIMING_PATCH:-$PROJECT_ROOT/scripts/efficiency/baseline_timing}"
+CODE_COMMIT="${CODE_COMMIT:-b29df9d36edb1e391472f3f13dcf86e29e8ac3a9}"
+HARNESS_COMMIT="${HARNESS_COMMIT:-5a72cd64d09a2d1a0f93503575e927f699384c7d}"
 DATASET="${1:?dataset: tumor or mimic}"
 MODEL="${2:?model}"
 SEED="${3:?seed}"
@@ -32,9 +34,9 @@ export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-}"
 conda activate "$CONDA_ENV"
 cd "$GIFT_ROOT"
 
-printf 'dataset\t%s\nmodel\t%s\nseed\t%s\ngpu\t%s\nexp_name\t%s\nconda_env\t%s\ngit_commit\t%s\n' \
+printf 'dataset\t%s\nmodel\t%s\nseed\t%s\ngpu\t%s\nexp_name\t%s\nconda_env\t%s\ngit_commit\t%s\nharness_commit\t%s\n' \
   "$DATASET" "$MODEL" "$SEED" "$GPU" "$EXP_NAME" "$CONDA_ENV" \
-  "$(git -C "$PROJECT_ROOT" rev-parse HEAD)" > "$METADATA_FILE"
+  "$CODE_COMMIT" "$HARNESS_COMMIT" > "$METADATA_FILE"
 : > "$TIMING_LOG"
 
 monitor_gpu() {

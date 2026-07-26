@@ -1,7 +1,9 @@
 {
   "backup": {
+    "code_commit": "b29df9d36edb1e391472f3f13dcf86e29e8ac3a9",
     "commit": "b29df9d36edb1e391472f3f13dcf86e29e8ac3a9",
-    "draft_pr": "https://github.com/JustinLiam/CIP/pull/1"
+    "draft_pr": "https://github.com/JustinLiam/CIP/pull/1",
+    "harness_commit": "5a72cd64d09a2d1a0f93503575e927f699384c7d"
   },
   "datasets": [
     "tumor",
