@@ -9,10 +9,7 @@ SEEDS=(10 101 1010 10101 101010)
 SUPERVISOR_DIR="$RUN_ROOT/supervisor"
 LOG="$SUPERVISOR_DIR/baseline_retry_gpu${GPU}.log"
 PID_FILE="$SUPERVISOR_DIR/baseline_retry_gpu${GPU}.pid"
-ORIGINAL_PID_FILES=(
-  "$SUPERVISOR_DIR/baseline_relaunch_gpu0.pid"
-  "$SUPERVISOR_DIR/baseline_relaunch_gpu1.pid"
-)
+ORIGINAL_PID_FILE="$SUPERVISOR_DIR/baseline_relaunch_gpu${GPU}.pid"
 
 mkdir -p "$SUPERVISOR_DIR"
 printf '%s\n' "$$" > "$PID_FILE"
@@ -29,13 +26,10 @@ original_queue_is_live() {
 
 printf '[%s] retry worker waiting gpu=%s\n' "$(date -Is)" "$GPU" >> "$LOG"
 while true; do
-  live=0
-  for pid_file in "${ORIGINAL_PID_FILES[@]}"; do
-    if [[ -s "$pid_file" ]] && original_queue_is_live "$(cat "$pid_file")"; then
-      live=$((live + 1))
-    fi
-  done
-  (( live == 0 )) && break
+  if [[ ! -s "$ORIGINAL_PID_FILE" ]] \
+    || ! original_queue_is_live "$(cat "$ORIGINAL_PID_FILE")"; then
+    break
+  fi
   sleep 60
 done
 
