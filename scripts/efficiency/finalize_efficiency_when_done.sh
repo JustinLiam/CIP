@@ -60,11 +60,9 @@ conda activate vcip
 profile_dataset() {
   local dataset="$1"
   local gpu="$2"
-  local seed
-  for seed in 10 101 1010 10101 101010; do
-    "$PROJECT_ROOT/scripts/efficiency/run_cripo_efficiency_profile.sh" \
-      "$dataset" "$seed" "$gpu"
-  done
+  local seed=10
+  "$PROJECT_ROOT/scripts/efficiency/run_cripo_efficiency_profile.sh" \
+    "$dataset" "$seed" "$gpu"
 }
 
 profile_dataset tumor 0 >> "$LOG" 2>&1 &

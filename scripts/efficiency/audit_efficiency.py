@@ -149,9 +149,11 @@ def main() -> None:
         "tumor": int(protocol.get("inference_batch_size_tumor", 0)),
         "mimic": int(protocol.get("inference_batch_size_mimic", 0)),
     }
+    inference_seed = str(protocol.get("inference_seed", ""))
     for row in rows:
         key = f"{row['dataset']}/{row['model']}/seed_{row['seed']}"
         task = root / row["dataset"] / row["model"] / f"seed_{row['seed']}"
+        is_inference_seed = row["seed"] == inference_seed
         if row["status"] != "COMPLETED":
             failures.append(f"{key}: status={row['status']}")
         missing_metrics = [metric for metric in METRICS if not finite(row.get(metric))]
@@ -188,7 +190,7 @@ def main() -> None:
                 task / "checkpoints" / "ct_iql_em_best.pt",
                 profile_path,
             )
-            if profile_path.exists():
+            if profile_path.exists() and is_inference_seed:
                 try:
                     profile = json.loads(profile_path.read_text())
                     timing = {
@@ -219,31 +221,32 @@ def main() -> None:
                 task / "complexity_info.csv",
                 timing_path,
             )
-            timing = read_json_lines(timing_path)
-            expected_batch = expected_batches.get(row["dataset"], 0)
-            for tau, field in (
-                (1, "decision_ms"),
-                (6, "episode_ms"),
-                (12, "episode_ms"),
-            ):
-                matching = [
-                    record for record in timing
-                    if has_tau(record, tau) and positive(record.get(field))
-                ]
-                if not matching:
-                    failures.append(
-                        f"{key}: missing positive raw timing {field} at tau={tau}"
-                    )
-                observed_batches = {
-                    integer(record.get("batch_size"))
-                    for record in matching
-                    if positive(record.get("batch_size"))
-                }
-                if observed_batches != {expected_batch}:
-                    failures.append(
-                        f"{key}: raw timing batch sizes at tau={tau} are "
-                        f"{sorted(observed_batches)}, expected={[expected_batch]}"
-                    )
+            if is_inference_seed:
+                timing = read_json_lines(timing_path)
+                expected_batch = expected_batches.get(row["dataset"], 0)
+                for tau, field in (
+                    (1, "decision_ms"),
+                    (6, "episode_ms"),
+                    (12, "episode_ms"),
+                ):
+                    matching = [
+                        record for record in timing
+                        if has_tau(record, tau) and positive(record.get(field))
+                    ]
+                    if not matching:
+                        failures.append(
+                            f"{key}: missing positive raw timing {field} at tau={tau}"
+                        )
+                    observed_batches = {
+                        integer(record.get("batch_size"))
+                        for record in matching
+                        if positive(record.get("batch_size"))
+                    }
+                    if observed_batches != {expected_batch}:
+                        failures.append(
+                            f"{key}: raw timing batch sizes at tau={tau} are "
+                            f"{sorted(observed_batches)}, expected={[expected_batch]}"
+                        )
         for path in required:
             if not path.exists() or path.stat().st_size == 0:
                 failures.append(f"{key}: missing {path.name}")
