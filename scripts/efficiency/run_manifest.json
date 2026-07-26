@@ -1,0 +1,70 @@
+{
+  "backup": {
+    "commit": "b29df9d36edb1e391472f3f13dcf86e29e8ac3a9",
+    "draft_pr": "https://github.com/JustinLiam/CIP/pull/1"
+  },
+  "datasets": [
+    "tumor",
+    "mimic"
+  ],
+  "hardware": {
+    "driver": "580.126.09",
+    "gpu_count": 2,
+    "gpu_memory_mib": 24564,
+    "gpu_model": "NVIDIA GeForce RTX 4090"
+  },
+  "software_environments": {
+    "default": {
+      "conda_env": "vcip",
+      "cuda_runtime": "11.7",
+      "methods": "all methods except CT and Tumor-CRN",
+      "python": "3.8.20",
+      "pytorch_lightning": "2.0.7",
+      "torch": "2.0.1+cu117"
+    },
+    "legacy_cts": {
+      "conda_env": "pytorch-lightning",
+      "cuda_runtime": "12.1",
+      "methods": "CT on both datasets and Tumor-CRN",
+      "python": "3.8.20",
+      "pytorch_lightning": "1.4.5",
+      "reason": "native compatibility for the published multi-optimizer CT/CRN implementation",
+      "torch": "2.2.0"
+    }
+  },
+  "measurements": {
+    "episode_ms_tau12": "synchronized amortized end-to-end closed-loop rollout time per trajectory at tau=12",
+    "episode_ms_tau6": "synchronized amortized end-to-end closed-loop rollout time per trajectory at tau=6",
+    "latency_ms": "synchronized amortized end-to-end closed-loop decision time per trajectory at tau=1",
+    "params_deploy": "parameters resident in the deployed policy path",
+    "peak_gb": "maximum per-second nvidia-smi GPU memory sample divided by 1024",
+    "train_min": "wall-clock model training time per seed divided by 60"
+  },
+  "methods": [
+    "cripo",
+    "rmsn",
+    "crn",
+    "ct",
+    "actin",
+    "vcip",
+    "scrl",
+    "gift"
+  ],
+  "protocol": {
+    "cripo_m_steps_per_outer": 1000,
+    "cripo_outer_iters": 18,
+    "inference_batch_size_mimic": 100,
+    "inference_batch_size_tumor": 200,
+    "mimic_max_number": 500,
+    "one_training_job_per_gpu": true,
+    "peak_memory_sampling_seconds": 1,
+    "tumor_coeff": 4
+  },
+  "seeds": [
+    10,
+    101,
+    1010,
+    10101,
+    101010
+  ]
+}
