@@ -77,6 +77,14 @@ def metadata(path: Path) -> dict[str, str]:
     return result
 
 
+def last_csv_row(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    with path.open(newline="", errors="replace") as stream:
+        rows = list(csv.DictReader(stream))
+    return rows[-1] if rows else {}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("run_root", type=Path)
@@ -217,10 +225,16 @@ def main() -> None:
                         )
         else:
             timing_path = task / "inference_timing.jsonl"
+            complexity_path = task / "complexity_info.csv"
             required = (
-                task / "complexity_info.csv",
+                complexity_path,
                 timing_path,
             )
+            complexity = last_csv_row(complexity_path)
+            if not positive(complexity.get("train_time")):
+                failures.append(
+                    f"{key}: missing positive pure training time in complexity_info.csv"
+                )
             if is_inference_seed:
                 timing = read_json_lines(timing_path)
                 expected_batch = expected_batches.get(row["dataset"], 0)
