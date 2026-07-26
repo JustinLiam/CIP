@@ -75,6 +75,12 @@ run_task() {
   local model="$2"
   local seed="$3"
   local status_file="$RUN_ROOT/$dataset/$model/seed_$seed/status.txt"
+  while [[ -s "$status_file" ]] \
+    && [[ "$(cat "$status_file")" == "RUNNING" ]]; do
+    printf '[%s] wait running gpu=%s dataset=%s model=%s seed=%s\n' \
+      "$(date -Is)" "$GPU" "$dataset" "$model" "$seed" >> "$SUPERVISOR_LOG"
+    sleep 30
+  done
   if [[ -s "$status_file" ]] \
     && [[ "$(cat "$status_file")" == "COMPLETED" ]]; then
     printf '[%s] skip completed gpu=%s dataset=%s model=%s seed=%s\n' \
