@@ -9,11 +9,20 @@ SEEDS=(10 101 1010 10101 101010)
 SUPERVISOR_DIR="$RUN_ROOT/supervisor"
 LOG="$SUPERVISOR_DIR/baseline_retry_gpu${GPU}.log"
 PID_FILE="$SUPERVISOR_DIR/baseline_retry_gpu${GPU}.pid"
+STATUS_FILE="$SUPERVISOR_DIR/baseline_retry_gpu${GPU}.status"
 ORIGINAL_PID_FILE="$SUPERVISOR_DIR/baseline_relaunch_gpu${GPU}.pid"
 
 mkdir -p "$SUPERVISOR_DIR"
 printf '%s\n' "$$" > "$PID_FILE"
-trap 'rm -f "$PID_FILE"' EXIT
+printf 'WAITING\n' > "$STATUS_FILE"
+
+on_exit() {
+  local status=$?
+  if (( status != 0 )); then
+    printf 'FAILED exit_code=%s\n' "$status" > "$STATUS_FILE"
+  fi
+}
+trap on_exit EXIT
 
 original_queue_is_live() {
   local pid="$1"
@@ -33,6 +42,7 @@ while true; do
   sleep 60
 done
 
+printf 'RUNNING\n' > "$STATUS_FILE"
 if [[ "$GPU" == "0" ]]; then
   MODEL="crn"
 elif [[ "$GPU" == "1" ]]; then
@@ -55,4 +65,5 @@ for seed in "${SEEDS[@]}"; do
   fi
 done
 
+printf 'COMPLETED\n' > "$STATUS_FILE"
 printf '[%s] retry queue complete gpu=%s\n' "$(date -Is)" "$GPU" >> "$LOG"
