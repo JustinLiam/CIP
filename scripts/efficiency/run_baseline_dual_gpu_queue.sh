@@ -5,12 +5,22 @@ PROJECT_ROOT="${PROJECT_ROOT:-/home/liam/pythonProject/VCIP-ICML-main}"
 RUN_ROOT="${RUN_ROOT:-$PROJECT_ROOT/results/efficiency_kdd26/formal_20260726}"
 RUNNER="$PROJECT_ROOT/scripts/efficiency/run_baseline_efficiency_train.sh"
 SEEDS=(10 101 1010 10101 101010)
-GPU="${1:?gpu index}"
-SUPERVISOR_LOG="$RUN_ROOT/supervisor/baseline_gpu${GPU}.log"
+QUEUE_ID="${1:?gpu index or rebalanced queue id}"
+GPU="$QUEUE_ID"
+SUPERVISOR_LOG="$RUN_ROOT/supervisor/baseline_gpu${QUEUE_ID}.log"
 
 mkdir -p "$(dirname "$SUPERVISOR_LOG")"
 
-if [[ "$GPU" == "0" ]]; then
+if [[ -n "${WAIT_PID:-}" ]]; then
+  printf '[%s] waiting for retained task pid=%s queue=%s\n' \
+    "$(date -Is)" "$WAIT_PID" "$QUEUE_ID" >> "$SUPERVISOR_LOG"
+  while kill -0 "$WAIT_PID" 2>/dev/null; do
+    sleep 30
+  done
+fi
+
+EXPLICIT_TASKS=()
+if [[ "$QUEUE_ID" == "0" ]]; then
   TASK_GROUPS=(
     "tumor gift"
     "mimic scrl"
@@ -18,7 +28,7 @@ if [[ "$GPU" == "0" ]]; then
     "mimic crn"
     "mimic gift"
   )
-elif [[ "$GPU" == "1" ]]; then
+elif [[ "$QUEUE_ID" == "1" ]]; then
   TASK_GROUPS=(
     "tumor scrl"
     "tumor vcip"
@@ -30,14 +40,47 @@ elif [[ "$GPU" == "1" ]]; then
     "mimic actin"
     "mimic ct"
   )
+elif [[ "$QUEUE_ID" == "r0" ]]; then
+  GPU=0
+  EXPLICIT_TASKS=(
+    "mimic actin 10"
+    "mimic actin 101"
+    "mimic actin 1010"
+    "mimic actin 10101"
+    "mimic actin 101010"
+    "tumor ct 10"
+    "tumor ct 101"
+    "tumor ct 1010"
+    "tumor ct 10101"
+    "tumor ct 101010"
+  )
+elif [[ "$QUEUE_ID" == "r1" ]]; then
+  GPU=1
+  EXPLICIT_TASKS=(
+    "mimic rmsn 10101"
+    "mimic rmsn 101010"
+    "mimic ct 10"
+    "mimic ct 101"
+    "mimic ct 1010"
+    "mimic ct 10101"
+    "mimic ct 101010"
+  )
 else
-  printf 'unsupported gpu=%s\n' "$GPU" >&2
+  printf 'unsupported queue=%s\n' "$QUEUE_ID" >&2
   exit 2
 fi
 
-for group in "${TASK_GROUPS[@]}"; do
-  read -r dataset model <<<"$group"
-  for seed in "${SEEDS[@]}"; do
+run_task() {
+  local dataset="$1"
+  local model="$2"
+  local seed="$3"
+  local status_file="$RUN_ROOT/$dataset/$model/seed_$seed/status.txt"
+  if [[ -s "$status_file" ]] \
+    && [[ "$(cat "$status_file")" == "COMPLETED" ]]; then
+    printf '[%s] skip completed gpu=%s dataset=%s model=%s seed=%s\n' \
+      "$(date -Is)" "$GPU" "$dataset" "$model" "$seed" >> "$SUPERVISOR_LOG"
+    return
+  fi
     printf '[%s] start gpu=%s dataset=%s model=%s seed=%s\n' \
       "$(date -Is)" "$GPU" "$dataset" "$model" "$seed" >> "$SUPERVISOR_LOG"
     if "$RUNNER" "$dataset" "$model" "$seed" "$GPU"; then
@@ -48,8 +91,22 @@ for group in "${TASK_GROUPS[@]}"; do
       printf '[%s] failed=%s gpu=%s dataset=%s model=%s seed=%s\n' \
         "$(date -Is)" "$status" "$GPU" "$dataset" "$model" "$seed" >> "$SUPERVISOR_LOG"
     fi
-  done
-done
+}
 
-printf '[%s] baseline queue complete gpu=%s\n' "$(date -Is)" "$GPU" \
+if (( ${#EXPLICIT_TASKS[@]} )); then
+  for task in "${EXPLICIT_TASKS[@]}"; do
+    read -r dataset model seed <<<"$task"
+    run_task "$dataset" "$model" "$seed"
+  done
+else
+  for group in "${TASK_GROUPS[@]}"; do
+    read -r dataset model <<<"$group"
+    for seed in "${SEEDS[@]}"; do
+      run_task "$dataset" "$model" "$seed"
+    done
+  done
+fi
+
+printf '[%s] baseline queue complete gpu=%s queue=%s\n' \
+  "$(date -Is)" "$GPU" "$QUEUE_ID" \
   >> "$SUPERVISOR_LOG"
