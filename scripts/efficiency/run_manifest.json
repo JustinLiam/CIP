@@ -39,7 +39,7 @@
     "episode_ms_tau6": "synchronized amortized end-to-end closed-loop rollout time per trajectory at tau=6",
     "latency_ms": "synchronized amortized end-to-end closed-loop decision time per trajectory at tau=1",
     "params_deploy": "parameters resident in the deployed policy path",
-    "peak_gb": "maximum per-second nvidia-smi GPU memory sample divided by 1024",
+    "peak_gb": "maximum per-second nvidia-smi GPU memory sample before evaluation begins, divided by 1024",
     "train_min": "wall-clock model training time per seed divided by 60"
   },
   "methods": [
