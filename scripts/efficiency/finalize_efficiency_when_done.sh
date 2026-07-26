@@ -81,6 +81,8 @@ fi
 printf '[%s] fixed-batch profiles complete; generating artifacts\n' \
   "$(date -Is)" >> "$LOG"
 python scripts/efficiency/normalize_efficiency_metadata.py >> "$LOG" 2>&1
+python scripts/efficiency/derive_training_peak_memory.py \
+  "$RUN_ROOT" >> "$LOG" 2>&1
 python scripts/efficiency/summarize_efficiency.py "$RUN_ROOT" >> "$LOG" 2>&1
 python scripts/efficiency/render_efficiency_table.py \
   "$RUN_ROOT/efficiency_summary.csv" \

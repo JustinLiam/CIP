@@ -185,6 +185,8 @@ def main() -> None:
             failures.append(
                 f"{key}: git_commit={meta.get('git_commit')!r}, expected={backup_commit}"
             )
+        if not positive(meta.get("peak_train_gpu_mib")):
+            failures.append(f"{key}: missing positive training-only peak GPU memory")
         resource = task / "logs" / "resources.tsv"
         if not resource.exists() or len(resource.read_text(errors="replace").splitlines()) < 2:
             failures.append(f"{key}: missing resource samples")

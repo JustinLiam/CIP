@@ -84,7 +84,7 @@ def collect_cripo(task: Path, dataset: str, seed: int) -> dict:
         "latency_ms": to_float(timing.get(1, {}).get("decision_ms")),
         "episode_ms_tau6": to_float(timing.get(6, {}).get("episode_ms")),
         "episode_ms_tau12": to_float(timing.get(12, {}).get("episode_ms")),
-        "peak_gb": to_float(metadata.get("peak_gpu_mib")) / 1024.0,
+        "peak_gb": to_float(metadata.get("peak_train_gpu_mib")) / 1024.0,
     }
 
 
@@ -112,7 +112,7 @@ def collect_baseline(task: Path, dataset: str, model: str, seed: int) -> dict:
         "episode_ms_tau12": median_timing(
             task / "inference_timing.jsonl", 12, "episode_ms"
         ),
-        "peak_gb": to_float(metadata.get("peak_gpu_mib")) / 1024.0,
+        "peak_gb": to_float(metadata.get("peak_train_gpu_mib")) / 1024.0,
     }
 
 

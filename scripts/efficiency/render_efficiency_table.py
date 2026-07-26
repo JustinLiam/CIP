@@ -68,7 +68,7 @@ def main() -> None:
         r"\begin{table*}[t]",
         r"\centering",
         r"\caption{Computational efficiency on a single NVIDIA RTX 4090. "
-        r"Training time and peak GPU memory are reported as mean $\pm$ "
+        r"Training time and training-only peak GPU memory are reported as mean $\pm$ "
         r"standard deviation over five training seeds; deployment parameter "
         r"counts are verified to be seed-invariant. Inference latency and "
         r"episode time are reported for the prespecified seed 10. Inference "
@@ -81,7 +81,7 @@ def main() -> None:
         r"\begin{tabular}{llrrrrrr}",
         r"\toprule",
         r"Dataset & Method & Params (deploy) & Train (min/seed) & Latency (ms) "
-        r"& Episode (ms, $\tau=6$) & Episode (ms, $\tau=12$) & Peak (GB) \\",
+        r"& Episode (ms, $\tau=6$) & Episode (ms, $\tau=12$) & Peak train (GB) \\",
         r"\midrule",
     ]
     for dataset, label in (("tumor", "Tumor"), ("mimic", "MIMIC-III")):
