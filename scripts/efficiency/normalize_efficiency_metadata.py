@@ -12,9 +12,18 @@ CODE_COMMIT = "b29df9d36edb1e391472f3f13dcf86e29e8ac3a9"
 HARNESS_COMMIT = "5a72cd64d09a2d1a0f93503575e927f699384c7d"
 
 
+def expected_conda_env(path: Path) -> str:
+    model = path.parents[1].name
+    dataset = path.parents[2].name
+    if model == "ct" or (dataset == "tumor" and model == "crn"):
+        return "pytorch-lightning"
+    return "vcip"
+
+
 def normalize(path: Path) -> None:
     entries = []
     seen = set()
+    conda_env = expected_conda_env(path)
     for line in path.read_text(errors="replace").splitlines():
         if "\t" not in line:
             entries.append((None, line))
@@ -24,12 +33,16 @@ def normalize(path: Path) -> None:
             value = CODE_COMMIT
         elif key == "harness_commit":
             value = HARNESS_COMMIT
+        elif key == "conda_env":
+            value = conda_env
         entries.append((key, value))
         seen.add(key)
     if "git_commit" not in seen:
         entries.append(("git_commit", CODE_COMMIT))
     if "harness_commit" not in seen:
         entries.append(("harness_commit", HARNESS_COMMIT))
+    if "conda_env" not in seen:
+        entries.append(("conda_env", conda_env))
     text = "\n".join(
         value if key is None else f"{key}\t{value}" for key, value in entries
     )
