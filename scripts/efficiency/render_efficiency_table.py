@@ -33,7 +33,7 @@ def mean_std_five(row: dict[str, str], field: str, digits: int) -> str:
     count = int(number(row, f"{field}_n")) if math.isfinite(number(row, f"{field}_n")) else 0
     if int(number(row, "n_completed")) != 5 or count != 5:
         return "--"
-    return f"${mean:.{digits}f} \\\\pm {std:.{digits}f}$"
+    return f"${mean:.{digits}f} \\pm {std:.{digits}f}$"
 
 
 def single_seed(row: dict[str, str], field: str, digits: int) -> str:
