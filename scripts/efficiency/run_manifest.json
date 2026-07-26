@@ -57,6 +57,7 @@
     "cripo_outer_iters": 18,
     "inference_batch_size_mimic": 100,
     "inference_batch_size_tumor": 200,
+    "inference_seed": 10,
     "mimic_max_number": 500,
     "one_training_job_per_gpu": true,
     "peak_memory_sampling_seconds": 1,

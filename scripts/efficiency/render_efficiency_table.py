@@ -27,13 +27,21 @@ def number(row: dict[str, str], key: str) -> float:
         return math.nan
 
 
-def mean_std(row: dict[str, str], field: str, digits: int) -> str:
+def mean_std_five(row: dict[str, str], field: str, digits: int) -> str:
     mean = number(row, f"{field}_mean")
     std = number(row, f"{field}_std")
     count = int(number(row, f"{field}_n")) if math.isfinite(number(row, f"{field}_n")) else 0
     if int(number(row, "n_completed")) != 5 or count != 5:
         return "--"
     return f"${mean:.{digits}f} \\\\pm {std:.{digits}f}$"
+
+
+def single_seed(row: dict[str, str], field: str, digits: int) -> str:
+    value = number(row, f"{field}_mean")
+    count = int(number(row, f"{field}_n")) if math.isfinite(number(row, f"{field}_n")) else 0
+    if int(number(row, "n_completed")) != 5 or count != 1:
+        return "--"
+    return f"{value:.{digits}f}"
 
 
 def params(row: dict[str, str]) -> str:
@@ -60,10 +68,12 @@ def main() -> None:
         r"\begin{table*}[t]",
         r"\centering",
         r"\caption{Computational efficiency on a single NVIDIA RTX 4090. "
-        r"Training time, inference latency, episode time, and peak GPU memory "
-        r"are reported as mean $\pm$ standard deviation over five seeds. "
-        r"Inference times are synchronized per-trajectory averages at batch "
-        r"size 200 for Tumor and 100 for MIMIC-III. Latency denotes one "
+        r"Training time and peak GPU memory are reported as mean $\pm$ "
+        r"standard deviation over five training seeds; deployment parameter "
+        r"counts are verified to be seed-invariant. Inference latency and "
+        r"episode time are reported for the prespecified seed 10. Inference "
+        r"times are synchronized per-trajectory averages at batch size 200 "
+        r"for Tumor and 100 for MIMIC-III. Latency denotes one "
         r"closed-loop intervention decision; episode time includes the "
         r"complete autoregressive rollout.}",
         r"\label{tab:efficiency}",
@@ -84,11 +94,11 @@ def main() -> None:
                         dataset_cell,
                         model_label,
                         params(row),
-                        mean_std(row, "train_min", 2),
-                        mean_std(row, "latency_ms", 2),
-                        mean_std(row, "episode_ms_tau6", 2),
-                        mean_std(row, "episode_ms_tau12", 2),
-                        mean_std(row, "peak_gb", 2),
+                        mean_std_five(row, "train_min", 2),
+                        single_seed(row, "latency_ms", 2),
+                        single_seed(row, "episode_ms_tau6", 2),
+                        single_seed(row, "episode_ms_tau12", 2),
+                        mean_std_five(row, "peak_gb", 2),
                     )
                 )
                 + r" \\"

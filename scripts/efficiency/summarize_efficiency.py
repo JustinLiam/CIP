@@ -18,6 +18,11 @@ FIELDS = (
     "episode_ms_tau12",
     "peak_gb",
 )
+INFERENCE_FIELDS = (
+    "latency_ms",
+    "episode_ms_tau6",
+    "episode_ms_tau12",
+)
 
 
 def read_kv(path: Path) -> dict[str, str]:
@@ -127,11 +132,15 @@ def main() -> None:
     parser.add_argument("run_root", type=Path)
     args = parser.parse_args()
     root = args.run_root.resolve()
-    seeds = (10, 101, 1010, 10101, 101010)
-    baseline_models = ("rmsn", "crn", "ct", "actin", "vcip", "scrl", "gift")
+    manifest = json.loads((root / "run_manifest.json").read_text())
+    seeds = tuple(int(seed) for seed in manifest["seeds"])
+    datasets = tuple(manifest["datasets"])
+    methods = tuple(manifest["methods"])
+    inference_seed = int(manifest["protocol"]["inference_seed"])
+    baseline_models = tuple(model for model in methods if model != "cripo")
 
     rows = []
-    for dataset in ("tumor", "mimic"):
+    for dataset in datasets:
         for seed in seeds:
             rows.append(collect_cripo(root / dataset / "cripo" / f"seed_{seed}", dataset, seed))
         for model in baseline_models:
@@ -150,8 +159,8 @@ def main() -> None:
     )
 
     summaries = []
-    for dataset in ("tumor", "mimic"):
-        for model in ("cripo", *baseline_models):
+    for dataset in datasets:
+        for model in methods:
             group = [
                 row for row in rows
                 if row["dataset"] == dataset and row["model"] == model
@@ -163,7 +172,12 @@ def main() -> None:
                 "n_total": len(group),
             }
             for field in FIELDS:
-                values = finite([row[field] for row in group])
+                selected = (
+                    [row for row in group if row["seed"] == inference_seed]
+                    if field in INFERENCE_FIELDS
+                    else group
+                )
+                values = finite([row[field] for row in selected])
                 summary[f"{field}_mean"] = statistics.mean(values) if values else math.nan
                 summary[f"{field}_std"] = (
                     statistics.stdev(values) if len(values) > 1 else 0.0

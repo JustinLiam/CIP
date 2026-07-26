@@ -18,6 +18,11 @@ METRICS = (
     "episode_ms_tau12",
     "peak_gb",
 )
+INFERENCE_METRICS = (
+    "latency_ms",
+    "episode_ms_tau6",
+    "episode_ms_tau12",
+)
 
 
 def finite(value: str) -> bool:
@@ -79,6 +84,7 @@ def main() -> None:
     root = args.run_root.resolve()
     manifest_path = root / "run_manifest.json"
     per_seed_path = root / "efficiency_per_seed.csv"
+    summary_path = root / "efficiency_summary.csv"
 
     failures: list[str] = []
     if not manifest_path.exists():
@@ -105,6 +111,37 @@ def main() -> None:
             f"task-key mismatch: missing={sorted(expected - actual)}, "
             f"unexpected={sorted(actual - expected)}"
         )
+
+    if not summary_path.exists():
+        failures.append("missing efficiency_summary.csv")
+        summary_rows = []
+    else:
+        with summary_path.open(newline="") as stream:
+            summary_rows = list(csv.DictReader(stream))
+    expected_groups = {
+        (dataset, method)
+        for dataset in manifest.get("datasets", [])
+        for method in manifest.get("methods", [])
+    }
+    actual_groups = {
+        (row["dataset"], row["model"])
+        for row in summary_rows
+    }
+    if actual_groups != expected_groups:
+        failures.append(
+            f"summary-key mismatch: missing={sorted(expected_groups - actual_groups)}, "
+            f"unexpected={sorted(actual_groups - expected_groups)}"
+        )
+    seed_count = len(manifest.get("seeds", []))
+    for row in summary_rows:
+        key = f"{row['dataset']}/{row['model']}"
+        for metric in METRICS:
+            expected_n = 1 if metric in INFERENCE_METRICS else seed_count
+            observed_n = integer(row.get(f"{metric}_n"))
+            if observed_n != expected_n:
+                failures.append(
+                    f"{key}: {metric}_n={observed_n}, expected={expected_n}"
+                )
 
     backup_commit = manifest.get("backup", {}).get("commit")
     protocol = manifest.get("protocol", {})
